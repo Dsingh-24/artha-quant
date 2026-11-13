@@ -1,0 +1,63 @@
+name: ArthaQuant CI & Netlify Auto-Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements-local.txt
+
+      - name: Install backend test dependencies
+        run: pip install -r requirements-local.txt
+
+      - name: Run platform & security test suite
+        run: pytest -v
+
+      - name: Verify static frontend security guardrails
+        run: |
+          python3 - <<'EOF'
+          import pathlib, re
+          pat = re.compile(r"\b(innerHTML|outerHTML|insertAdjacentHTML|localStorage|sessionStorage|eval)\b|document\.write\s*\(|\b(alert|confirm|prompt)\s*\(")
+          violations = []
+          for p in list(pathlib.Path("static").rglob("*.js")) + list(pathlib.Path("static").rglob("*.html")):
+              for idx, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+                  s = line.strip()
+                  if s.startswith("//") or s.startswith("<!--"):
+                      continue
+                  if pat.search(line):
+                      violations.append(f"{p}:{idx}: {s}")
+          assert not violations, f"Security violations found: {violations}"
+          print("Frontend static security check passed (0 violations).")
+          EOF
+
+      - name: Build Netlify static bundle (`dist/`)
+        run: sh scripts/build_netlify.sh
+
+      - name: Trigger Netlify Deploy via Build Hook (if configured)
+        if: github.ref == 'refs/heads/main' && env.NETLIFY_BUILD_HOOK_URL != ''
+        env:
+          NETLIFY_BUILD_HOOK_URL: ${{ secrets.NETLIFY_BUILD_HOOK_URL }}
+        run: curl -fsSL -X POST "$NETLIFY_BUILD_HOOK_URL"
+
+      - name: Direct Netlify Production Deploy via CLI (if NETLIFY_AUTH_TOKEN configured)
+        if: github.ref == 'refs/heads/main' && env.NETLIFY_AUTH_TOKEN != ''
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: d82d8880-58e1-4f6b-99e6-8295cc7248c7
+        run: npx -y netlify-cli@latest deploy --prod --dir=dist --site="$NETLIFY_SITE_ID" --message="GitHub Actions auto-deploy (${GITHUB_SHA::7})"

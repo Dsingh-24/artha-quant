@@ -1,0 +1,33 @@
+#!/bin/sh
+# ArthaQuant automated pre-commit hook:
+# 1. Blocks accidental staging of local SQLite `.db`, `.env`, or `.netlify` state.
+# 2. Automatically exports `static/data/market_snapshot.json` whenever `data/arthaquant.db`
+#    is newer than the snapshot, staging the updated snapshot into the commit seamlessly.
+
+set -eu
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Safety check: never allow sensitive local files to be committed
+FORBIDDEN=$(git diff --cached --name-only | grep -E '(^data/.*\.db|\.env|\.netlify/)' || true)
+if [ -n "$FORBIDDEN" ]; then
+  echo "ERROR: Refusing to commit local database/secret files:" >&2
+  echo "$FORBIDDEN" >&2
+  exit 1
+fi
+
+DB_FILE="data/arthaquant.db"
+SNAPSHOT_FILE="static/data/market_snapshot.json"
+
+if [ -f "$DB_FILE" ]; then
+  if [ ! -f "$SNAPSHOT_FILE" ] || [ "$DB_FILE" -nt "$SNAPSHOT_FILE" ]; then
+    echo "[ArthaQuant Hook] Local market DB updated — exporting sanitized market_snapshot.json..."
+    if [ -x ".venv/bin/python3" ]; then
+      .venv/bin/python3 scripts/export_snapshot.py
+    else
+      python3 scripts/export_snapshot.py
+    fi
+    git add "$SNAPSHOT_FILE"
+  fi
+fi

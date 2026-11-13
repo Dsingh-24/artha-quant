@@ -56,6 +56,7 @@ from app.security import (
     verify_password,
 )
 from app.universe import import_fundamentals_csv, seed_calibrated_nse_universe
+from scripts.export_snapshot import export_public_snapshot
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("arthaquant.api")
@@ -424,6 +425,14 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             "price_history": sampled_prices,
         }
 
+    def _refresh_cache_and_snapshot() -> None:
+        market_cache.invalidate()
+        if db.db_path.resolve() == DEFAULT_DB_PATH.resolve():
+            try:
+                export_public_snapshot(db_path=db.db_path)
+            except Exception as exc:
+                logger.warning("Failed to auto-export market_snapshot.json: %s", exc)
+
     @app.post("/api/sync/ticker")
     def sync_live_ticker(
         payload: TickerSyncRequest,
@@ -438,7 +447,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
                 status_code=422,
                 detail=f"Live sync unavailable for {payload.ticker}. Verify NSE symbol or network connectivity.",
             )
-        market_cache.invalidate()
+        _refresh_cache_and_snapshot()
         return {"status": "ok", "sync": summary}
 
     @app.post("/api/funnel/prices")
@@ -451,7 +460,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             summary = refresh_live_prices_only(db)
         except Exception:
             raise HTTPException(status_code=502, detail="Unable to refresh live NSE prices.")
-        market_cache.invalidate()
+        _refresh_cache_and_snapshot()
         return {"status": "ok", **summary}
 
     @app.post("/api/funnel/refresh")
@@ -466,7 +475,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             s2 = run_stage2_deep_fundamentals(db, s1["shortlisted"])
         except Exception:
             raise HTTPException(status_code=502, detail="Unable to complete live Nifty 200 funnel refresh.")
-        market_cache.invalidate()
+        _refresh_cache_and_snapshot()
         return {
             "status": "ok",
             "stage1_scanned": s1["total_scanned"],
@@ -485,7 +494,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
         if not next_batch:
             return {"status": "ok", "companies_deep_scored": 0, "annual_rows_saved": 0}
         s2 = run_stage2_deep_fundamentals(db, next_batch)
-        market_cache.invalidate()
+        _refresh_cache_and_snapshot()
         return {"status": "ok", **s2}
 
     @app.post("/api/import/csv")
@@ -520,7 +529,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             dest_path.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=str(exc))
 
-        market_cache.invalidate()
+        _refresh_cache_and_snapshot()
         return {"status": "ok", "imported": summary}
 
     # --- Point-in-Time Backtester & Wealth Planner ---
