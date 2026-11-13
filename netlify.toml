@@ -1,7 +1,7 @@
 "$schema" = "https://open-api.netlify.com/netlify.schema.json"
 
 [build]
-  command = "python3 scripts/build_netlify.py"
+  command = "sh scripts/build_netlify.sh"
   publish = "dist"
 
 [[headers]]

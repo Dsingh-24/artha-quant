@@ -37,7 +37,7 @@
 ```bash
 # 1. Create virtual environment & install dependencies
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements-local.txt
 
 # 2. Launch ArthaQuant locally (strictly bound to localhost)
 .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
