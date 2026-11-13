@@ -1,0 +1,21 @@
+# Virtual environment & Python bytecode
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local SQLite database & user session/auth tables (NEVER commit!)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/uploads/
+
+# Netlify local link state & generated static build output
+.netlify
+.netlify/
+dist/
+
+# Environment & OS metadata
+.env
+.env.*
+.DS_Store
