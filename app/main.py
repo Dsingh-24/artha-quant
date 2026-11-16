@@ -25,7 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.backtester import run_point_in_time_backtest
+from pydantic import ValidationError
+from app.backtester import NASDAQ_BENCHMARK_TICKER, run_point_in_time_backtest
 from app.database import DEFAULT_DB_PATH, Database
 from app.factors import PRESET_WEIGHTS, score_universe_point_in_time
 from app.live_funnel import (
@@ -39,6 +40,7 @@ from app.planner import build_investment_plan
 from app.schemas import (
     AuthCredentials,
     BacktestRequest,
+    CompanyTickerQuery,
     FunnelExpandRequest,
     FunnelRefreshRequest,
     PlannerRequest,
@@ -339,7 +341,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
         s1_lookup = {r["ticker"]: r for r in stage1_rows}
         qtr_signals = market_cache.get_quarterly_signals()
 
-        scored = score_universe_point_in_time(
+        all_scored = score_universe_point_in_time(
             companies=companies,
             fundamentals_df=fund_df,
             price_matrix=price_mat,
@@ -350,7 +352,34 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             quarterly_signals=qtr_signals,
         )
 
-        sectors = sorted({c["sector"] for c in companies})
+        count_in = sum(1 for s in all_scored if s.get("market", "IN") == "IN")
+        count_us = sum(1 for s in all_scored if s.get("market", "IN") == "US")
+        market_counts = {"ALL": len(all_scored), "IN": count_in, "US": count_us}
+
+        norm_stage1 = []
+        for r in stage1_rows:
+            r_mkt = "US" if r.get("market") == "US" else "IN"
+            norm_stage1.append(
+                {
+                    **r,
+                    "market": r_mkt,
+                    "market_label": "US Stock" if r_mkt == "US" else "Indian Stock",
+                    "currency": r.get("currency") or ("USD" if r_mkt == "US" else "INR"),
+                }
+            )
+
+        if payload.market in ("IN", "US"):
+            scored = [s for s in all_scored if s.get("market", "IN") == payload.market]
+            for rank_idx, item in enumerate(scored, start=1):
+                item["rank"] = rank_idx
+            stage1_view = [r for r in norm_stage1 if r["market"] == payload.market]
+            companies_view = [c for c in companies if (c.get("market") or "IN") == payload.market]
+        else:
+            scored = all_scored
+            stage1_view = norm_stage1
+            companies_view = companies
+
+        sectors = sorted({c["sector"] for c in companies_view})
         filtered = [
             s
             for s in scored
@@ -360,7 +389,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
 
         filtered_stage1 = [
             r
-            for r in stage1_rows
+            for r in stage1_view
             if (payload.sector == "ALL" or r["sector"] == payload.sector)
         ]
 
@@ -368,16 +397,28 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
         for s in scored:
             rating_counts[s["rating"]] = rating_counts.get(s["rating"], 0) + 1
 
-        bm_latest = float(price_mat[BENCHMARK_TICKER].dropna().iloc[-1]) if BENCHMARK_TICKER in price_mat.columns else 0.0
-        unscored_remaining = sum(1 for r in stage1_rows if not r.get("deep_scored"))
+        bm_nifty = (
+            float(price_mat[BENCHMARK_TICKER].dropna().iloc[-1])
+            if BENCHMARK_TICKER in price_mat.columns and not price_mat[BENCHMARK_TICKER].dropna().empty
+            else 0.0
+        )
+        bm_nasdaq = (
+            float(price_mat[NASDAQ_BENCHMARK_TICKER].dropna().iloc[-1])
+            if NASDAQ_BENCHMARK_TICKER in price_mat.columns and not price_mat[NASDAQ_BENCHMARK_TICKER].dropna().empty
+            else 0.0
+        )
+        unscored_remaining = sum(1 for r in stage1_view if not r.get("deep_scored"))
 
         return {
             "as_of_date": as_of,
-            "benchmark_nifty50": round(bm_latest, 2),
+            "market": payload.market,
+            "market_counts": market_counts,
+            "benchmark_nifty50": round(bm_nifty, 2),
+            "benchmark_nasdaq100": round(bm_nasdaq, 2),
             "preset_weights": PRESET_WEIGHTS,
             "sectors": sectors,
             "rating_counts": rating_counts,
-            "total_stage1_scanned": len(stage1_rows) if stage1_rows else len(companies),
+            "total_stage1_scanned": len(stage1_view) if stage1_view else len(companies_view),
             "total_deep_scored": len(scored),
             "unscored_funnel_remaining": unscored_remaining,
             "total_universe": len(scored),
@@ -389,23 +430,52 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
     def get_company_detail(
         ticker: str,
         preset: str = "qglp_compounder",
+        w_q: Optional[float] = None,
+        w_v: Optional[float] = None,
+        w_g: Optional[float] = None,
+        w_m: Optional[float] = None,
         _sess: Dict[str, Any] = Depends(require_session),
     ) -> Dict[str, Any]:
-        validated = TickerSyncRequest(ticker=ticker).ticker
+        try:
+            cleaned = CompanyTickerQuery(ticker=ticker).ticker
+        except ValidationError:
+            raise HTTPException(status_code=422, detail="Invalid ticker symbol.")
         companies, fund_df, price_mat, stage1_rows = market_cache.load()
-        comp = db.get_company(validated)
+        comp = db.get_company(cleaned)
+        validated = cleaned
+        if not comp and not cleaned.endswith((".NS", ".BO")):
+            fallback_ns = f"{cleaned}.NS"
+            comp = db.get_company(fallback_ns)
+            if comp:
+                validated = fallback_ns
         if not comp:
             raise HTTPException(status_code=404, detail="Company not found in universe.")
+
+        c_mkt = "US" if comp.get("market") == "US" else "IN"
+        comp_out = {
+            **comp,
+            "market": c_mkt,
+            "market_label": "US Stock" if c_mkt == "US" else "Indian Stock",
+            "currency": comp.get("currency") or ("USD" if c_mkt == "US" else "INR"),
+        }
 
         as_of = str(price_mat.index[-1])
         s1_lookup = {r["ticker"]: r for r in stage1_rows}
         qtr_signals = market_cache.get_quarterly_signals()
+        custom_w = None
+        if preset == "custom" and w_q is not None and w_v is not None and w_g is not None and w_m is not None:
+            custom_w = {"quality": w_q, "value": w_v, "growth": w_g, "momentum": w_m}
+            eff_preset = "custom"
+        else:
+            eff_preset = preset if preset in PRESET_WEIGHTS else "qglp_compounder"
+
         scored = score_universe_point_in_time(
             companies=companies,
             fundamentals_df=fund_df,
             price_matrix=price_mat,
             as_of_date=as_of,
-            preset=preset if preset in PRESET_WEIGHTS else "qglp_compounder",
+            preset=eff_preset,
+            custom_weights=custom_w,
             stage1_lookup=s1_lookup,
             quarterly_signals=qtr_signals,
         )
@@ -419,7 +489,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
         ]
 
         return {
-            "company": comp,
+            "company": comp_out,
             "scorecard": scorecard,
             "fundamentals": fundamentals,
             "price_history": sampled_prices,
@@ -554,6 +624,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
                 weighting=payload.weighting,
                 initial_capital=payload.initial_capital,
                 cost_bps=payload.cost_bps,
+                market=payload.market,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
@@ -582,6 +653,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             target_corpus_inr=payload.target_corpus_inr,
             risk_profile=payload.risk_profile,
             max_stocks=payload.max_stocks,
+            market=payload.market,
         )
         if payload.save_plan:
             plan_id = db.save_user_plan(int(sess["user_id"]), payload.plan_name, plan)

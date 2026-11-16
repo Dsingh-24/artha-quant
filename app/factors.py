@@ -195,6 +195,9 @@ def score_universe_point_in_time(
         latest = fund_records[-1]
         prev = fund_records[-2] if len(fund_records) >= 2 else None
         is_fin = bool(comp.get("is_financial"))
+        market_code = "US" if comp.get("market") == "US" else "IN"
+        market_label = "US Stock" if market_code == "US" else "Indian Stock"
+        currency = "USD" if market_code == "US" else "INR"
         promoter_pct = float(comp.get("promoter_pct") or 0.0)
         inst_pct = float(comp.get("inst_pct") or 0.0)
 
@@ -408,6 +411,7 @@ def score_universe_point_in_time(
             qtr_growth_score = _clamp(0.40 * q_g_rev + 0.45 * q_g_pat + 0.15 * q_g_opm)
             growth_score = _clamp(0.68 * annual_growth_score + 0.32 * qtr_growth_score)
         else:
+            qtr_growth_score = annual_growth_score
             growth_score = annual_growth_score
 
         # --- Pillar 4: Piotroski Health, 4Q Institutional/Promoter Conviction & Trend ---
@@ -434,57 +438,56 @@ def score_universe_point_in_time(
 
         # --- Forensic, Governance, Quarterly Inflection & Valuation Guardrails ---
         red_flags: List[str] = []
+        penalty_items: List[Dict[str, Any]] = []
         strengths: List[str] = []
         penalty = 0.0
         valuation_capped = False
 
+        def _add_flag(msg: str, pts: float) -> None:
+            nonlocal penalty
+            red_flags.append(msg)
+            penalty += pts
+            penalty_items.append({"reason": msg, "points": -round(pts, 1)})
+
         if pat_cr <= 0 or pat_fy_cr <= 0:
-            red_flags.append("Loss-making in latest fiscal year or TTM (PAT <= 0)")
-            penalty += 20.0
+            _add_flag("Loss-making in latest fiscal year or TTM (PAT <= 0)", 20.0)
         if profitable_yrs < max(1, len(window_5y) - 1):
-            red_flags.append(f"Inconsistent profitability ({profitable_yrs}/{len(window_5y)} profitable years)")
-            penalty += 10.0
+            _add_flag(f"Inconsistent profitability ({profitable_yrs}/{len(window_5y)} profitable years)", 10.0)
         if equity_cr <= 0:
-            red_flags.append("Negative net worth / eroded book equity")
-            penalty += 15.0
+            _add_flag("Negative net worth / eroded book equity", 15.0)
         if not is_fin and de_cur > 1.8:
-            red_flags.append(f"High corporate debt load (D/E {de_cur:.2f}x)")
-            penalty += 12.0
+            _add_flag(f"High corporate debt load (D/E {de_cur:.2f}x)", 12.0)
         if not is_fin and cum_cfo_ebitda_5y < 55.0:
-            red_flags.append(f"Weak 5Y cumulative cash conversion ({cum_cfo_ebitda_5y:.0f}% CFO/EBITDA)")
-            penalty += 10.0
+            _add_flag(f"Weak 5Y cumulative cash conversion ({cum_cfo_ebitda_5y:.0f}% CFO/EBITDA)", 10.0)
         if pat_cagr_3y < -10.0 and pat_cagr_5y < -5.0:
-            red_flags.append(f"Structural multi-year profit contraction ({pat_cagr_3y:.1f}% 3Y PAT CAGR)")
-            penalty += 10.0
+            _add_flag(f"Structural multi-year profit contraction ({pat_cagr_3y:.1f}% 3Y PAT CAGR)", 10.0)
         if has_qtr_data and (qtr_pat_yoy <= -15.0 or (qtr_rev_yoy <= -6.0 and qtr_pat_yoy < 0.0)):
-            red_flags.append(
-                f"Recent 2Q earnings slowdown ({qtr_pat_yoy:+.1f}% YoY PAT, {qtr_rev_yoy:+.1f}% YoY Sales in {latest_qtr_label})"
+            _add_flag(
+                f"Recent 2Q earnings slowdown ({qtr_pat_yoy:+.1f}% YoY PAT, {qtr_rev_yoy:+.1f}% YoY Sales in {latest_qtr_label})",
+                9.0,
             )
-            penalty += 9.0
         if has_sh_trend and (
             (smart_money_chg <= -4.5 and (promoter_pct + inst_pct) < 72.0)
             or (promoter_chg_1y <= -3.5 and inst_chg_1y < 0.5)
         ):
-            red_flags.append(
-                f"4Q Promoter/Institutional exit ({promoter_chg_1y:+.1f}% Promoter, {inst_chg_1y:+.1f}% FII+DII)"
+            _add_flag(
+                f"4Q Promoter/Institutional exit ({promoter_chg_1y:+.1f}% Promoter, {inst_chg_1y:+.1f}% FII+DII)",
+                7.0,
             )
-            penalty += 7.0
         if is_fin and gnpa_pct > 0 and (nnpa_pct > 1.5 or gnpa_pct > 4.5):
-            red_flags.append(f"Elevated banking NPAs (Gross NPA {gnpa_pct:.2f}%, Net NPA {nnpa_pct:.2f}%)")
-            penalty += 10.0
+            _add_flag(f"Elevated banking NPAs (Gross NPA {gnpa_pct:.2f}%, Net NPA {nnpa_pct:.2f}%)", 10.0)
         if is_commodity_biz and moat_stability < 55.0:
-            red_flags.append(
-                f"Commodity cyclicality risk (8Y ROCE swung {cycle_floor_ret:.0f}%–{max(cycle_rets):.0f}%)"
+            _add_flag(
+                f"Commodity cyclicality risk (8Y ROCE swung {cycle_floor_ret:.0f}%–{max(cycle_rets):.0f}%)",
+                5.0,
             )
-            penalty += 5.0
         if f_score <= 3:
-            red_flags.append(f"Weak Piotroski financial health ({f_score}/9)")
-            penalty += 10.0
+            _add_flag(f"Weak Piotroski financial health ({f_score}/9)", 10.0)
         if (pe_ratio > 56.0 and peg_ratio > 2.1) or (is_cyclical_profile and pe_ratio > fair_pe * 1.75):
-            red_flags.append(
-                f"Valuation rich at {pe_ratio:.1f}x P/E (Fair ~{fair_pe}x, PEG {peg_ratio:.1f}x) — wait for pullback"
+            _add_flag(
+                f"Valuation rich at {pe_ratio:.1f}x P/E (Fair ~{fair_pe}x, PEG {peg_ratio:.1f}x) — wait for pullback",
+                8.0,
             )
-            penalty += 8.0
             valuation_capped = True
 
         # Bull Thesis Explanations
@@ -518,9 +521,14 @@ def score_universe_point_in_time(
                 f"Institutional accumulation ({inst_chg_1y:+.1f}% FII+DII stake added over 4Q; Total Prom+Inst {promoter_pct + inst_pct:.1f}%)"
             )
         elif (promoter_pct + inst_pct) >= 65.0:
-            strengths.append(
-                f"High institutional & promoter skin-in-the-game ({promoter_pct:.1f}% Promoter + {inst_pct:.1f}% FII/DII)"
-            )
+            if market_code == "US":
+                strengths.append(
+                    f"Strong institutional & insider ownership ({inst_pct:.1f}% Institutional + {promoter_pct:.1f}% Insider)"
+                )
+            else:
+                strengths.append(
+                    f"High institutional & promoter skin-in-the-game ({promoter_pct:.1f}% Promoter + {inst_pct:.1f}% FII/DII)"
+                )
 
         raw_composite = (
             weights["quality"] * quality_score
@@ -533,29 +541,88 @@ def score_universe_point_in_time(
         if valuation_capped and composite_score >= 45.0 and pat_cr > 0:
             rating = "Hold"
             conviction = "Great Business, Rich Price — Buy on Dip"
+            rating_rule = (
+                f"Score {composite_score}/100 passes quality threshold, but Valuation Guardrail fired "
+                f"(P/E {pe_ratio:.1f}x vs Fair ~{fair_pe}x) → Capped at Hold until pullback."
+            )
         elif composite_score >= 68.0 and len(red_flags) == 0:
             rating = "Strong Buy"
             conviction = "Core Long-Term Compounder"
+            rating_rule = (
+                f"Composite Score {composite_score}/100 ≥ 68.0 with 0 forensic or valuation red flags → Strong Buy."
+            )
         elif composite_score >= 57.0 and pat_cr > 0 and profitable_yrs >= len(window_5y) - 1:
             rating = "Buy"
             conviction = "Accumulate for 3-5Y+"
+            rating_rule = (
+                f"Composite Score {composite_score}/100 ≥ 57.0 with {profitable_yrs}/{len(window_5y)} profitable years "
+                + ("(prevented from Strong Buy due to guardrail flag)" if red_flags and composite_score >= 68.0 else "→ Buy.")
+            )
         elif composite_score >= 45.0 and pat_cr > 0:
             rating = "Hold"
             conviction = "Watchlist / Hold Existing"
+            rating_rule = (
+                f"Composite Score {composite_score}/100 is in the 45–57 neutral zone (or profit consistency < 4/5 yrs) → Hold."
+            )
         else:
             rating = "Avoid"
             conviction = "Fundamental / Balance-Sheet Caution"
+            rating_rule = (
+                f"Composite Score {composite_score}/100 < 45.0 or negative TTM/FY profit → Avoid."
+            )
 
         if not strengths:
-            strengths.append("Established NSE Nifty-200 operating franchise")
+            strengths.append(
+                "Established Nasdaq-100 operating franchise"
+                if market_code == "US"
+                else "Established NSE Nifty-200 operating franchise"
+            )
 
         s1_info = (stage1_lookup or {}).get(tk, {})
+
+        score_breakdown = {
+            "preset_used": preset,
+            "weights_pct": {
+                "quality": round(weights["quality"] * 100.0, 1),
+                "value": round(weights["value"] * 100.0, 1),
+                "growth": round(weights["growth"] * 100.0, 1),
+                "momentum": round(weights["momentum"] * 100.0, 1),
+            },
+            "contributions": {
+                "quality": round(weights["quality"] * quality_score, 1),
+                "value": round(weights["value"] * value_score, 1),
+                "growth": round(weights["growth"] * growth_score, 1),
+                "momentum": round(weights["momentum"] * momentum_score, 1),
+            },
+            "raw_composite": round(raw_composite, 1),
+            "total_penalty": round(penalty, 1),
+            "penalty_items": penalty_items,
+            "final_score": composite_score,
+            "valuation_capped": valuation_capped,
+            "rating_rule": rating_rule,
+            "sub_scores": {
+                "capital_return": round(q_return, 0),
+                "moat_stability": round(moat_stability, 0),
+                "balance_sheet": round(q_lev, 0),
+                "cash_conversion": round(q_cash, 0),
+                "operating_margin": round(q_margin, 0),
+                "peg_attractiveness": round(v_peg, 0),
+                "fair_pe_discount": round(v_pe_rel, 0),
+                "multi_year_cagr": round(annual_growth_score, 0),
+                "quarterly_momentum": round(qtr_growth_score, 0),
+                "piotroski_health": round(m_piotroski, 0),
+                "ownership_conviction": round(ownership_score, 0),
+            },
+        }
 
         results.append(
             {
                 "ticker": tk,
                 "name": comp["name"],
                 "sector": comp["sector"],
+                "market": market_code,
+                "market_label": market_label,
+                "currency": currency,
                 "cap_tier": comp.get("cap_tier", "Large Cap"),
                 "data_source": comp.get("data_source", "real_nse_screener"),
                 "is_financial": is_fin,
@@ -615,6 +682,7 @@ def score_universe_point_in_time(
                 "strengths": strengths[:4],
                 "red_flags": red_flags[:4],
                 "piotroski_checks": f_checks,
+                "score_breakdown": score_breakdown,
             }
         )
 

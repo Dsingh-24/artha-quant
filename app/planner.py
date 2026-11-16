@@ -12,6 +12,8 @@ from typing import Any, Dict, List
 
 import numpy as np
 
+USD_INR_RATE = 84.5
+
 RISK_PROFILES: Dict[str, Dict[str, Any]] = {
     "equity_direct": {
         "label": "100% Direct Long-Term NSE Compounder Basket (Buy & Hold 5Y+)",
@@ -56,6 +58,63 @@ RISK_PROFILES: Dict[str, Dict[str, Any]] = {
         "blended_sigma": 0.088,
     },
 }
+
+US_RISK_PROFILES: Dict[str, Dict[str, Any]] = {
+    "equity_direct": {
+        "label": "100% Direct Long-Term Nasdaq-100 Compounder Basket (Buy & Hold 5Y+)",
+        "allocation": [
+            {"asset": "Core QGLP / Coffee-Can Compounders", "pct": 65.0, "expected_return": 12.8},
+            {"asset": "GARP Growth & Value Leaders", "pct": 35.0, "expected_return": 14.2},
+        ],
+        "blended_mu": 0.132,
+        "blended_sigma": 0.168,
+    },
+    "moderate": {
+        "label": "Moderate Multi-Asset (70% US Equity / 20% US Treasury / 10% Gold)",
+        "allocation": [
+            {"asset": "Core QGLP / Coffee-Can Compounders", "pct": 45.0, "expected_return": 12.5},
+            {"asset": "GARP Growth & Value Leaders", "pct": 25.0, "expected_return": 14.0},
+            {"asset": "US 10Y Treasury / IG Bond ETF", "pct": 20.0, "expected_return": 4.4},
+            {"asset": "Gold ETF Hedge", "pct": 10.0, "expected_return": 6.5},
+        ],
+        "blended_mu": 0.106,
+        "blended_sigma": 0.128,
+    },
+    "aggressive": {
+        "label": "Aggressive Wealth Builder (85% US Equity / 10% T-Bills / 5% Gold)",
+        "allocation": [
+            {"asset": "Core QGLP / Coffee-Can Compounders", "pct": 50.0, "expected_return": 12.6},
+            {"asset": "GARP Growth & Value Leaders", "pct": 35.0, "expected_return": 14.4},
+            {"asset": "US T-Bill Opportunity Reserve", "pct": 10.0, "expected_return": 4.3},
+            {"asset": "Gold ETF Hedge", "pct": 5.0, "expected_return": 6.5},
+        ],
+        "blended_mu": 0.121,
+        "blended_sigma": 0.152,
+    },
+    "conservative": {
+        "label": "Conservative (45% US Equity / 40% US Treasury / 15% Gold)",
+        "allocation": [
+            {"asset": "Core QGLP / Coffee-Can Compounders", "pct": 30.0, "expected_return": 12.0},
+            {"asset": "GARP Value Leaders", "pct": 15.0, "expected_return": 13.2},
+            {"asset": "US Treasury / IG Corporate Bond ETF", "pct": 40.0, "expected_return": 4.5},
+            {"asset": "Gold ETF Hedge", "pct": 15.0, "expected_return": 6.5},
+        ],
+        "blended_mu": 0.084,
+        "blended_sigma": 0.088,
+    },
+}
+
+
+def _resolve_risk_profile(risk_profile: str, market: str) -> Dict[str, Any]:
+    if market == "US":
+        return US_RISK_PROFILES.get(risk_profile, US_RISK_PROFILES["equity_direct"])
+    base = RISK_PROFILES.get(risk_profile, RISK_PROFILES["equity_direct"])
+    if market == "ALL":
+        return {
+            **base,
+            "label": base["label"].replace("NSE ", "Global NSE + Nasdaq-100 "),
+        }
+    return base
 
 
 def _classify_portfolio_role(stock: Dict[str, Any]) -> str:
@@ -104,8 +163,25 @@ def build_investment_plan(
     target_corpus_inr: float,
     risk_profile: str = "equity_direct",
     max_stocks: int = 8,
+    market: str = "ALL",
 ) -> Dict[str, Any]:
-    prof = RISK_PROFILES.get(risk_profile, RISK_PROFILES["equity_direct"])
+    eff_market = market if market in ("ALL", "IN", "US") else "ALL"
+    plan_currency = "USD" if eff_market == "US" else "INR"
+    prof = _resolve_risk_profile(risk_profile, eff_market)
+
+    if eff_market in ("IN", "US"):
+        pool_stocks = [s for s in ranked_stocks if (s.get("market") or "IN") == eff_market]
+    else:
+        pool_stocks = list(ranked_stocks)
+
+    def _px_in_plan_ccy(stock: Dict[str, Any]) -> float:
+        s_mkt = "US" if stock.get("market") == "US" else "IN"
+        s_ccy = stock.get("currency") or ("USD" if s_mkt == "US" else "INR")
+        native_px = max(0.01, float(stock["price"]))
+        if plan_currency == "USD":
+            return native_px if s_ccy == "USD" else (native_px / USD_INR_RATE)
+        return (native_px * USD_INR_RATE) if s_ccy == "USD" else native_px
+
     equity_share = (
         sum(
             a["pct"]
@@ -124,14 +200,14 @@ def build_investment_plan(
     # Pass 3: Relax if universe is small
     tier1 = [
         s
-        for s in ranked_stocks
+        for s in pool_stocks
         if s["rating"] in {"Strong Buy", "Buy"}
         and s["pillars"]["quality"] >= 58.0
         and s["metrics"].get("moat_stability_score", 70) >= 52
         and not s.get("is_cyclical", False)
     ]
-    tier2 = [s for s in ranked_stocks if s["rating"] in {"Strong Buy", "Buy"} and s not in tier1]
-    tier3 = [s for s in ranked_stocks if s["rating"] != "Avoid" and s not in tier1 and s not in tier2]
+    tier2 = [s for s in pool_stocks if s["rating"] in {"Strong Buy", "Buy"} and s not in tier1]
+    tier3 = [s for s in pool_stocks if s["rating"] != "Avoid" and s not in tier1 and s not in tier2]
 
     selected: List[Dict[str, Any]] = []
     sector_counts: Dict[str, int] = {}
@@ -144,7 +220,7 @@ def build_investment_plan(
         for stock in pool:
             if stock in selected:
                 continue
-            if equity_lump_inr > 0 and float(stock["price"]) > equity_lump_inr * 0.22:
+            if equity_lump_inr > 0 and _px_in_plan_ccy(stock) > equity_lump_inr * 0.22:
                 continue
             if stock.get("is_cyclical", False) and cyclical_count >= cyc_cap:
                 continue
@@ -183,12 +259,15 @@ def build_investment_plan(
         w = float(weights[idx])
         target_alloc = equity_lump_inr * w
         alloc_sip = equity_sip_inr * w
-        px = max(1.0, float(s["price"]))
+        s_mkt = "US" if s.get("market") == "US" else "IN"
+        s_label = s.get("market_label") or ("US Stock" if s_mkt == "US" else "Indian Stock")
+        s_ccy = s.get("currency") or ("USD" if s_mkt == "US" else "INR")
+        px_plan = max(0.01, _px_in_plan_ccy(s))
         remaining_budget = max(0.0, equity_lump_inr - deployed_equity_inr)
-        shares_qty = int(math.floor(min(target_alloc * 1.03, remaining_budget) / px))
-        if shares_qty * px > remaining_budget and shares_qty > 0:
-            shares_qty = int(math.floor(remaining_budget / px))
-        actual_inr = round(shares_qty * px, 0)
+        shares_qty = int(math.floor(min(target_alloc * 1.03, remaining_budget) / px_plan))
+        if shares_qty * px_plan > remaining_budget and shares_qty > 0:
+            shares_qty = int(math.floor(remaining_budget / px_plan))
+        actual_inr = round(shares_qty * px_plan, 0)
         deployed_equity_inr += actual_inr
 
         m = s["metrics"]
@@ -203,7 +282,7 @@ def build_investment_plan(
                 if later_sh > 0
                 else f"Buy {shares_qty} sh Now"
             )
-            immediate_tranche_inr += round(now_sh * px, 0)
+            immediate_tranche_inr += round(now_sh * px_plan, 0)
 
         sector_exposure[s["sector"]] = round(sector_exposure.get(s["sector"], 0.0) + w * 100.0, 1)
 
@@ -212,10 +291,14 @@ def build_investment_plan(
                 "ticker": s["ticker"],
                 "name": s["name"],
                 "sector": s["sector"],
+                "market": s_mkt,
+                "market_label": s_label,
+                "currency": s_ccy,
                 "role": _classify_portfolio_role(s),
                 "rating": s["rating"],
                 "composite_score": s["composite_score"],
                 "price": s["price"],
+                "price_plan_ccy": round(px_plan, 2),
                 "fair_pe": m["fair_pe"],
                 "pe_ratio": m["pe_ratio"],
                 "equity_weight_pct": round(w * 100.0, 1),
@@ -278,6 +361,9 @@ def build_investment_plan(
     recommended_extra_sip = round(shortfall_inr / max(1.0, fv_factor), 0) if shortfall_inr > 0 else 0.0
 
     return {
+        "market": eff_market,
+        "plan_currency": plan_currency,
+        "fx_usd_inr": USD_INR_RATE,
         "profile_label": prof["label"],
         "expected_cagr_pct": round(prof["blended_mu"] * 100.0, 2),
         "expected_volatility_pct": round(prof["blended_sigma"] * 100.0, 2),

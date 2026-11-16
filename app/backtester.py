@@ -20,6 +20,8 @@ from app.factors import score_universe_point_in_time
 from app.universe import BENCHMARK_TICKER
 
 INDIA_RISK_FREE_RATE = 0.068  # ~6.8% 10Y Government of India G-Sec yield
+US_RISK_FREE_RATE = 0.043  # ~4.3% 10Y US Treasury yield
+NASDAQ_BENCHMARK_TICKER = "^NDX"
 
 REBALANCE_STEP_DAYS = {
     "quarterly": 63,
@@ -60,11 +62,38 @@ def run_point_in_time_backtest(
     weighting: str = "equal",
     initial_capital: float = 1_000_000.0,
     cost_bps: float = 25.0,
+    market: str = "IN",
 ) -> Dict[str, Any]:
-    if price_matrix.empty or BENCHMARK_TICKER not in price_matrix.columns:
-        raise ValueError("Insufficient market & Nifty 50 benchmark price history for backtest.")
+    if price_matrix.empty:
+        raise ValueError("Insufficient market price history for backtest.")
 
-    all_dates = list(price_matrix.index)
+    eff_market = market if market in ("ALL", "IN", "US") else "IN"
+    if eff_market in ("IN", "US"):
+        eval_companies = [c for c in companies if (c.get("market") or "IN") == eff_market]
+    else:
+        eval_companies = list(companies)
+    if not eval_companies:
+        raise ValueError(f"No companies available in universe for market '{eff_market}'.")
+
+    has_ndx = (
+        NASDAQ_BENCHMARK_TICKER in price_matrix.columns
+        and int(price_matrix[NASDAQ_BENCHMARK_TICKER].dropna().shape[0]) >= 60
+    )
+    if eff_market == "US" and has_ndx:
+        bm_ticker = NASDAQ_BENCHMARK_TICKER
+        risk_free_rate = US_RISK_FREE_RATE
+        benchmark_name = "Nasdaq 100 (^NDX)"
+        currency = "USD"
+    else:
+        if BENCHMARK_TICKER not in price_matrix.columns:
+            raise ValueError("Insufficient market & Nifty 50 benchmark price history for backtest.")
+        bm_ticker = BENCHMARK_TICKER
+        risk_free_rate = INDIA_RISK_FREE_RATE
+        benchmark_name = "Nifty 50 (^NSEI)"
+        currency = "INR"
+
+    active_price_mat = price_matrix.loc[price_matrix[bm_ticker].notna()]
+    all_dates = list(active_price_mat.index)
     target_days = lookback_years * 252
     if len(all_dates) <= target_days + 65:
         start_idx = min(252, max(65, len(all_dates) // 5))
@@ -78,9 +107,9 @@ def run_point_in_time_backtest(
     step = REBALANCE_STEP_DAYS.get(rebalance, 63)
     rebal_indices = list(range(0, len(sim_dates) - 1, step))
 
-    daily_ret_matrix = price_matrix.pct_change().fillna(0.0)
+    daily_ret_matrix = active_price_mat.pct_change().fillna(0.0)
     port_daily_rets = np.zeros(len(sim_dates), dtype=float)
-    bm_daily_rets = daily_ret_matrix.loc[sim_dates, BENCHMARK_TICKER].to_numpy(dtype=float)
+    bm_daily_rets = daily_ret_matrix.loc[sim_dates, bm_ticker].to_numpy(dtype=float)
     bm_daily_rets[0] = 0.0
 
     prev_weights: Dict[str, float] = {}
@@ -92,9 +121,9 @@ def run_point_in_time_backtest(
         next_offset = rebal_indices[idx_pos + 1] if idx_pos + 1 < len(rebal_indices) else len(sim_dates) - 1
 
         ranked = score_universe_point_in_time(
-            companies=companies,
+            companies=eval_companies,
             fundamentals_df=fundamentals_df,
-            price_matrix=price_matrix,
+            price_matrix=active_price_mat,
             as_of_date=reb_date,
             preset=preset,
             custom_weights=custom_weights,
@@ -155,6 +184,13 @@ def run_point_in_time_backtest(
                     "ticker": s["ticker"],
                     "name": s["name"],
                     "sector": s["sector"],
+                    "market": s.get("market", "IN"),
+                    "market_label": s.get(
+                        "market_label",
+                        "US Stock" if s.get("market") == "US" else "Indian Stock",
+                    ),
+                    "currency": s.get("currency", "USD" if s.get("market") == "US" else "INR"),
+                    "price": s.get("price"),
                     "weight_pct": round(new_weights.get(s["ticker"], 0.0) * 100.0, 2),
                     "composite_score": s["composite_score"],
                     "rating": s["rating"],
@@ -172,7 +208,7 @@ def run_point_in_time_backtest(
     port_cagr = ((float(port_nav.iloc[-1]) / initial_capital) ** (1.0 / years_elapsed) - 1.0) * 100.0
     bm_cagr = ((float(bm_nav.iloc[-1]) / initial_capital) ** (1.0 / years_elapsed) - 1.0) * 100.0
 
-    rf_daily = INDIA_RISK_FREE_RATE / 252.0
+    rf_daily = risk_free_rate / 252.0
     port_ret_s = pd.Series(port_daily_rets[1:])
     bm_ret_s = pd.Series(bm_daily_rets[1:])
 
@@ -185,7 +221,7 @@ def run_point_in_time_backtest(
 
     downside = port_ret_s[port_ret_s < rf_daily] - rf_daily
     downside_dev = float(math.sqrt((downside**2).mean()) * math.sqrt(252.0)) if len(downside) > 0 else 0.10
-    sortino = ((port_cagr / 100.0) - INDIA_RISK_FREE_RATE) / max(0.01, downside_dev)
+    sortino = ((port_cagr / 100.0) - risk_free_rate) / max(0.01, downside_dev)
 
     max_dd = float(port_dd.min())
     bm_max_dd = float(bm_dd.min())
@@ -216,6 +252,10 @@ def run_point_in_time_backtest(
 
     return {
         "summary": {
+            "market": eff_market,
+            "benchmark_ticker": bm_ticker,
+            "benchmark_name": benchmark_name,
+            "currency": currency,
             "start_date": sim_dates[0],
             "end_date": sim_dates[-1],
             "years_tested": round(years_elapsed, 2),
@@ -236,7 +276,7 @@ def run_point_in_time_backtest(
             "beta": round(beta, 2),
             "information_ratio": round(info_ratio, 2),
             "win_rate_pct": round(win_rate, 1),
-            "risk_free_rate_pct": round(INDIA_RISK_FREE_RATE * 100.0, 1),
+            "risk_free_rate_pct": round(risk_free_rate * 100.0, 1),
             "reporting_lag_days": 60,
         },
         "equity_curve": curve,

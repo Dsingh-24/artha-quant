@@ -21,6 +21,7 @@ StrategyPreset = Literal[
 WeightingScheme = Literal["equal", "score", "inv_vol"]
 RebalanceFrequency = Literal["quarterly", "semiannual", "annual"]
 RiskProfile = Literal["equity_direct", "conservative", "moderate", "aggressive"]
+MarketFilter = Literal["ALL", "IN", "US"]
 
 
 class AuthCredentials(BaseModel):
@@ -40,6 +41,19 @@ class ScreenerRequest(BaseModel):
     weights: Optional[FactorWeights] = None
     sector: str = Field(default="ALL", max_length=50)
     min_score: float = Field(default=0.0, ge=0.0, le=100.0)
+    market: MarketFilter = "ALL"
+
+
+class CompanyTickerQuery(BaseModel):
+    ticker: str = Field(..., min_length=1, max_length=24)
+
+    @field_validator("ticker")
+    @classmethod
+    def validate_ticker_symbol(cls, value: str) -> str:
+        cleaned = value.strip().upper()
+        if not TICKER_RE.match(cleaned):
+            raise ValueError("Invalid NSE/BSE or Nasdaq ticker symbol.")
+        return cleaned
 
 
 class TickerSyncRequest(BaseModel):
@@ -71,8 +85,9 @@ class BacktestRequest(BaseModel):
     top_n: int = Field(default=10, ge=3, le=20)
     rebalance: RebalanceFrequency = "annual"
     weighting: WeightingScheme = "equal"
-    initial_capital: float = Field(default=500_000.0, ge=50_000.0, le=1_000_000_000.0)
+    initial_capital: float = Field(default=500_000.0, ge=1_000.0, le=1_000_000_000.0)
     cost_bps: float = Field(default=25.0, ge=0.0, le=200.0)
+    market: MarketFilter = "IN"
 
 
 class PlannerRequest(BaseModel):
@@ -80,8 +95,9 @@ class PlannerRequest(BaseModel):
     lump_sum_inr: float = Field(default=500_000.0, ge=0.0, le=1_000_000_000.0)
     monthly_sip_inr: float = Field(default=0.0, ge=0.0, le=50_000_000.0)
     horizon_years: int = Field(default=7, ge=1, le=40)
-    target_corpus_inr: float = Field(default=1_500_000.0, ge=50_000.0, le=10_000_000_000.0)
+    target_corpus_inr: float = Field(default=1_500_000.0, ge=1_000.0, le=10_000_000_000.0)
     risk_profile: RiskProfile = "equity_direct"
     preset: StrategyPreset = "qglp_compounder"
     max_stocks: int = Field(default=8, ge=5, le=15)
+    market: MarketFilter = "ALL"
     save_plan: bool = False

@@ -73,6 +73,8 @@ class Database:
                     promoter_pct REAL NOT NULL DEFAULT 0.0,
                     inst_pct REAL NOT NULL DEFAULT 0.0,
                     data_source TEXT NOT NULL DEFAULT 'real_nse_live',
+                    market TEXT NOT NULL DEFAULT 'IN',
+                    currency TEXT NOT NULL DEFAULT 'INR',
                     updated_at INTEGER NOT NULL
                 );
 
@@ -92,6 +94,8 @@ class Database:
                     stage1_rank INTEGER NOT NULL DEFAULT 999,
                     shortlisted INTEGER NOT NULL DEFAULT 0,
                     deep_scored INTEGER NOT NULL DEFAULT 0,
+                    market TEXT NOT NULL DEFAULT 'IN',
+                    currency TEXT NOT NULL DEFAULT 'INR',
                     updated_at INTEGER NOT NULL
                 );
 
@@ -161,12 +165,22 @@ class Database:
                 );
                 """
             )
-            # Ensure backward-compatible migration if existing DB lacks promoter_pct / inst_pct
+            # Ensure backward-compatible migration if existing DB lacks newer columns
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(companies)").fetchall()}
             if "promoter_pct" not in cols:
                 conn.execute("ALTER TABLE companies ADD COLUMN promoter_pct REAL NOT NULL DEFAULT 0.0")
             if "inst_pct" not in cols:
                 conn.execute("ALTER TABLE companies ADD COLUMN inst_pct REAL NOT NULL DEFAULT 0.0")
+            if "market" not in cols:
+                conn.execute("ALTER TABLE companies ADD COLUMN market TEXT NOT NULL DEFAULT 'IN'")
+            if "currency" not in cols:
+                conn.execute("ALTER TABLE companies ADD COLUMN currency TEXT NOT NULL DEFAULT 'INR'")
+
+            s1_cols = {r["name"] for r in conn.execute("PRAGMA table_info(stage1_funnel)").fetchall()}
+            if "market" not in s1_cols:
+                conn.execute("ALTER TABLE stage1_funnel ADD COLUMN market TEXT NOT NULL DEFAULT 'IN'")
+            if "currency" not in s1_cols:
+                conn.execute("ALTER TABLE stage1_funnel ADD COLUMN currency TEXT NOT NULL DEFAULT 'INR'")
 
     # --- User & Session Management ---
 
@@ -234,8 +248,8 @@ class Database:
             if syn_cnt > 0:
                 conn.execute("DELETE FROM daily_prices WHERE ticker = ?", ("^NSEI",))
             conn.execute(
-                "DELETE FROM daily_prices WHERE ticker NOT IN (SELECT ticker FROM companies) AND ticker != ?",
-                ("^NSEI",),
+                "DELETE FROM daily_prices WHERE ticker NOT IN (SELECT ticker FROM companies) AND ticker NOT IN (?, ?)",
+                ("^NSEI", "^NDX"),
             )
 
     def count_companies(self) -> int:
@@ -258,15 +272,18 @@ class Database:
         data_source: str,
         promoter_pct: float = 0.0,
         inst_pct: float = 0.0,
+        market: str = "IN",
+        currency: str = "INR",
     ) -> None:
         now = int(time.time())
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO companies (
-                    ticker, name, sector, cap_tier, is_financial, promoter_pct, inst_pct, data_source, updated_at
+                    ticker, name, sector, cap_tier, is_financial, promoter_pct, inst_pct,
+                    data_source, market, currency, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ticker) DO UPDATE SET
                     name = excluded.name,
                     sector = excluded.sector,
@@ -275,20 +292,69 @@ class Database:
                     promoter_pct = CASE WHEN excluded.promoter_pct > 0 THEN excluded.promoter_pct ELSE companies.promoter_pct END,
                     inst_pct = CASE WHEN excluded.inst_pct > 0 THEN excluded.inst_pct ELSE companies.inst_pct END,
                     data_source = excluded.data_source,
+                    market = excluded.market,
+                    currency = excluded.currency,
                     updated_at = excluded.updated_at
                 """,
-                (ticker, name, sector, cap_tier, 1 if is_financial else 0, round(promoter_pct, 2), round(inst_pct, 2), data_source, now),
+                (
+                    ticker,
+                    name,
+                    sector,
+                    cap_tier,
+                    1 if is_financial else 0,
+                    round(promoter_pct, 2),
+                    round(inst_pct, 2),
+                    data_source,
+                    market,
+                    currency,
+                    now,
+                ),
             )
 
-    def upsert_stage1_funnel(self, rows: Iterable[Tuple[Any, ...]]) -> None:
+    def upsert_stage1_funnel(self, rows: Iterable[Any]) -> None:
+        now_default = int(time.time())
+        normalized: List[Tuple[Any, ...]] = []
+        for r in rows:
+            if isinstance(r, dict):
+                normalized.append(
+                    (
+                        r["ticker"],
+                        r["name"],
+                        r["sector"],
+                        r.get("industry", ""),
+                        float(r.get("last_price", 0.0)),
+                        float(r.get("ret_6m_pct", 0.0)),
+                        float(r.get("mom_12_1_pct", 0.0)),
+                        float(r.get("volatility_pct", 0.0)),
+                        float(r.get("dist_52w_high_pct", 0.0)),
+                        int(r.get("above_200dma", 0)),
+                        float(r.get("avg_turnover_cr", 0.0)),
+                        float(r.get("stage1_score", 0.0)),
+                        int(r.get("stage1_rank", 999)),
+                        int(r.get("shortlisted", 0)),
+                        int(r.get("deep_scored", 0)),
+                        int(r.get("updated_at", now_default)),
+                        str(r.get("market", "IN")),
+                        str(r.get("currency", "INR")),
+                    )
+                )
+            else:
+                tup = tuple(r)
+                if len(tup) == 16:
+                    normalized.append((*tup, "IN", "INR"))
+                elif len(tup) == 18:
+                    normalized.append(tup)
+                else:
+                    raise ValueError(f"Expected 16- or 18-tuple for stage1_funnel, got length {len(tup)}")
+
         with self.connect() as conn:
             conn.executemany(
                 """
                 INSERT INTO stage1_funnel (
                     ticker, name, sector, industry, last_price, ret_6m_pct, mom_12_1_pct,
                     volatility_pct, dist_52w_high_pct, above_200dma, avg_turnover_cr,
-                    stage1_score, stage1_rank, shortlisted, deep_scored, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    stage1_score, stage1_rank, shortlisted, deep_scored, updated_at, market, currency
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ticker) DO UPDATE SET
                     name = excluded.name,
                     sector = excluded.sector,
@@ -304,10 +370,15 @@ class Database:
                     stage1_rank = excluded.stage1_rank,
                     shortlisted = MAX(stage1_funnel.shortlisted, excluded.shortlisted),
                     deep_scored = MAX(stage1_funnel.deep_scored, excluded.deep_scored),
+                    market = excluded.market,
+                    currency = excluded.currency,
                     updated_at = excluded.updated_at
                 """,
-                list(rows),
+                normalized,
             )
+
+    def upsert_stage1_rows(self, rows: Iterable[Any]) -> None:
+        self.upsert_stage1_funnel(rows)
 
     def mark_funnel_deep_scored(self, ticker: str) -> None:
         now = int(time.time())
@@ -320,14 +391,20 @@ class Database:
     def get_stage1_funnel(self) -> List[Dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM stage1_funnel ORDER BY stage1_rank ASC, stage1_score DESC"
+                """
+                SELECT ticker, name, sector, industry, last_price, ret_6m_pct, mom_12_1_pct,
+                       volatility_pct, dist_52w_high_pct, above_200dma, avg_turnover_cr,
+                       stage1_score, stage1_rank, shortlisted, deep_scored, market, currency, updated_at
+                FROM stage1_funnel
+                ORDER BY stage1_rank ASC, stage1_score DESC
+                """
             ).fetchall()
             return [dict(r) for r in rows]
 
     def get_next_unscored_funnel_tickers(self, limit: int = 25) -> List[Dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT ticker, name, sector FROM stage1_funnel WHERE deep_scored = 0 ORDER BY stage1_rank ASC LIMIT ?",
+                "SELECT ticker, name, sector, market, currency FROM stage1_funnel WHERE deep_scored = 0 AND market = 'IN' ORDER BY stage1_rank ASC LIMIT ?",
                 (limit,),
             ).fetchall()
             return [dict(r) for r in rows]
@@ -383,14 +460,24 @@ class Database:
     def get_all_companies(self) -> List[Dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT ticker, name, sector, cap_tier, is_financial, promoter_pct, inst_pct, data_source, updated_at FROM companies ORDER BY ticker ASC"
+                """
+                SELECT ticker, name, sector, cap_tier, is_financial, promoter_pct, inst_pct,
+                       data_source, market, currency, updated_at
+                FROM companies
+                ORDER BY ticker ASC
+                """
             ).fetchall()
             return [dict(r) for r in rows]
 
     def get_company(self, ticker: str) -> Optional[Dict[str, Any]]:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT ticker, name, sector, cap_tier, is_financial, promoter_pct, inst_pct, data_source, updated_at FROM companies WHERE ticker = ?",
+                """
+                SELECT ticker, name, sector, cap_tier, is_financial, promoter_pct, inst_pct,
+                       data_source, market, currency, updated_at
+                FROM companies
+                WHERE ticker = ?
+                """,
                 (ticker,),
             ).fetchone()
             return dict(row) if row else None

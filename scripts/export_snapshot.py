@@ -35,6 +35,8 @@ def export_public_snapshot(db_path: Path = DEFAULT_DB_PATH, out_path: Path | Non
             "promoter_pct": round(float(c.get("promoter_pct") or 0.0), 2),
             "inst_pct": round(float(c.get("inst_pct") or 0.0), 2),
             "data_source": c.get("data_source", "real_nse_screener"),
+            "market": c.get("market", "IN"),
+            "currency": c.get("currency", "INR"),
         }
         for c in db.get_all_companies()
     ]
@@ -55,6 +57,8 @@ def export_public_snapshot(db_path: Path = DEFAULT_DB_PATH, out_path: Path | Non
             "stage1_score": round(float(r["stage1_score"]), 1),
             "stage1_rank": int(r["stage1_rank"]),
             "deep_scored": int(r["deep_scored"]),
+            "market": r.get("market", "IN"),
+            "currency": r.get("currency", "INR"),
         }
         for r in db.get_stage1_funnel()
     ]

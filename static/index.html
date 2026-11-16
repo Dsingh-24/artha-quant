@@ -3,21 +3,21 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ArthaQuant — Indian Equity Investment Advisor, Backtester &amp; Planner</title>
+  <title>ArthaQuant V2 — NSE &amp; Nasdaq-100 Stock Rankings, Score Reasoning &amp; Wealth Planner</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <!-- Toast notification bar (no native alert/confirm/prompt) -->
+  <!-- Non-blocking toast notification bar -->
   <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
-  <!-- Advisor Workspace Auth Gate -->
+  <!-- Local Advisor Auth Gate (shown only when running local FastAPI server) -->
   <section id="auth-screen" class="auth-screen hidden">
     <div class="auth-card">
       <div class="brand-row">
         <span class="brand-badge">AQ</span>
         <div>
-          <h1>ArthaQuant India</h1>
-          <p class="subtitle">Institutional Factor Ratings, Backtesting &amp; Wealth Planner</p>
+          <h1>ArthaQuant Global</h1>
+          <p class="subtitle">NSE Nifty-200 &amp; US Nasdaq-100 Rankings, Score Reasoning &amp; Wealth Planner</p>
         </div>
       </div>
       <p id="auth-subtitle" class="auth-desc"></p>
@@ -30,144 +30,323 @@
         <button id="auth-submit-btn" type="submit" class="btn btn-primary btn-full">Initialize Workspace</button>
       </form>
       <div class="firm-pills">
-        <span class="pill">AQR Multi-Factor</span>
+        <span class="pill">QGLP Compounders</span>
         <span class="pill">Marcellus Coffee-Can</span>
-        <span class="pill">Gotham Magic Formula</span>
-        <span class="pill">Piotroski F-Score</span>
+        <span class="pill">Greenblatt Magic Formula</span>
+        <span class="pill">Piotroski 9-Point</span>
       </div>
     </div>
   </section>
 
-  <!-- Main Institutional Terminal -->
+  <!-- Main Application Shell -->
   <div id="app-shell" class="app-shell hidden">
     <header class="topbar">
       <div class="brand-row">
         <span class="brand-badge">AQ</span>
         <div>
-          <div class="brand-title">ArthaQuant <span class="tag-nse">NSE INDIA</span></div>
-          <div id="market-status-line" class="subtitle">Loading market snapshot...</div>
+          <div class="brand-title">
+            <span>ArthaQuant</span>
+            <span class="tag-nse">NSE NIFTY 200</span>
+            <span class="tag-nasdaq">NASDAQ 100</span>
+          </div>
+          <div id="market-status-line" class="subtitle">Loading audited Indian NSE &amp; US Nasdaq-100 fundamentals...</div>
         </div>
       </div>
 
       <nav class="nav-tabs" role="tablist">
-        <button type="button" class="nav-tab active" data-tab="screener">1. Fundamental Screener &amp; Ratings</button>
-        <button type="button" class="nav-tab" data-tab="planner">2. Deploy ₹5L Today (Advisor Blueprint)</button>
-        <button type="button" class="nav-tab" data-tab="backtest">3. 5Y Long-Term Backtester</button>
+        <button type="button" class="nav-tab active" data-tab="screener">Stock Rankings &amp; Research</button>
+        <button type="button" id="nav-planner-tab" class="nav-tab" data-tab="planner">Investment Planner</button>
+        <button type="button" class="nav-tab" data-tab="backtest">5-Year Strategy Backtest</button>
       </nav>
 
       <div class="user-bar">
+        <button id="toggle-data-drawer-btn" type="button" class="btn btn-ghost btn-sm">Data &amp; Live Sync</button>
         <span id="user-badge" class="user-chip"></span>
-        <button id="logout-btn" type="button" class="btn btn-ghost">Sign Out</button>
+        <button id="logout-btn" type="button" class="btn btn-ghost btn-sm">Sign Out</button>
       </div>
     </header>
 
-    <main class="main-container">
-      <!-- TAB 1: FUNDAMENTAL SCREENER & COMPANY DEEP DIVE -->
-      <section id="tab-screener" class="tab-panel">
-        <div class="kpi-strip" id="screener-kpis"></div>
-
-        <!-- Two-Stage Nifty 200 Institutional Funnel Bar -->
-        <div class="funnel-bar">
-          <div class="funnel-steps">
-            <span class="funnel-step" id="funnel-stage1-pill">Stage 1 Bulk Scan: -- NSE Stocks</span>
-            <span class="funnel-arrow">→</span>
-            <span class="funnel-step funnel-step-active" id="funnel-stage2-pill">Stage 2 Deep Fundamental Scored: -- Stocks</span>
+    <!-- Collapsible Data Management, Funnel Switcher & Live Sync Bar -->
+    <section id="data-sync-drawer" class="data-drawer hidden">
+      <div class="data-drawer-inner">
+        <div class="data-drawer-row">
+          <div>
+            <div class="drawer-heading">Universe &amp; Live Data Controls</div>
+            <div class="muted-note" id="funnel-summary-note">Nifty-200 &amp; Nasdaq-100 liquid universe deep-scored on multi-year audited financials.</div>
+          </div>
+          <div class="inline-group wrap-group">
+            <button id="view-stage2-btn" type="button" class="btn btn-primary btn-sm">Audited Rankings</button>
+            <button id="view-stage1-btn" type="button" class="btn btn-ghost btn-sm">Raw Stage-1 Price Scan</button>
+            <button id="fast-prices-btn" type="button" class="btn btn-secondary btn-sm">Weekly Price Refresh (4s)</button>
+            <button id="expand-funnel-btn" type="button" class="btn btn-ghost btn-sm">+ Deep-Score Remaining</button>
+            <button id="refresh-funnel-btn" type="button" class="btn btn-ghost btn-sm">Full Funnel Sync</button>
+          </div>
+        </div>
+        <div class="data-drawer-grid">
+          <div class="inline-group">
+            <input id="sync-ticker-input" type="text" placeholder="Sync custom NSE symbol (e.g. ZOMATO.NS)" maxlength="24" class="input-control" />
+            <button id="sync-ticker-btn" type="button" class="btn btn-ghost btn-sm">Sync Stock</button>
           </div>
           <div class="inline-group">
-            <button id="view-stage2-btn" type="button" class="btn btn-primary">Stage 2: Deep Fundamental Ratings</button>
-            <button id="view-stage1-btn" type="button" class="btn btn-ghost">Stage 1: All 200 Bulk Funnel</button>
-            <button id="fast-prices-btn" type="button" class="btn btn-secondary">Weekly Price Refresh (4s)</button>
-            <button id="expand-funnel-btn" type="button" class="btn btn-ghost">+ Deep-Score Next 30</button>
-            <button id="refresh-funnel-btn" type="button" class="btn btn-ghost">Full Funnel Sync</button>
+            <input id="csv-file-input" type="file" accept=".csv" class="file-input" />
+            <button id="csv-upload-btn" type="button" class="btn btn-ghost btn-sm">Import Screener CSV</button>
           </div>
         </div>
+      </div>
+    </section>
 
+    <main class="main-container">
+      <!-- TAB 1: CLEAN MULTI-MARKET STOCK RANKINGS LEADERBOARD -->
+      <section id="tab-screener" class="tab-panel">
         <div class="control-card">
-          <div class="control-grid">
-            <div>
-              <label class="field-label" for="screener-preset">Investment Philosophy / Firm Model</label>
-              <select id="screener-preset" class="input-control">
-                <option value="qglp_compounder" selected>Long-Term QGLP Compounder (45% 5Y Quality / 25% Growth / 20% GARP)</option>
-                <option value="coffee_can">Marcellus Coffee-Can (55% Quality + 30% 5Y Compounding)</option>
-                <option value="magic_formula">Joel Greenblatt Magic Formula (Earnings Yield + ROCE)</option>
-                <option value="artha_blend">Artha Balanced Multi-Factor (Quality + Value + Growth + Mom)</option>
-                <option value="value_momentum">AQR Tactical Value + Momentum</option>
-                <option value="custom">Custom Factor Weights</option>
-              </select>
+          <!-- Market Switcher Row -->
+          <div class="market-bar-row">
+            <div class="market-bar-label">
+              <span class="drawer-heading">Equity Market Universe</span>
+              <span class="muted-note">Every company displays its Indian NSE or US Nasdaq-100 listing &amp; native currency</span>
             </div>
-            <div>
-              <label class="field-label" for="screener-sector">NSE Sector Filter</label>
-              <select id="screener-sector" class="input-control">
-                <option value="ALL">All Indian Sectors</option>
-              </select>
-            </div>
-            <div>
-              <label class="field-label" for="screener-min-score">Min Composite Score</label>
-              <input id="screener-min-score" type="number" min="0" max="95" step="5" value="0" class="input-control" />
-            </div>
-            <div class="sync-box">
-              <label class="field-label" for="sync-ticker-input">Sync Any Custom NSE Stock Live</label>
-              <div class="inline-group">
-                <input id="sync-ticker-input" type="text" placeholder="e.g. ZOMATO.NS or DIXON.NS" maxlength="24" class="input-control" />
-                <button id="sync-ticker-btn" type="button" class="btn btn-secondary">Deep Sync</button>
-              </div>
+            <div id="screener-market-switcher" class="market-switcher" role="group" aria-label="Screener Market Filter">
+              <button type="button" class="market-btn active" data-market="ALL">
+                <span>All Markets</span>
+                <span id="mkt-count-all" class="ms-count"></span>
+              </button>
+              <button type="button" class="market-btn market-btn-in" data-market="IN">
+                <span class="ms-dot ms-dot-in"></span>
+                <span>Indian Stocks (NSE)</span>
+                <span id="mkt-count-in" class="ms-count"></span>
+              </button>
+              <button type="button" class="market-btn market-btn-us" data-market="US">
+                <span class="ms-dot ms-dot-us"></span>
+                <span>US Stocks (Nasdaq-100)</span>
+                <span id="mkt-count-us" class="ms-count"></span>
+              </button>
             </div>
           </div>
 
+          <div class="filter-bar-grid">
+            <div>
+              <label class="field-label" for="screener-search">Search Company, Ticker, or Sector</label>
+              <input id="screener-search" type="search" placeholder="Search NSE &amp; Nasdaq-100 stocks (e.g. Muthoot, NVDA, MSFT, ICICI, Apple, Dixon)..." class="input-control" />
+            </div>
+            <div>
+              <label class="field-label" for="screener-preset">Scoring Philosophy (Ranking Model)</label>
+              <select id="screener-preset" class="input-control">
+                <option value="qglp_compounder" selected>Long-Term QGLP Compounder (Recommended)</option>
+                <option value="coffee_can">Marcellus Coffee-Can (55% Moat + 30% Growth)</option>
+                <option value="magic_formula">Greenblatt Magic Formula (Quality + Value)</option>
+                <option value="artha_blend">Balanced 4-Factor Blend</option>
+                <option value="value_momentum">AQR Tactical Value + Momentum</option>
+                <option value="custom">Custom Pillar Weights...</option>
+              </select>
+            </div>
+            <div>
+              <label id="screener-sector-label" class="field-label" for="screener-sector">Sector Filter</label>
+              <select id="screener-sector" class="input-control">
+                <option value="ALL">All Sectors</option>
+              </select>
+            </div>
+            <div>
+              <label class="field-label" for="screener-sort">Sort Rankings By</label>
+              <select id="screener-sort" class="input-control">
+                <option value="composite" selected>Overall Rank (Composite Score)</option>
+                <option value="quality">Quality &amp; 8Y Moat Pillar</option>
+                <option value="growth">Growth (5Y + 2Q) Pillar</option>
+                <option value="value">Valuation (Fair P/E Upside) Pillar</option>
+                <option value="mcap">Market Cap (Largest First)</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Custom Weights Row (hidden unless Custom is chosen) -->
           <div id="custom-weights-row" class="weights-row hidden">
             <div>
-              <label class="field-label" for="w-quality">Quality Weight (%)</label>
-              <input id="w-quality" type="number" min="0" max="100" value="35" class="input-control" />
+              <label class="field-label" for="w-quality">Quality &amp; Moat (%)</label>
+              <input id="w-quality" type="number" min="0" max="100" value="45" class="input-control" />
             </div>
             <div>
-              <label class="field-label" for="w-value">Value Weight (%)</label>
-              <input id="w-value" type="number" min="0" max="100" value="25" class="input-control" />
+              <label class="field-label" for="w-growth">5Y + 2Q Growth (%)</label>
+              <input id="w-growth" type="number" min="0" max="100" value="25" class="input-control" />
             </div>
             <div>
-              <label class="field-label" for="w-growth">Growth Weight (%)</label>
-              <input id="w-growth" type="number" min="0" max="100" value="20" class="input-control" />
+              <label class="field-label" for="w-value">GARP Valuation (%)</label>
+              <input id="w-value" type="number" min="0" max="100" value="20" class="input-control" />
             </div>
             <div>
-              <label class="field-label" for="w-momentum">Momentum &amp; F-Score (%)</label>
-              <input id="w-momentum" type="number" min="0" max="100" value="20" class="input-control" />
+              <label class="field-label" for="w-momentum">Piotroski &amp; Smart Money (%)</label>
+              <input id="w-momentum" type="number" min="0" max="100" value="10" class="input-control" />
             </div>
             <div class="align-end">
-              <button id="apply-weights-btn" type="button" class="btn btn-primary">Re-Score Universe</button>
+              <button id="apply-weights-btn" type="button" class="btn btn-primary btn-full">Apply Custom Formula</button>
             </div>
           </div>
 
-          <div class="csv-bar">
-            <span class="muted-note">Have custom Screener.in exports? Upload UTF-8 CSV (ticker, name, sector, fiscal_year, revenue_cr, ebitda_cr, net_profit_cr, roce_pct, roe_pct, debt_to_equity):</span>
-            <div class="inline-group">
-              <input id="csv-file-input" type="file" accept=".csv" class="file-input" />
-              <button id="csv-upload-btn" type="button" class="btn btn-ghost">Import CSV</button>
-            </div>
-          </div>
+          <!-- Transparent Formula Legend -->
+          <div class="formula-legend-bar" id="active-formula-bar"></div>
         </div>
 
-        <div class="split-workspace">
-          <div class="panel table-panel">
-            <div class="panel-header">
-              <h2 id="table-panel-title">Stage 2: Deep Fundamental Ratings (Real Consolidated NSE Data)</h2>
-              <span class="muted-note" id="table-panel-sub">Click any company row for forensic thesis &amp; 5Y trend</span>
-            </div>
-            <div class="table-scroll">
-              <table class="quant-table">
-                <thead id="screener-thead"></thead>
-                <tbody id="screener-tbody"></tbody>
-              </table>
-            </div>
-          </div>
+        <!-- Interactive Rating Tier Filter Cards -->
+        <div id="rating-filter-strip" class="rating-filter-grid"></div>
 
-          <aside class="panel detail-panel" id="company-detail-panel">
-            <div id="company-detail-content" class="detail-body"></div>
-          </aside>
+        <!-- Top 3 Ranked Spotlight Podium -->
+        <div id="podium-section">
+          <div class="section-heading-row">
+            <h2 id="podium-heading">Top Conviction Leaders</h2>
+            <span class="muted-note">Click any card or row to inspect the exact step-by-step score calculation &amp; 8-year evidence</span>
+          </div>
+          <div id="top-podium-grid" class="podium-grid"></div>
+        </div>
+
+        <!-- Clean Full-Width Leaderboard Table -->
+        <div class="panel leaderboard-panel">
+          <div class="panel-header">
+            <div>
+              <h2 id="table-panel-title">Global Multi-Market Fundamental Rankings</h2>
+              <p class="muted-note" id="table-panel-sub">Click any company to open its full Score Reasoning &amp; Forensic Deep Dive</p>
+            </div>
+            <span id="visible-count-badge" class="pill"></span>
+          </div>
+          <div class="table-scroll leaderboard-scroll">
+            <table class="quant-table leaderboard-table">
+              <thead id="screener-thead"></thead>
+              <tbody id="screener-tbody"></tbody>
+            </table>
+          </div>
         </div>
       </section>
 
-      <!-- TAB 2: POINT-IN-TIME BACKTESTER -->
+      <!-- TAB 2: CAPITAL DEPLOYMENT & WEALTH PLANNER -->
+      <section id="tab-planner" class="tab-panel hidden">
+        <div class="control-card">
+          <div class="market-bar-row">
+            <div class="market-bar-label">
+              <span class="drawer-heading">Deployment Universe &amp; Plan Currency</span>
+              <span class="muted-note" id="pl-market-sub">Select Indian NSE (₹ INR), US Nasdaq-100 ($ USD), or Global All-Market deployment</span>
+            </div>
+            <div id="planner-market-switcher" class="market-switcher" role="group" aria-label="Planner Market Filter">
+              <button type="button" class="market-btn active" data-market="ALL">
+                <span>All Markets (₹ INR)</span>
+              </button>
+              <button type="button" class="market-btn market-btn-in" data-market="IN">
+                <span class="ms-dot ms-dot-in"></span>
+                <span>Indian Stocks (NSE · ₹)</span>
+              </button>
+              <button type="button" class="market-btn market-btn-us" data-market="US">
+                <span class="ms-dot ms-dot-us"></span>
+                <span>US Stocks (Nasdaq-100 · $)</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="control-grid six-col">
+            <div>
+              <label id="pl-lumpsum-label" class="field-label" for="pl-lumpsum">Capital to Deploy Today (₹ INR)</label>
+              <input id="pl-lumpsum" type="number" min="0" step="50000" value="500000" class="input-control" />
+            </div>
+            <div>
+              <label id="pl-sip-label" class="field-label" for="pl-sip">Optional Monthly SIP (₹ INR)</label>
+              <input id="pl-sip" type="number" min="0" step="5000" value="0" class="input-control" />
+            </div>
+            <div>
+              <label class="field-label" for="pl-horizon">Holding Horizon (Years)</label>
+              <input id="pl-horizon" type="number" min="1" max="40" value="7" class="input-control" />
+            </div>
+            <div>
+              <label id="pl-target-label" class="field-label" for="pl-target">Target Corpus Goal (₹ INR)</label>
+              <input id="pl-target" type="number" min="1000" step="100000" value="1300000" class="input-control" />
+            </div>
+            <div>
+              <label class="field-label" for="pl-risk">Portfolio Mode</label>
+              <select id="pl-risk" class="input-control">
+                <option value="equity_direct" selected>100% Direct Compounder Basket</option>
+                <option value="aggressive">Aggressive Multi-Asset (85% Eq / 10% Cash / 5% Gold)</option>
+                <option value="moderate">Moderate Multi-Asset (70% Eq / 20% Debt / 10% Gold)</option>
+                <option value="conservative">Conservative (45% Eq / 40% Debt / 15% Gold)</option>
+              </select>
+            </div>
+            <div class="align-end">
+              <button id="run-planner-btn" type="button" class="btn btn-primary btn-full">Build ₹ Blueprint</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="pl-kpis" class="kpi-strip"></div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 id="pl-basket-title">Recommended Buy Basket — Where to Invest &amp; Why</h2>
+              <p class="muted-note" id="pl-basket-sub">Max 2 stocks per sector • Non-cyclical compounders prioritized • Click any stock for full Score Reasoning</p>
+            </div>
+          </div>
+          <div class="table-scroll">
+            <table class="quant-table leaderboard-table">
+              <thead>
+                <tr>
+                  <th>Company &amp; Portfolio Role</th>
+                  <th>Verdict</th>
+                  <th>Score</th>
+                  <th>CMP vs Fair P/E</th>
+                  <th>Allocation &amp; Shares</th>
+                  <th>Entry Execution Plan</th>
+                  <th>Investment Rationale</th>
+                  <th>Deep Dive</th>
+                </tr>
+              </thead>
+              <tbody id="pl-basket-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="charts-two-col">
+          <div class="panel">
+            <div class="panel-header">
+              <h2 id="pl-cone-title">1,000-Path Wealth Projection Cone (₹)</h2>
+              <div class="legend-inline">
+                <span class="legend-dot dot-cyan"></span><span>90th Bull</span>
+                <span class="legend-dot dot-emerald"></span><span>50th Median</span>
+                <span class="legend-dot dot-amber"></span><span>10th Bear</span>
+              </div>
+            </div>
+            <div id="pl-cone-chart" class="chart-box"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Asset Allocation &amp; Hold Discipline</h2>
+              <span id="pl-profile-label" class="muted-note"></span>
+            </div>
+            <div id="pl-asset-bars" class="asset-bars"></div>
+            <div class="discipline-box">
+              <div class="drawer-heading">Low-Churn Long-Term Hold Rules</div>
+              <ul id="pl-monitoring-list" class="thesis-list"></ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: POINT-IN-TIME BACKTESTER -->
       <section id="tab-backtest" class="tab-panel hidden">
         <div class="control-card">
+          <div class="market-bar-row">
+            <div class="market-bar-label">
+              <span class="drawer-heading">Backtest Market &amp; Benchmark Index</span>
+              <span class="muted-note">Simulates point-in-time portfolios vs. Nifty 50 (^NSEI) or Nasdaq 100 (^NDX)</span>
+            </div>
+            <div id="bt-market-switcher" class="market-switcher" role="group" aria-label="Backtest Market Filter">
+              <button type="button" class="market-btn" data-market="ALL">
+                <span>All Markets</span>
+              </button>
+              <button type="button" class="market-btn market-btn-in active" data-market="IN">
+                <span class="ms-dot ms-dot-in"></span>
+                <span>Indian Stocks (NSE)</span>
+              </button>
+              <button type="button" class="market-btn market-btn-us" data-market="US">
+                <span class="ms-dot ms-dot-us"></span>
+                <span>US Stocks (Nasdaq-100)</span>
+              </button>
+            </div>
+          </div>
+
           <div class="control-grid six-col">
             <div>
               <label class="field-label" for="bt-preset">Strategy Model</label>
@@ -175,7 +354,7 @@
                 <option value="qglp_compounder" selected>Long-Term QGLP Compounder</option>
                 <option value="coffee_can">Marcellus Coffee-Can</option>
                 <option value="magic_formula">Greenblatt Magic Formula</option>
-                <option value="artha_blend">Artha Balanced Multi-Factor</option>
+                <option value="artha_blend">Balanced Multi-Factor</option>
                 <option value="value_momentum">AQR Value + Momentum</option>
               </select>
             </div>
@@ -189,7 +368,7 @@
               </select>
             </div>
             <div>
-              <label class="field-label" for="bt-topn">Portfolio Size (Top N)</label>
+              <label class="field-label" for="bt-topn">Portfolio Concentration</label>
               <select id="bt-topn" class="input-control">
                 <option value="5">Top 5 High-Conviction</option>
                 <option value="8" selected>Top 8 Concentrated</option>
@@ -198,7 +377,7 @@
               </select>
             </div>
             <div>
-              <label class="field-label" for="bt-rebal">Rebalance Cadence</label>
+              <label class="field-label" for="bt-rebal">Rebalance Frequency</label>
               <select id="bt-rebal" class="input-control">
                 <option value="annual" selected>Annual Buy &amp; Hold (252d)</option>
                 <option value="semiannual">Semi-Annual (126d)</option>
@@ -210,15 +389,15 @@
               <select id="bt-weight" class="input-control">
                 <option value="equal" selected>Equal Weight (1/N)</option>
                 <option value="score">Conviction Score Tilt</option>
-                <option value="inv_vol">Bridgewater Inverse-Vol</option>
+                <option value="inv_vol">Inverse-Volatility</option>
               </select>
             </div>
             <div class="align-end">
               <button id="run-backtest-btn" type="button" class="btn btn-primary btn-full">Run Backtest</button>
             </div>
           </div>
-          <div class="muted-note top-gap">
-            Bias Guardrails Active: <strong>60-day SEBI LODR reporting lag</strong> enforced on annual financials + <strong>25 bps</strong> Indian delivery brokerage/STT/slippage per turnover + <strong>6.8% India 10Y G-Sec</strong> Sharpe risk-free rate.
+          <div id="bt-guardrail-note" class="muted-note top-gap">
+            Bias Guardrails Active: 60-day SEBI LODR reporting lag enforced on annual statements • 25 bps Indian delivery STT/brokerage/slippage per turnover • 6.8% India 10Y G-Sec Sharpe risk-free rate.
           </div>
         </div>
 
@@ -227,10 +406,10 @@
         <div class="charts-two-col">
           <div class="panel">
             <div class="panel-header">
-              <h2>₹5,00,000 Long-Term Wealth Growth vs. Nifty 50 (^NSEI)</h2>
+              <h2 id="bt-equity-title">₹5,00,000 Wealth Growth vs. Nifty 50 (^NSEI)</h2>
               <div class="legend-inline">
                 <span class="legend-dot dot-emerald"></span><span>Model Portfolio</span>
-                <span class="legend-dot dot-slate"></span><span>Nifty 50 Benchmark</span>
+                <span class="legend-dot dot-slate"></span><span id="bt-bm-legend">Nifty 50 Benchmark</span>
               </div>
             </div>
             <div id="bt-equity-chart" class="chart-box"></div>
@@ -249,18 +428,18 @@
           <div class="panel">
             <div class="panel-header">
               <h2>Current Model Portfolio Holdings</h2>
-              <span class="muted-note">Latest rebalance allocation</span>
+              <span class="muted-note">Click any holding to inspect its Score Reasoning</span>
             </div>
             <div class="table-scroll short-scroll">
-              <table class="quant-table">
+              <table class="quant-table leaderboard-table">
                 <thead>
                   <tr>
-                    <th>Ticker</th>
-                    <th>Company</th>
+                    <th>Company &amp; Market</th>
                     <th>Sector</th>
-                    <th>Rating</th>
+                    <th>Verdict</th>
                     <th>Score</th>
                     <th>Weight</th>
+                    <th>Deep Dive</th>
                   </tr>
                 </thead>
                 <tbody id="bt-holdings-tbody"></tbody>
@@ -271,7 +450,7 @@
           <div class="panel">
             <div class="panel-header">
               <h2>Historical Rebalance Ledger</h2>
-              <span class="muted-note">Point-in-time period returns vs. Nifty 50</span>
+              <span id="bt-ledger-sub" class="muted-note">Point-in-time period returns vs. Nifty 50</span>
             </div>
             <div class="table-scroll short-scroll">
               <table class="quant-table">
@@ -281,7 +460,7 @@
                     <th>Top Selections</th>
                     <th>Turnover</th>
                     <th>Strategy</th>
-                    <th>Nifty 50</th>
+                    <th id="bt-ledger-bm-th">Nifty 50</th>
                     <th>Excess</th>
                   </tr>
                 </thead>
@@ -291,98 +470,22 @@
           </div>
         </div>
       </section>
-
-      <!-- TAB 3: DEPLOY CAPITAL TODAY & LONG-TERM WEALTH ADVISOR -->
-      <section id="tab-planner" class="tab-panel hidden">
-        <div class="control-card">
-          <div class="control-grid six-col">
-            <div>
-              <label class="field-label" for="pl-lumpsum">Capital to Deploy Today (₹)</label>
-              <input id="pl-lumpsum" type="number" min="0" step="50000" value="500000" class="input-control" />
-            </div>
-            <div>
-              <label class="field-label" for="pl-sip">Optional Monthly SIP (₹)</label>
-              <input id="pl-sip" type="number" min="0" step="5000" value="0" class="input-control" />
-            </div>
-            <div>
-              <label class="field-label" for="pl-horizon">Holding Horizon (Years)</label>
-              <input id="pl-horizon" type="number" min="1" max="40" value="7" class="input-control" />
-            </div>
-            <div>
-              <label class="field-label" for="pl-target">Target Corpus Goal (₹)</label>
-              <input id="pl-target" type="number" min="50000" step="100000" value="1300000" class="input-control" />
-            </div>
-            <div>
-              <label class="field-label" for="pl-risk">Allocation Mode</label>
-              <select id="pl-risk" class="input-control">
-                <option value="equity_direct" selected>100% Direct Long-Term NSE Compounders</option>
-                <option value="aggressive">Aggressive Multi-Asset (85% Eq / 10% Cash / 5% Gold)</option>
-                <option value="moderate">Moderate Multi-Asset (70% Eq / 20% Debt / 10% Gold)</option>
-                <option value="conservative">Conservative (45% Eq / 40% Debt / 15% Gold)</option>
-              </select>
-            </div>
-            <div class="align-end">
-              <button id="run-planner-btn" type="button" class="btn btn-primary btn-full">Build ₹ Deployment Plan</button>
-            </div>
-          </div>
-        </div>
-
-        <div id="pl-kpis" class="kpi-strip"></div>
-
-        <div class="panel">
-          <div class="panel-header">
-            <h2>Where to Invest Today &amp; Why — Diversified Fundamental Stock Blueprint</h2>
-            <span class="muted-note">Max 2/sector • 8Y Moat Stability &ge; 52 • 2Q YoY &amp; 4Q Inst Flow verified • &gt;56x P/E &amp; peak cyclicals excluded</span>
-          </div>
-          <div class="table-scroll">
-            <table class="quant-table">
-              <thead>
-                <tr>
-                  <th>Stock &amp; Role</th>
-                  <th>Rating</th>
-                  <th>Score</th>
-                  <th>CMP vs Fair P/E</th>
-                  <th>Allocation (₹)</th>
-                  <th>Entry Execution Plan</th>
-                  <th>Why Invest (5Y Moat, Growth &amp; Valuation Rationale)</th>
-                </tr>
-              </thead>
-              <tbody id="pl-basket-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-
-        <div class="panel" id="pl-monitoring-panel">
-          <div class="panel-header">
-            <h2>Long-Term Investor Discipline (Weekly Check &amp; Low-Churn Hold Rules)</h2>
-          </div>
-          <ul id="pl-monitoring-list" class="thesis-list"></ul>
-        </div>
-
-        <div class="charts-two-col">
-          <div class="panel">
-            <div class="panel-header">
-              <h2>1,000-Path Long-Term Wealth Cone (₹)</h2>
-              <div class="legend-inline">
-                <span class="legend-dot dot-cyan"></span><span>90th Bull</span>
-                <span class="legend-dot dot-emerald"></span><span>50th Base</span>
-                <span class="legend-dot dot-amber"></span><span>10th Bear</span>
-              </div>
-            </div>
-            <div id="pl-cone-chart" class="chart-box"></div>
-          </div>
-
-          <div class="panel">
-            <div class="panel-header">
-              <h2>Portfolio Sleeve Breakdown</h2>
-              <span id="pl-profile-label" class="muted-note"></span>
-            </div>
-            <div id="pl-asset-bars" class="asset-bars"></div>
-          </div>
-        </div>
-      </section>
     </main>
   </div>
+
+  <!-- SLIDE-OVER STOCK SCORE REASONING & FORENSIC DEEP DIVE DRAWER -->
+  <div id="deep-dive-backdrop" class="drawer-backdrop hidden"></div>
+  <aside id="deep-dive-drawer" class="deep-dive-drawer hidden" aria-label="Stock Score Deep Dive">
+    <div class="drawer-sticky-bar">
+      <div class="inline-group">
+        <button id="dd-prev-btn" type="button" class="btn btn-ghost btn-sm">&larr; Prev Rank</button>
+        <button id="dd-next-btn" type="button" class="btn btn-ghost btn-sm">Next Rank &rarr;</button>
+        <span id="dd-nav-label" class="muted-note"></span>
+      </div>
+      <button id="dd-close-btn" type="button" class="btn btn-ghost btn-sm">Close (Esc) &times;</button>
+    </div>
+    <div id="company-detail-content" class="drawer-scroll-body"></div>
+  </aside>
 
   <script type="module" src="/static/app.js"></script>
 </body>
