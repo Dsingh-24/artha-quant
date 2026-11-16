@@ -263,7 +263,7 @@ def _authenticated_multimarket_client(tmp_path: Path) -> tuple[TestClient, str]:
     from app.database import DEFAULT_DB_PATH, Database
 
     db_copy = tmp_path / "multimarket_artha.db"
-    if DEFAULT_DB_PATH.exists():
+    if DEFAULT_DB_PATH.exists() and Database(db_path=DEFAULT_DB_PATH).count_companies() >= 250:
         shutil.copy2(DEFAULT_DB_PATH, db_copy)
     else:
         snap_path = Path(__file__).resolve().parent.parent / "static" / "data" / "market_snapshot.json"
@@ -310,7 +310,8 @@ def _authenticated_multimarket_client(tmp_path: Path) -> tuple[TestClient, str]:
             )
             for f in snap["fundamentals"]
         )
-        for q in snap.get("quarterly_signals", []):
+        q_raw = snap.get("quarterly_signals", {})
+        for q in (q_raw.values() if isinstance(q_raw, dict) else q_raw):
             db.upsert_quarterly_signals(q)
         dates = snap["price_dates"]
         price_rows = [
