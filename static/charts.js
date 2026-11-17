@@ -213,6 +213,104 @@ export function createContributionBarSvg(contributions, height = 8) {
   return svg;
 }
 
+export function createConsensusBarSvg(street) {
+  const s = street || {};
+  let sb = Math.max(0, Math.round(Number(s.strong_buy ?? s.strong_buy_count ?? 0)));
+  let buy = Math.max(0, Math.round(Number(s.buy ?? s.buy_count ?? 0)));
+  let hold = Math.max(0, Math.round(Number(s.hold ?? s.hold_count ?? 0)));
+  const sellOnly = Math.max(0, Math.round(Number(s.sell ?? s.sell_count ?? 0)));
+  const strongSell = Math.max(0, Math.round(Number(s.strong_sell ?? s.strong_sell_count ?? 0)));
+  let sellTotal = sellOnly + strongSell;
+
+  let total = sb + buy + hold + sellTotal;
+  const fallbackAnalysts = Math.max(0, Math.round(Number(s.analyst_count || 0)));
+  if (total === 0 && fallbackAnalysts > 0) {
+    const buyPct = Math.max(0, Math.min(100, Number(s.consensus_buy_pct ?? 50)));
+    const estBuyTotal = Math.round((buyPct / 100) * fallbackAnalysts);
+    sb = Math.round(estBuyTotal * 0.4);
+    buy = Math.max(0, estBuyTotal - sb);
+    hold = Math.max(0, fallbackAnalysts - estBuyTotal);
+    sellTotal = 0;
+    total = sb + buy + hold + sellTotal;
+  }
+
+  const width = 640;
+  const barH = 12;
+  const svg = svgEl("svg", {
+    viewBox: `0 0 ${width} 42`,
+    width: "100%",
+    height: "42",
+  });
+
+  svg.appendChild(
+    svgEl("rect", {
+      x: 0,
+      y: 2,
+      width,
+      height: barH,
+      rx: 6,
+      fill: "#172236",
+    })
+  );
+
+  const segments = [
+    { label: "Strong Buy", count: sb, color: "#10b981" },
+    { label: "Buy", count: buy, color: "#34d399" },
+    { label: "Hold", count: hold, color: "#f59e0b" },
+    { label: "Sell / Strong Sell", count: sellTotal, color: "#f43f5e" },
+  ];
+
+  if (total > 0) {
+    const activeSegs = segments.filter((seg) => seg.count > 0);
+    const gap = activeSegs.length > 1 ? 2 : 0;
+    const totalGap = gap * Math.max(0, activeSegs.length - 1);
+    const availW = width - totalGap;
+    let curX = 0;
+
+    activeSegs.forEach((seg, idx) => {
+      const segW =
+        idx === activeSegs.length - 1
+          ? Math.max(2, width - curX)
+          : Math.max(2, (seg.count / total) * availW);
+      svg.appendChild(
+        svgEl("rect", {
+          x: curX.toFixed(1),
+          y: 2,
+          width: segW.toFixed(1),
+          height: barH,
+          rx: 3,
+          fill: seg.color,
+        })
+      );
+      curX += segW + gap;
+    });
+  }
+
+  const legendPositions = [6, 158, 286, 414];
+  segments.forEach((seg, idx) => {
+    const lx = legendPositions[idx];
+    svg.appendChild(
+      svgEl("circle", {
+        cx: lx + 5,
+        cy: 31,
+        r: 4.5,
+        fill: seg.color,
+      })
+    );
+    const lbl = svgEl("text", {
+      x: lx + 15,
+      y: 35,
+      fill: "#cbd5e1",
+      "font-size": "11.5",
+      "font-weight": "600",
+    });
+    lbl.textContent = `${seg.label}: ${seg.count}`;
+    svg.appendChild(lbl);
+  });
+
+  return svg;
+}
+
 export function renderMultiLineChart(container, seriesList, xLabels, yFormatter, opts = {}) {
   container.replaceChildren();
   if (!xLabels || xLabels.length < 2) {

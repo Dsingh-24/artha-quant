@@ -26,9 +26,18 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from pydantic import ValidationError
-from app.backtester import NASDAQ_BENCHMARK_TICKER, run_point_in_time_backtest
+from app.backtester import (
+    NASDAQ_BENCHMARK_TICKER,
+    SP500_BENCHMARK_TICKER,
+    run_point_in_time_backtest,
+)
 from app.database import DEFAULT_DB_PATH, Database
-from app.factors import PRESET_WEIGHTS, score_universe_point_in_time
+from app.factors import (
+    PRESET_WEIGHTS,
+    matches_market_filter,
+    resolve_market_and_index_tag,
+    score_universe_point_in_time,
+)
 from app.live_funnel import (
     BENCHMARK_TICKER,
     refresh_live_prices_only,
@@ -84,6 +93,7 @@ class MarketDataCache:
         self._price_matrix: Optional[pd.DataFrame] = None
         self._stage1_funnel: Optional[list] = None
         self._quarterly_signals: Optional[Dict[str, Dict[str, Any]]] = None
+        self._street_signals: Optional[Dict[str, Dict[str, Any]]] = None
 
     def invalidate(self) -> None:
         with self._lock:
@@ -92,12 +102,19 @@ class MarketDataCache:
             self._price_matrix = None
             self._stage1_funnel = None
             self._quarterly_signals = None
+            self._street_signals = None
 
     def get_quarterly_signals(self) -> Dict[str, Dict[str, Any]]:
         with self._lock:
             if self._quarterly_signals is None:
                 self._quarterly_signals = self.db.get_all_quarterly_signals()
             return self._quarterly_signals
+
+    def get_street_signals(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            if self._street_signals is None:
+                self._street_signals = getattr(self.db, "get_all_street_signals", lambda: {})()
+            return self._street_signals
 
     def load(self) -> Tuple[list, pd.DataFrame, pd.DataFrame, list]:
         with self._lock:
@@ -340,6 +357,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
         custom_w = payload.weights.model_dump() if payload.weights else None
         s1_lookup = {r["ticker"]: r for r in stage1_rows}
         qtr_signals = market_cache.get_quarterly_signals()
+        street_signals = market_cache.get_street_signals()
 
         all_scored = score_universe_point_in_time(
             companies=companies,
@@ -350,30 +368,52 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             custom_weights=custom_w,
             stage1_lookup=s1_lookup,
             quarterly_signals=qtr_signals,
+            street_signals=street_signals,
         )
 
         count_in = sum(1 for s in all_scored if s.get("market", "IN") == "IN")
         count_us = sum(1 for s in all_scored if s.get("market", "IN") == "US")
-        market_counts = {"ALL": len(all_scored), "IN": count_in, "US": count_us}
+        count_ndx = sum(1 for s in all_scored if s.get("index_tag") == "NASDAQ100")
+        count_sp500 = sum(1 for s in all_scored if s.get("index_tag") == "SP500")
+        market_counts = {
+            "ALL": len(all_scored),
+            "IN": count_in,
+            "US": count_us,
+            "NASDAQ100": count_ndx,
+            "SP500": count_sp500,
+        }
 
         norm_stage1 = []
         for r in stage1_rows:
-            r_mkt = "US" if r.get("market") == "US" else "IN"
+            r_mkt, r_idx_tag, r_label, r_ccy = resolve_market_and_index_tag(r)
             norm_stage1.append(
                 {
                     **r,
                     "market": r_mkt,
-                    "market_label": "US Stock" if r_mkt == "US" else "Indian Stock",
-                    "currency": r.get("currency") or ("USD" if r_mkt == "US" else "INR"),
+                    "index_tag": r_idx_tag,
+                    "market_label": r_label,
+                    "currency": r_ccy,
                 }
             )
 
-        if payload.market in ("IN", "US"):
-            scored = [s for s in all_scored if s.get("market", "IN") == payload.market]
+        if payload.market != "ALL":
+            scored = [
+                s
+                for s in all_scored
+                if matches_market_filter(s["market"], s["index_tag"], payload.market)
+            ]
             for rank_idx, item in enumerate(scored, start=1):
                 item["rank"] = rank_idx
-            stage1_view = [r for r in norm_stage1 if r["market"] == payload.market]
-            companies_view = [c for c in companies if (c.get("market") or "IN") == payload.market]
+            stage1_view = [
+                r
+                for r in norm_stage1
+                if matches_market_filter(r["market"], r["index_tag"], payload.market)
+            ]
+            companies_view = []
+            for c in companies:
+                c_mkt, c_idx, _, _ = resolve_market_and_index_tag(c)
+                if matches_market_filter(c_mkt, c_idx, payload.market):
+                    companies_view.append(c)
         else:
             scored = all_scored
             stage1_view = norm_stage1
@@ -402,6 +442,11 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             if BENCHMARK_TICKER in price_mat.columns and not price_mat[BENCHMARK_TICKER].dropna().empty
             else 0.0
         )
+        bm_sp500 = (
+            float(price_mat[SP500_BENCHMARK_TICKER].dropna().iloc[-1])
+            if SP500_BENCHMARK_TICKER in price_mat.columns and not price_mat[SP500_BENCHMARK_TICKER].dropna().empty
+            else 0.0
+        )
         bm_nasdaq = (
             float(price_mat[NASDAQ_BENCHMARK_TICKER].dropna().iloc[-1])
             if NASDAQ_BENCHMARK_TICKER in price_mat.columns and not price_mat[NASDAQ_BENCHMARK_TICKER].dropna().empty
@@ -414,6 +459,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             "market": payload.market,
             "market_counts": market_counts,
             "benchmark_nifty50": round(bm_nifty, 2),
+            "benchmark_sp500": round(bm_sp500, 2),
             "benchmark_nasdaq100": round(bm_nasdaq, 2),
             "preset_weights": PRESET_WEIGHTS,
             "sectors": sectors,
@@ -451,17 +497,19 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
         if not comp:
             raise HTTPException(status_code=404, detail="Company not found in universe.")
 
-        c_mkt = "US" if comp.get("market") == "US" else "IN"
+        c_mkt, c_idx_tag, c_label, c_ccy = resolve_market_and_index_tag(comp)
         comp_out = {
             **comp,
             "market": c_mkt,
-            "market_label": "US Stock" if c_mkt == "US" else "Indian Stock",
-            "currency": comp.get("currency") or ("USD" if c_mkt == "US" else "INR"),
+            "index_tag": c_idx_tag,
+            "market_label": c_label,
+            "currency": c_ccy,
         }
 
         as_of = str(price_mat.index[-1])
         s1_lookup = {r["ticker"]: r for r in stage1_rows}
         qtr_signals = market_cache.get_quarterly_signals()
+        street_signals = market_cache.get_street_signals()
         custom_w = None
         if preset == "custom" and w_q is not None and w_v is not None and w_g is not None and w_m is not None:
             custom_w = {"quality": w_q, "value": w_v, "growth": w_g, "momentum": w_m}
@@ -478,6 +526,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             custom_weights=custom_w,
             stage1_lookup=s1_lookup,
             quarterly_signals=qtr_signals,
+            street_signals=street_signals,
         )
         scorecard = next((s for s in scored if s["ticker"] == validated), None)
         fundamentals = db.get_company_fundamentals(validated)
@@ -610,6 +659,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
         _sess: Dict[str, Any] = Depends(require_session),
     ) -> Dict[str, Any]:
         companies, fund_df, price_mat, _s1 = market_cache.load()
+        street_signals = market_cache.get_street_signals()
         custom_w = payload.weights.model_dump() if payload.weights else None
         try:
             return run_point_in_time_backtest(
@@ -625,6 +675,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
                 initial_capital=payload.initial_capital,
                 cost_bps=payload.cost_bps,
                 market=payload.market,
+                street_signals=street_signals,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
@@ -634,8 +685,10 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
         payload: PlannerRequest,
         sess: Dict[str, Any] = Depends(require_session),
     ) -> Dict[str, Any]:
-        companies, fund_df, price_mat, _s1 = market_cache.load()
+        companies, fund_df, price_mat, stage1_rows = market_cache.load()
+        s1_lookup = {r["ticker"]: r for r in stage1_rows}
         qtr_signals = market_cache.get_quarterly_signals()
+        street_signals = market_cache.get_street_signals()
         as_of = str(price_mat.index[-1])
         ranked = score_universe_point_in_time(
             companies=companies,
@@ -643,7 +696,9 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             price_matrix=price_mat,
             as_of_date=as_of,
             preset=payload.preset,
+            stage1_lookup=s1_lookup,
             quarterly_signals=qtr_signals,
+            street_signals=street_signals,
         )
         plan = build_investment_plan(
             ranked_stocks=ranked,

@@ -1,13 +1,19 @@
-"""Real-Market US Nasdaq-100 Funnel, Yahoo v8 5Y Price Sync & Official SEC EDGAR XBRL Engine.
+"""Real-Market US S&P 500 + Nasdaq-100 Funnel, Yahoo v8 5Y Price Sync & Official SEC EDGAR XBRL Engine.
+
+Strict Overlap Priority Rule:
+- Every US ticker in `NASDAQ100_SET` gets `index_tag = "NASDAQ100"` (even when also in S&P 500,
+  e.g. `AAPL`, `MSFT`, `NVDA`, `AMZN`, `META`, `GOOGL`, `COST`, `AVGO`, `PEP`).
+- Every US ticker in S&P 500 that is NOT in `NASDAQ100_SET` gets `index_tag = "SP500"`
+  (e.g. `BRK-B`, `JPM`, `LLY`, `V`, `MA`, `UNH`, `XOM`, `WMT`, `GS`, `MS`, `CAT`, `ORCL`, `CRM`).
+- Zero duplicate tickers (`ticker` is PRIMARY KEY) and zero duplicate dual-class CIKs.
 
 Unit Invariant (Critical for Unified Multi-Market Scoring):
 - Monetary fundamentals (`revenue_cr`, `ebitda_cr`, `ebit_cr`, `net_profit_cr`, `cfo_cr`, `fcf_cr`,
   `total_assets_cr`, `total_equity_cr`, `total_debt_cr`, `current_assets_cr`, `current_liabilities_cr`,
   `ttm_rev_cr`, `ttm_pat_cr`) are stored in **USD Millions ($M)** (`val / 1e6`).
-- `shares_cr` is stored in **Millions of diluted shares** (`shares / 1e6`, split-adjusted to match
-  Yahoo Finance's split-adjusted daily close prices).
-- Therefore `price ($/sh) * shares_cr (M) = market_cap ($M)`, making P/E, P/B, EV/EBITDA, FCF Yield,
-  ROCE%, ROE%, D/E, and CFO/EBITDA% in `app/factors.py` dimensionally identical across `IN` and `US`!
+- `shares_cr` is stored in **Millions of economic shares** (`shares / 1e6`, split-adjusted and
+  cross-calibrated against consolidated market cap so dual-class / Class-B tickers like `BRK-B`,
+  `BF-B`, `GOOGL`, `META` satisfy `price ($/sh) * shares_cr (M) = market_cap ($M)` with zero anomalies!).
 """
 
 from __future__ import annotations
@@ -19,18 +25,20 @@ import math
 import threading
 import time
 import urllib.parse
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 import numpy as np
 import pandas as pd
+from bs4 import BeautifulSoup
 
 from app.database import DEFAULT_DB_PATH, Database
 
 logger = logging.getLogger("arthaquant.nasdaq")
 
 NASDAQ_BENCHMARK_TICKER = "^NDX"
+SP500_BENCHMARK_TICKER = "^GSPC"
+SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 YAHOO_UA = "Mozilla/5.0"
 SEC_UA = "ArthaQuant Research dipanshu2405@gmail.com"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
@@ -146,11 +154,106 @@ NASDAQ100_SPECS: List[Tuple[str, str, str, str, bool, float, float]] = [
     ("CHTR", "Charter Communications", "Telecom, Infra & Services", "Broadband Cable & Connectivity", False, 32.5, 61.4),
 ]
 
-# Explicit CIK fallback for delisted/reorganized symbols if ever needed
+NASDAQ100_SET: Set[str] = {s[0] for s in NASDAQ100_SPECS}
+NASDAQ100_BY_TICKER: Dict[str, Tuple[str, str, str, str, bool, float, float]] = {s[0]: s for s in NASDAQ100_SPECS}
+
 KNOWN_CIK_FALLBACKS: Dict[str, int] = {
     "EA": 712515,
     "WBD": 1437107,
+    "BRK-B": 1067983,
+    "BF-B": 14693,
+    "XOM": 34088,
 }
+
+
+def map_gics_to_artha_sector(gics_sector: str, gics_sub: str, name: str = "") -> Tuple[str, bool]:
+    """Map S&P 500 GICS 11-sector taxonomy cleanly into ArthaQuant's unified 9-sector taxonomy."""
+    sec = (gics_sector or "").strip().lower()
+    sub = (gics_sub or "").strip().lower()
+    nm = (name or "").strip().lower()
+
+    if sec == "financials":
+        return "Banking & Financials", True
+    if sec == "information technology":
+        return "IT Services", False
+    if sec == "health care":
+        return "Pharma & Healthcare", False
+    if sec in ("energy", "utilities"):
+        return "Energy, Oil & Power", False
+    if sec == "materials":
+        return "Materials, Metals & Chemicals", False
+    if sec in ("communication services", "real estate"):
+        return "Telecom, Infra & Services", False
+    if sec == "consumer staples":
+        return "Consumer & Retail", False
+    if sec == "consumer discretionary":
+        if any(k in sub or k in nm for k in ("automobile", "automotive", "auto parts", "tires", "vehicle")):
+            return "Auto & Mobility", False
+        return "Consumer & Retail", False
+    if sec == "industrials":
+        if any(k in sub or k in nm for k in ("passenger ground", "uber", "lyft")):
+            return "Auto & Mobility", False
+        if "human resource" in sub or "data processing" in sub:
+            return "IT Services", False
+        return "Capital Goods & Defence", False
+    return "Capital Goods & Defence", False
+
+
+def fetch_sp500_constituents() -> Tuple[List[Tuple[str, str, str, str, bool, float, float]], Dict[str, int]]:
+    """Fetch S&P 500 constituents from Wikipedia, normalize `.` -> `-`, and deduplicate dual-class CIKs."""
+    specs: List[Tuple[str, str, str, str, bool, float, float]] = []
+    wiki_ciks: Dict[str, int] = {}
+
+    with httpx.Client(headers={"User-Agent": YAHOO_UA}, follow_redirects=True, timeout=20.0) as client:
+        resp = client.get(SP500_WIKI_URL)
+        resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    table = soup.find("table", {"id": "constituents"}) or soup.find("table", class_="wikitable")
+    if not table:
+        raise RuntimeError("Could not locate S&P 500 constituents table on Wikipedia")
+
+    raw_rows: List[Tuple[str, str, str, str, int]] = []
+    for tr in table.find_all("tr")[1:]:
+        cols = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
+        if len(cols) < 4:
+            continue
+        raw_sym = cols[0].strip().upper().replace(".", "-")
+        if not raw_sym:
+            continue
+        sec_name = cols[1].strip()
+        gics_sec = cols[2].strip()
+        gics_sub = cols[3].strip()
+        cik_int = 0
+        if len(cols) >= 7:
+            digits = "".join(ch for ch in cols[6] if ch.isdigit())
+            if digits:
+                cik_int = int(digits)
+        raw_rows.append((raw_sym, sec_name, gics_sec, gics_sub, cik_int))
+        if cik_int > 0:
+            wiki_ciks[raw_sym] = cik_int
+
+    # Reserve CIKs already represented by NASDAQ100_SET (e.g. GOOGL CIK 1652044 beats GOOG)
+    claimed_ciks: Set[int] = set()
+    for sym, _, _, _, cik_int in raw_rows:
+        if sym in NASDAQ100_SET and cik_int > 0:
+            claimed_ciks.add(cik_int)
+
+    seen_syms: Set[str] = set()
+    for sym, sec_name, gics_sec, gics_sub, cik_int in raw_rows:
+        if sym in seen_syms or sym in NASDAQ100_SET:
+            continue
+        if cik_int > 0 and cik_int in claimed_ciks:
+            logger.info("Skipping duplicate dual-class S&P 500 share class %s (CIK %d already represented)", sym, cik_int)
+            continue
+        seen_syms.add(sym)
+        if cik_int > 0:
+            claimed_ciks.add(cik_int)
+
+        sector, is_fin = map_gics_to_artha_sector(gics_sec, gics_sub, sec_name)
+        specs.append((sym, sec_name, sector, gics_sub[:80], is_fin, 1.2, 78.5))
+
+    return specs, wiki_ciks
 
 
 def _clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
@@ -164,9 +267,9 @@ def _lin(v: float, bad: float, good: float) -> float:
 
 
 class _RateLimiter:
-    """Thread-safe minimum spacing limiter (e.g. 0.14s = ~7.1 req/sec < SEC 8 req/s cap)."""
+    """Thread-safe minimum spacing limiter (e.g. 0.135s = ~7.4 req/sec < SEC 8 req/s cap)."""
 
-    def __init__(self, min_interval_sec: float = 0.14) -> None:
+    def __init__(self, min_interval_sec: float = 0.135) -> None:
         self.min_interval = min_interval_sec
         self._lock = threading.Lock()
         self._next_allowed = 0.0
@@ -188,6 +291,7 @@ def fetch_yahoo_chart_5y_with_splits(
     symbol: str,
     client: Optional[httpx.Client] = None,
     host_idx: int = 0,
+    range_str: str = "10y",
 ) -> Tuple[List[Tuple[str, str, float, float]], List[Tuple[str, float]]]:
     """Fetch 5Y daily closes + 10Y split history from Yahoo Finance v8/finance/chart."""
     enc = urllib.parse.quote(symbol, safe="")
@@ -200,10 +304,12 @@ def fetch_yahoo_chart_5y_with_splits(
     try:
         for attempt in range(4):
             host = hosts[(host_idx + attempt) % 2]
-            # Request 10y with events=splits so pre-5y splits on FY2019-2021 filings are also captured,
-            # then slice daily prices to the trailing 5 years (~1265 trading days).
-            url = f"https://{host}/v8/finance/chart/{enc}?range=10y&interval=1d&events=splits"
-            resp = sess.get(url)
+            url = f"https://{host}/v8/finance/chart/{enc}?range={range_str}&interval=1d&events=splits"
+            try:
+                resp = sess.get(url)
+            except Exception:
+                time.sleep(0.4 * (attempt + 1))
+                continue
             if resp.status_code == 200:
                 payload = resp.json()
                 break
@@ -264,6 +370,38 @@ def fetch_yahoo_chart_5y_with_splits(
     return price_rows, splits
 
 
+def _fetch_yahoo_implied_shares_millions(symbols: List[str]) -> Dict[str, float]:
+    """Fetch consolidated implied share count (`marketCap / regularMarketPrice / 1e6`) via Yahoo v7 quote."""
+    implied: Dict[str, float] = {}
+    if not symbols:
+        return implied
+    try:
+        with httpx.Client(headers={"User-Agent": YAHOO_UA}, follow_redirects=True, timeout=15.0) as client:
+            client.get("https://fc.yahoo.com")
+            rc = client.get("https://query2.finance.yahoo.com/v1/test/getcrumb")
+            if rc.status_code != 200 or not rc.text.strip():
+                return implied
+            crumb = urllib.parse.quote(rc.text.strip(), safe="")
+            for i in range(0, len(symbols), 45):
+                batch = ",".join(urllib.parse.quote(s, safe="") for s in symbols[i : i + 45])
+                url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={batch}&crumb={crumb}"
+                rq = client.get(url)
+                if rq.status_code != 200:
+                    continue
+                for q in (rq.json().get("quoteResponse") or {}).get("result") or []:
+                    sym = str(q.get("symbol") or "").strip().upper()
+                    px = float(q.get("regularMarketPrice") or 0.0)
+                    mc = float(q.get("marketCap") or 0.0)
+                    sh = float(q.get("sharesOutstanding") or 0.0)
+                    if sym and px > 0 and mc > 0:
+                        implied[sym] = (mc / px) / 1e6
+                    elif sym and sh > 0:
+                        implied[sym] = sh / 1e6
+    except Exception as exc:
+        logger.warning("Yahoo v7 implied share calibration warning: %s", exc)
+    return implied
+
+
 def _fetch_fx_yearly_rates() -> Dict[str, Dict[int, float]]:
     """Fetch historical EUR/USD and GBP/USD annual average FX rates via Yahoo v8 chart."""
     fx_map: Dict[str, Dict[int, float]] = {
@@ -272,7 +410,7 @@ def _fetch_fx_yearly_rates() -> Dict[str, Dict[int, float]]:
     }
     with httpx.Client(headers={"User-Agent": YAHOO_UA}, follow_redirects=True, timeout=12.0) as client:
         for ccy, yf_sym in (("EUR", "EURUSD=X"), ("GBP", "GBPUSD=X")):
-            rows, _ = fetch_yahoo_chart_5y_with_splits(yf_sym, client=client)
+            rows, _ = fetch_yahoo_chart_5y_with_splits(yf_sym, client=client, range_str="5y")
             by_yr: Dict[int, List[float]] = {}
             for _, d_str, px, _ in rows:
                 if 0.5 < px < 2.5:
@@ -304,7 +442,7 @@ def _extract_flow_series(
 ) -> Dict[str, Tuple[float, str]]:
     """Return `{end_date: (val_in_usd_millions, earliest_valid_filed_date)}` for flow items."""
     allowed_ccy = ("USD", "EUR", "GBP")
-    merged: Dict[str, Tuple[float, str, str]] = {}  # end_date -> (val_m, earliest_filed, latest_filed)
+    merged: Dict[str, Tuple[float, str, str]] = {}
 
     for tax_name, tag_name in candidates:
         concept = (facts_root.get(tax_name) or {}).get(tag_name)
@@ -451,10 +589,8 @@ def _extract_split_adjusted_shares(
                     continue
             filed_s = item.get("filed") or end_s
             raw_m = float(val) / 1e6
-            # Some filers report diluted shares already in Millions or Thousands when raw < 0.05M
             if raw_m < 0.005 and float(val) > 10.0:
                 raw_m = float(val)
-            # Apply any stock splits that occurred strictly AFTER this SEC filing was submitted
             adj_factor = 1.0
             for sp_date, sp_ratio in splits:
                 if sp_date > filed_s:
@@ -471,8 +607,6 @@ def _extract_split_adjusted_shares(
                 latest_date = end_s
                 latest_sh_m = info[0]
 
-        # Once weighted-average diluted shares are populated across multiple years, prefer them
-        # over single-class `EntityCommonStockSharesOutstanding` (critical for GOOGL, META, ABNB, etc.)
         if len(by_end) >= 3 and is_flow:
             break
 
@@ -487,6 +621,7 @@ def parse_sec_company_facts(
     cur_price: float,
     splits: List[Tuple[str, float]],
     fx_rates: Dict[str, Dict[int, float]],
+    target_shares_m: float = 0.0,
 ) -> Optional[Dict[str, Any]]:
     """Normalize SEC EDGAR XBRL `companyfacts` into audited annual FY rows + 2Q YoY signals ($M)."""
     _, fallback_name, sector, _industry, is_fin, insider_pct, inst_pct = spec
@@ -498,8 +633,13 @@ def parse_sec_company_facts(
         ("us-gaap", "Revenues"),
         ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax"),
         ("us-gaap", "SalesRevenueNet"),
+        ("us-gaap", "RevenuesNetOfInterestExpense"),
         ("us-gaap", "RegulatedAndUnregulatedOperatingRevenue"),
         ("us-gaap", "ElectricUtilityRevenue"),
+        ("us-gaap", "HealthCareOrganizationRevenue"),
+        ("us-gaap", "RealEstateRevenueNet"),
+        ("us-gaap", "FinancialServicesRevenue"),
+        ("us-gaap", "PremiumsEarnedNet"),
         ("ifrs-full", "Revenue"),
         ("ifrs-full", "RevenueFromContractsWithCustomers"),
     ]
@@ -507,7 +647,9 @@ def parse_sec_company_facts(
         ("us-gaap", "RevenueFromContractWithCustomerIncludingAssessedTax"),
         ("us-gaap", "SalesRevenueGoodsNet"),
         ("us-gaap", "SalesRevenueServicesNet"),
-        ("us-gaap", "RevenuesNetOfInterestExpense"),
+        ("us-gaap", "OperatingLeaseLeaseIncome"),
+        ("us-gaap", "InterestAndDividendIncomeOperating"),
+        ("us-gaap", "NoninterestIncome"),
     ]
 
     ebit_tags = [
@@ -515,6 +657,7 @@ def parse_sec_company_facts(
         ("ifrs-full", "ProfitLossFromOperatingActivities"),
         ("us-gaap", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"),
         ("us-gaap", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"),
+        ("us-gaap", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic"),
         ("ifrs-full", "ProfitLossBeforeTax"),
     ]
     pat_tags = [
@@ -523,6 +666,7 @@ def parse_sec_company_facts(
         ("ifrs-full", "ProfitLoss"),
         ("us-gaap", "ProfitLoss"),
         ("us-gaap", "NetIncomeLossAvailableToCommonStockholdersBasic"),
+        ("us-gaap", "IncomeLossFromContinuingOperations"),
     ]
     da_tags = [
         ("us-gaap", "DepreciationDepletionAndAmortization"),
@@ -547,7 +691,6 @@ def parse_sec_company_facts(
         ("ifrs-full", "PurchaseOfPropertyPlantAndEquipmentIntangibleAssetsOtherThanGoodwillInvestmentPropertyAndOtherNoncurrentAssets"),
     ]
 
-    # 12-month annual flow series
     ann_rev = _extract_flow_series(facts_root, rev_primary_tags, fx_rates, 330, 385, take_max_across_tags=True)
     if len(ann_rev) < 3:
         fb_rev = _extract_flow_series(facts_root, rev_fallback_tags, fx_rates, 330, 385, take_max_across_tags=True)
@@ -560,7 +703,6 @@ def parse_sec_company_facts(
     ann_cfo = _extract_flow_series(facts_root, cfo_tags, fx_rates, 330, 385)
     ann_capex = _extract_flow_series(facts_root, capex_tags, fx_rates, 330, 385)
 
-    # Instant balance sheet series
     bs_assets = _extract_instant_series(facts_root, [("us-gaap", "Assets"), ("ifrs-full", "Assets")], fx_rates)
     bs_equity = _extract_instant_series(
         facts_root,
@@ -606,10 +748,18 @@ def parse_sec_company_facts(
     )
 
     shares_by_end, latest_sh_m = _extract_split_adjusted_shares(facts_root, splits)
+    if target_shares_m > 0:
+        if latest_sh_m <= 0:
+            latest_sh_m = target_shares_m
+        else:
+            ratio = target_shares_m / latest_sh_m
+            # Rescale Class-A / dual-class / ADR / thousands-vs-shares SEC discrepancies (e.g. BRK-B 1500x, BF-B, GOOGL)
+            if ratio < 0.72 or ratio > 1.38:
+                shares_by_end = {d_k: v_sh * ratio for d_k, v_sh in shares_by_end.items()}
+                latest_sh_m = target_shares_m
     if latest_sh_m <= 0:
         latest_sh_m = 500.0
 
-    # Deduplicate annual period_end dates so consecutive FYs are >= 300 days apart
     candidate_ends = sorted(d for d in (set(ann_rev.keys()) & set(ann_pat.keys())) if d >= "2018-01-01")
     selected_ends: List[str] = []
     for d_str in candidate_ends:
@@ -622,21 +772,17 @@ def parse_sec_company_facts(
             if gap >= 300:
                 selected_ends.append(d_str)
             elif gap < 45:
-                # 52/53-week minor restatement date adjustment: keep the newer one
                 selected_ends[-1] = d_str
 
     selected_ends = selected_ends[-8:]
     if len(selected_ends) < 2:
         return None
 
-    # Normalize historical share series against `latest_sh_m` so any uncaptured pre-IPO / ADR
-    # share-class quirk (>4x sudden jump without economic dilution) is smoothed cleanly.
     annual_rows: List[Tuple[Any, ...]] = []
     prev_fy_int = 0
 
-    for end_s in selected_ends:
+    for idx_yr, end_s in enumerate(selected_ends):
         end_dt = dt.date.fromisoformat(end_s)
-        # 52/53-week Dec fiscal years spilling 1-10 days into Jan belong to prior calendar year
         fy_int = (end_dt.year - 1) if (end_dt.month == 1 and end_dt.day <= 10) else end_dt.year
         if fy_int <= prev_fy_int:
             fy_int = prev_fy_int + 1
@@ -676,10 +822,6 @@ def parse_sec_company_facts(
             liab_m = _lookup_nearest_instant(bs_tot_liab, end_s)
             tot_eq_m = (tot_assets_m - liab_m) if liab_m is not None else (tot_assets_m * 0.45)
 
-        # Buyback-cannibal companies (e.g. SBUX, ORLY, BKNG, MAR, CHTR) can carry negative GAAP book equity
-        # purely from treasury stock repurchases despite huge positive FCF & EBIT. Preserve positive economic
-        # invested-capital equity floor when profitable & cash-generative so ROE/P-B/guardrails aren't distorted
-        # as "insolvent" when EBIT & CFO are strongly positive!
         effective_eq_m = tot_eq_m
         if effective_eq_m <= 0 and pat_m > 0 and cfo_m > 0 and ebit_m > 0:
             effective_eq_m = max(rev_m * 0.12, pat_m * 2.8)
@@ -694,12 +836,16 @@ def parse_sec_company_facts(
         sh_m = _lookup_nearest_instant(shares_by_end, end_s, max_gap_days=20) or latest_sh_m
         if latest_sh_m > 0 and (sh_m < latest_sh_m * 0.22 or sh_m > latest_sh_m * 4.5):
             sh_m = latest_sh_m
+        # For the latest annual FY, ensure exact alignment with consolidated market-cap share count if calibrated
+        if idx_yr == len(selected_ends) - 1 and target_shares_m > 0:
+            if sh_m < target_shares_m * 0.78 or sh_m > target_shares_m * 1.30:
+                sh_m = target_shares_m
 
         opm_pct = (ebitda_m / max(1.0, rev_m)) * 100.0
         if is_fin:
-            roe_pct = (pat_m / effective_eq_m) * 100.0 if effective_eq_m > 0 else -25.0
+            roe_pct = _clamp((pat_m / effective_eq_m) * 100.0, -45.0, 125.0) if effective_eq_m > 0 else -25.0
             roa_pct = (pat_m / max(1.0, tot_assets_m)) * 100.0
-            roce_pct = max(roe_pct * 0.85, roa_pct * 7.5)
+            roce_pct = _clamp(max(roe_pct * 0.85, roa_pct * 7.5), -45.0, 95.0)
             cfo_ebitda_pct = 92.0 if pat_m > 0 else 40.0
         else:
             cap_employed = max(25.0, tot_assets_m - cur_liab_m, max(0.0, effective_eq_m) + tot_debt_m)
@@ -748,7 +894,6 @@ def parse_sec_company_facts(
     q_pat = _extract_flow_series(facts_root, pat_tags, fx_rates, 75, 106)
     q_ebit = _extract_flow_series(facts_root, ebit_tags, fx_rates, 75, 106)
 
-    # Derive missing Q4 (`FY - (Q1+Q2+Q3)`) when 3 prior standalone quarters exist inside that fiscal year
     for fy_end_s in selected_ends[-3:]:
         if fy_end_s in q_rev and fy_end_s in q_pat:
             continue
@@ -758,7 +903,6 @@ def parse_sec_company_facts(
             for q_d in (set(q_rev.keys()) & set(q_pat.keys()))
             if 50 <= (fy_end_dt - dt.date.fromisoformat(q_d)).days <= 305
         )
-        # Deduplicate close dates
         dedup_q: List[str] = []
         for q_d in prior_q_ends:
             if not dedup_q or (dt.date.fromisoformat(q_d) - dt.date.fromisoformat(dedup_q[-1])).days >= 60:
@@ -793,7 +937,6 @@ def parse_sec_company_facts(
 
     if len(clean_q) >= 4:
         last4 = clean_q[-4:]
-        # Only use 4-quarter sum as TTM if the 4 quarters span roughly 1 year (~250-390 days between Q[-4] and Q[-1])
         span_days_4q = (dt.date.fromisoformat(last4[-1]) - dt.date.fromisoformat(last4[0])).days
         if 240 <= span_days_4q <= 320:
             ttm_rev_m = sum(q_rev[d][0] for d in last4)
@@ -815,7 +958,6 @@ def parse_sec_company_facts(
     if len(clean_q) >= 5:
         span = 2 if len(clean_q) >= 6 else 1
         cur_qs = clean_q[-span:]
-        # Match YoY counterpart quarters (~365 days prior for each quarter in cur_qs)
         prv_qs: List[str] = []
         for cq in cur_qs:
             cq_dt = dt.date.fromisoformat(cq)
@@ -892,123 +1034,298 @@ def parse_sec_company_facts(
     }
 
 
-def ingest_nasdaq100_universe(db: Optional[Database] = None) -> Dict[str, Any]:
-    """Ingest 5Y Yahoo v8 daily prices (`^NDX` + 100 Nasdaq-100 stocks) and SEC EDGAR XBRL fundamentals."""
+def ingest_us_universe(db: Optional[Database] = None, force_resync_nasdaq: bool = False) -> Dict[str, Any]:
+    """Ingest S&P 500 + Nasdaq-100 US universe with strict `NASDAQ100` > `SP500` overlap priority."""
     if db is None:
         db = Database(db_path=DEFAULT_DB_PATH)
 
     t0 = time.time()
-    logger.info("Fetching 5Y daily prices + split events for ^NDX and 100 Nasdaq-100 tickers...")
+    sp500_only_specs, wiki_ciks = fetch_sp500_constituents()
+    combined_specs: List[Tuple[str, str, str, str, bool, float, float]] = list(NASDAQ100_SPECS) + sp500_only_specs
+    spec_by_tk = {s[0]: s for s in combined_specs}
 
-    all_yahoo_syms = [NASDAQ_BENCHMARK_TICKER] + [s[0] for s in NASDAQ100_SPECS]
+    logger.info(
+        "US Universe assembled: %d NASDAQ100 + %d non-overlap SP500 = %d unique US tickers",
+        len(NASDAQ100_SPECS),
+        len(sp500_only_specs),
+        len(combined_specs),
+    )
+
+    # Inspect already-synced US tickers in SQLite so fresh NASDAQ100 SEC filings can be reused cleanly
+    with db.connect() as conn:
+        existing_fund_counts = {
+            r["ticker"]: int(r["cnt"])
+            for r in conn.execute("SELECT ticker, COUNT(*) AS cnt FROM fundamentals_annual GROUP BY ticker").fetchall()
+        }
+        existing_price_counts = {
+            r["ticker"]: int(r["cnt"])
+            for r in conn.execute("SELECT ticker, COUNT(*) AS cnt FROM daily_prices GROUP BY ticker").fetchall()
+        }
+
+    # Fetch 5Y daily prices for ^NDX, ^GSPC, and all new / stale US tickers; fetch 1M tail for already-fresh tickers
+    full_sync_syms: List[str] = [SP500_BENCHMARK_TICKER, NASDAQ_BENCHMARK_TICKER]
+    tail_sync_syms: List[str] = []
+    for spec in combined_specs:
+        tk = spec[0]
+        if force_resync_nasdaq or existing_price_counts.get(tk, 0) < 1000 or existing_fund_counts.get(tk, 0) < 2:
+            full_sync_syms.append(tk)
+        else:
+            tail_sync_syms.append(tk)
+
+    logger.info(
+        "Syncing Yahoo v8 prices: %d full 5Y series + %d incremental tail updates...",
+        len(full_sync_syms),
+        len(tail_sync_syms),
+    )
+
     price_map: Dict[str, List[Tuple[str, str, float, float]]] = {}
     splits_map: Dict[str, List[Tuple[str, float]]] = {}
 
-    def _pull_yf(idx_sym: Tuple[int, str]) -> Tuple[str, List[Tuple[str, str, float, float]], List[Tuple[str, float]]]:
+    def _pull_yf_full(idx_sym: Tuple[int, str]) -> Tuple[str, List[Tuple[str, str, float, float]], List[Tuple[str, float]]]:
         idx, sym = idx_sym
-        with httpx.Client(headers={"User-Agent": YAHOO_UA}, follow_redirects=True, timeout=14.0) as client:
-            rows, sps = fetch_yahoo_chart_5y_with_splits(sym, client=client, host_idx=idx % 2)
+        with httpx.Client(headers={"User-Agent": YAHOO_UA}, follow_redirects=True, timeout=15.0) as client:
+            rows, sps = fetch_yahoo_chart_5y_with_splits(sym, client=client, host_idx=idx % 2, range_str="10y")
             return sym, rows, sps
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
-        for sym, rows, sps in pool.map(_pull_yf, enumerate(all_yahoo_syms)):
+    def _pull_yf_tail(idx_sym: Tuple[int, str]) -> Tuple[str, List[Tuple[str, str, float, float]]]:
+        idx, sym = idx_sym
+        with httpx.Client(headers={"User-Agent": YAHOO_UA}, follow_redirects=True, timeout=12.0) as client:
+            rows, _ = fetch_yahoo_chart_5y_with_splits(sym, client=client, host_idx=idx % 2, range_str="1mo")
+            return sym, rows
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        for sym, rows, sps in pool.map(_pull_yf_full, enumerate(full_sync_syms)):
             if rows:
                 price_map[sym] = rows
             splits_map[sym] = sps
 
-    bm_rows = price_map.pop(NASDAQ_BENCHMARK_TICKER, [])
-    if bm_rows:
-        db.upsert_prices(bm_rows)
-    bm_series = pd.Series({r[1]: r[2] for r in bm_rows}).sort_index()
+    tail_rows_to_upsert: List[Tuple[str, str, float, float]] = []
+    if tail_sync_syms:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            for sym, rows in pool.map(_pull_yf_tail, enumerate(tail_sync_syms)):
+                if rows:
+                    tail_rows_to_upsert.extend(rows)
+
+    for bm_tk in (NASDAQ_BENCHMARK_TICKER, SP500_BENCHMARK_TICKER):
+        bm_rows = price_map.pop(bm_tk, [])
+        if bm_rows:
+            db.upsert_prices(bm_rows)
+
+    if tail_rows_to_upsert:
+        db.upsert_prices(tail_rows_to_upsert)
+
+    # Persist newly fetched full 5Y stock price histories (>= 65 trading days)
+    new_price_rows: List[Tuple[str, str, float, float]] = []
+    for sym, rows in price_map.items():
+        if len(rows) >= 65:
+            new_price_rows.extend(rows)
+    if new_price_rows:
+        db.upsert_prices(new_price_rows)
+
+    # Load full US price histories from SQLite for uniform Stage-1 cross-sectional ranking across all ~510 US stocks
+    us_tk_list = [s[0] for s in combined_specs]
+    full_us_prices: Dict[str, List[Tuple[str, float]]] = {}
+    with db.connect() as conn:
+        placeholders = ",".join("?" for _ in us_tk_list)
+        for r in conn.execute(
+            f"SELECT ticker, trade_date, close_price FROM daily_prices WHERE ticker IN ({placeholders}) ORDER BY trade_date ASC",
+            tuple(us_tk_list),
+        ).fetchall():
+            full_us_prices.setdefault(r["ticker"], []).append((r["trade_date"], float(r["close_price"])))
+
+        bm_gspc_rows = conn.execute(
+            "SELECT trade_date, close_price FROM daily_prices WHERE ticker = ? ORDER BY trade_date ASC",
+            (SP500_BENCHMARK_TICKER,),
+        ).fetchall()
+        bm_ndx_rows = conn.execute(
+            "SELECT trade_date, close_price FROM daily_prices WHERE ticker = ? ORDER BY trade_date ASC",
+            (NASDAQ_BENCHMARK_TICKER,),
+        ).fetchall()
+
+    bm_ref = bm_gspc_rows if len(bm_gspc_rows) >= 126 else bm_ndx_rows
     bm_6m_ret = 0.0
-    if len(bm_series) >= 126:
-        bm_6m_ret = ((float(bm_series.iloc[-1]) / float(bm_series.iloc[-126])) - 1.0) * 100.0
+    if len(bm_ref) >= 126:
+        bm_6m_ret = ((float(bm_ref[-1]["close_price"]) / float(bm_ref[-126]["close_price"])) - 1.0) * 100.0
+
+    # Calibrate consolidated economic share counts across ALL active US tickers via Yahoo v7 quote
+    active_us_Syms = [s[0] for s in combined_specs if len(full_us_prices.get(s[0], [])) >= 65]
+    implied_shares_map = _fetch_yahoo_implied_shares_millions(active_us_Syms)
+    logger.info("Calibrated consolidated implied share counts for %d/%d US tickers", len(implied_shares_map), len(active_us_Syms))
+
+    # Determine which active US tickers require SEC EDGAR XBRL download
+    specs_needing_sec: List[Tuple[str, str, str, str, bool, float, float]] = [
+        spec_by_tk[tk]
+        for tk in active_us_Syms
+        if force_resync_nasdaq or existing_fund_counts.get(tk, 0) < 2
+    ]
 
     fx_rates = _fetch_fx_yearly_rates()
+    sec_limiter = _RateLimiter(min_interval_sec=0.135)  # ~7.4 req/s (strictly <= 8 req/s)
+    cik_map: Dict[str, int] = {}
+    cik_map.update(wiki_ciks)
 
-    # Fetch SEC EDGAR ticker -> CIK mapping
-    sec_limiter = _RateLimiter(min_interval_sec=0.14)  # ~7.1 req/s (strictly <= 8 req/s)
-    cik_map: Dict[str, int] = dict(KNOWN_CIK_FALLBACKS)
-    with httpx.Client(headers={"User-Agent": SEC_UA}, follow_redirects=True, timeout=20.0) as sec_client:
-        sec_limiter.wait()
-        tk_resp = sec_client.get(SEC_TICKERS_URL)
-        tk_resp.raise_for_status()
-        for entry in tk_resp.json().values():
-            sym_u = str(entry.get("ticker") or "").strip().upper()
-            if sym_u and entry.get("cik_str"):
-                cik_map[sym_u] = int(entry["cik_str"])
+    if specs_needing_sec:
+        with httpx.Client(headers={"User-Agent": SEC_UA}, follow_redirects=True, timeout=20.0) as sec_client:
+            sec_limiter.wait()
+            tk_resp = sec_client.get(SEC_TICKERS_URL)
+            tk_resp.raise_for_status()
+            for entry in tk_resp.json().values():
+                sym_u = str(entry.get("ticker") or "").strip().upper()
+                if sym_u and entry.get("cik_str"):
+                    cik_map[sym_u] = int(entry["cik_str"])
+                    cik_map.setdefault(sym_u.replace(".", "-"), int(entry["cik_str"]))
+        # Explicit historical 10-K CIK overrides take priority over recent re-domicile shell CIKs (e.g. XOM -> 34088)
+        cik_map.update(KNOWN_CIK_FALLBACKS)
 
-    # Filter active Nasdaq-100 constituents with >= 65 trading days of valid price history
-    active_specs: List[Tuple[str, str, str, str, bool, float, float]] = []
-    all_stock_price_rows: List[Tuple[str, str, float, float]] = []
-    for spec in NASDAQ100_SPECS:
-        tk = spec[0]
-        p_rows = price_map.get(tk, [])
-        if len(p_rows) < 65:
-            logger.info("Skipping %s (only %d Yahoo trading days — delisted/corporate action)", tk, len(p_rows))
-            continue
-        active_specs.append(spec)
-        all_stock_price_rows.extend(p_rows)
+        logger.info("Fetching SEC EDGAR XBRL companyfacts for %d US stocks...", len(specs_needing_sec))
 
-    if all_stock_price_rows:
-        db.upsert_prices(all_stock_price_rows)
-
-    # Fetch SEC EDGAR companyfacts concurrently with strict <= 8 req/s global rate limiter
-    logger.info("Fetching SEC EDGAR XBRL companyfacts for %d active Nasdaq-100 stocks...", len(active_specs))
-
-    def _pull_sec_parsed(spec: Tuple[str, str, str, str, bool, float, float]) -> Optional[Dict[str, Any]]:
-        tk = spec[0]
-        cik = cik_map.get(tk)
-        if not cik:
-            logger.warning("No SEC CIK found for %s", tk)
-            return None
-        cur_px = float(price_map[tk][-1][2])
-        url = SEC_FACTS_URL_TMPL.format(cik=cik)
-        payload = None
-        with httpx.Client(headers={"User-Agent": SEC_UA}, follow_redirects=True, timeout=25.0) as sec_client:
-            for attempt in range(3):
-                sec_limiter.wait()
-                resp = sec_client.get(url)
-                if resp.status_code == 200:
-                    payload = resp.json()
+        def _pull_sec_parsed(spec: Tuple[str, str, str, str, bool, float, float]) -> Optional[Dict[str, Any]]:
+            tk = spec[0]
+            cik = cik_map.get(tk) or cik_map.get(tk.replace("-", "."))
+            if not cik:
+                logger.warning("No SEC CIK found for %s", tk)
+                return None
+            cur_px = float(full_us_prices[tk][-1][1])
+            url = SEC_FACTS_URL_TMPL.format(cik=cik)
+            payload = None
+            with httpx.Client(headers={"User-Agent": SEC_UA}, follow_redirects=True, timeout=25.0) as sec_client:
+                for attempt in range(3):
+                    sec_limiter.wait()
+                    try:
+                        resp = sec_client.get(url)
+                    except Exception:
+                        time.sleep(0.8 * (attempt + 1))
+                        continue
+                    if resp.status_code == 200:
+                        payload = resp.json()
+                        break
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        time.sleep(0.8 * (attempt + 1))
+                        continue
                     break
-                if resp.status_code in (429, 500, 502, 503, 504):
-                    time.sleep(0.8 * (attempt + 1))
-                    continue
-                break
-        if not payload:
-            return None
-        try:
-            return parse_sec_company_facts(
+            if not payload:
+                return None
+            try:
+                return parse_sec_company_facts(
+                    ticker=tk,
+                    spec=spec,
+                    sec_payload=payload,
+                    cur_price=cur_px,
+                    splits=splits_map.get(tk, []),
+                    fx_rates=fx_rates,
+                    target_shares_m=implied_shares_map.get(tk, 0.0),
+                )
+            except Exception as exc:
+                logger.warning("SEC XBRL parse error for %s: %s", tk, exc)
+                return None
+
+        new_annual_rows: List[Tuple[Any, ...]] = []
+        parsed_new: Dict[str, Dict[str, Any]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            for res in pool.map(_pull_sec_parsed, specs_needing_sec):
+                if res is not None:
+                    parsed_new[res["ticker"]] = res
+                    new_annual_rows.extend(res["annual_rows"])
+
+        for tk, parsed in parsed_new.items():
+            idx_tag = "NASDAQ100" if tk in NASDAQ100_SET else "SP500"
+            db.upsert_company(
                 ticker=tk,
-                spec=spec,
-                sec_payload=payload,
-                cur_price=cur_px,
-                splits=splits_map.get(tk, []),
-                fx_rates=fx_rates,
+                name=parsed["name"],
+                sector=parsed["sector"],
+                cap_tier=parsed["cap_tier"],
+                is_financial=parsed["is_financial"],
+                data_source="real_sec_edgar_xbrl",
+                promoter_pct=parsed["promoter_pct"],
+                inst_pct=parsed["inst_pct"],
+                market="US",
+                currency="USD",
+                index_tag=idx_tag,
             )
-        except Exception as exc:
-            logger.warning("SEC XBRL parse error for %s: %s", tk, exc)
-            return None
+            db.upsert_quarterly_signals(parsed["quarterly_signals"])
 
-    parsed_by_tk: Dict[str, Dict[str, Any]] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        for res in pool.map(_pull_sec_parsed, active_specs):
-            if res is not None:
-                parsed_by_tk[res["ticker"]] = res
+        if new_annual_rows:
+            db.upsert_fundamentals(new_annual_rows)
 
-    # Compute Stage-1 funnel metrics & persist US companies, stage1_funnel, fundamentals, quarterly signals
+    # Audit & heal any share-count scaling discrepancies across ALL US fundamentals (including previously synced rows)
+    with db.connect() as conn:
+        for tk in active_us_Syms:
+            target_sh = implied_shares_map.get(tk, 0.0)
+            if target_sh <= 0:
+                continue
+            f_rows = conn.execute(
+                "SELECT fiscal_year, shares_cr FROM fundamentals_annual WHERE ticker = ? ORDER BY fiscal_year ASC",
+                (tk,),
+            ).fetchall()
+            if not f_rows:
+                continue
+            latest_db_sh = float(f_rows[-1]["shares_cr"])
+            if latest_db_sh > 0 and (target_sh / latest_db_sh < 0.72 or target_sh / latest_db_sh > 1.38):
+                scale = target_sh / latest_db_sh
+                logger.info(
+                    "Rescaling %s shares_cr by %.3fx (%.2fM -> %.2fM) to match consolidated market cap",
+                    tk,
+                    scale,
+                    latest_db_sh,
+                    target_sh,
+                )
+                for fr in f_rows:
+                    conn.execute(
+                        "UPDATE fundamentals_annual SET shares_cr = ? WHERE ticker = ? AND fiscal_year = ?",
+                        (round(max(0.05, float(fr["shares_cr"]) * scale), 3), tk, int(fr["fiscal_year"])),
+                    )
+
+        scored_us_set = {
+            r["ticker"]
+            for r in conn.execute("SELECT DISTINCT ticker FROM fundamentals_annual").fetchall()
+        }
+
+    # Ensure every active US company with fundamentals has strict overlap priority `index_tag` (`NASDAQ100` > `SP500`)
+    # and recompute unified US Stage-1 rankings
+    existing_comp_map = {c["ticker"]: c for c in db.get_all_companies()}
     stage1_items: List[Dict[str, Any]] = []
-    for spec in active_specs:
+
+    for spec in combined_specs:
         tk, name, sector, industry, is_fin, insider_pct, inst_pct = spec
-        if tk not in parsed_by_tk:
+        if tk not in scored_us_set or tk not in full_us_prices:
             continue
-        rows = price_map[tk]
-        closes = np.array([r[2] for r in rows], dtype=float)
+        p_hist = full_us_prices[tk]
+        if len(p_hist) < 65:
+            continue
+
+        idx_tag = "NASDAQ100" if tk in NASDAQ100_SET else "SP500"
+        closes = np.array([p[1] for p in p_hist], dtype=float)
         cur_px = float(closes[-1])
 
+        # Refresh company metadata & strict overlap index_tag
+        ex_c = existing_comp_map.get(tk)
+        sh_est = implied_shares_map.get(tk, 0.0)
+        mcap_m = cur_px * sh_est if sh_est > 0 else 0.0
+        if mcap_m >= 200_000:
+            cap_tier = "Mega Cap ($200B+)"
+        elif mcap_m >= 50_000:
+            cap_tier = "Large Cap ($50B+)"
+        elif ex_c and ex_c.get("cap_tier"):
+            cap_tier = str(ex_c["cap_tier"])
+        else:
+            cap_tier = "Large/Mid Cap"
+
+        db.upsert_company(
+            ticker=tk,
+            name=name[:80],
+            sector=sector,
+            cap_tier=cap_tier,
+            is_financial=is_fin,
+            data_source="real_sec_edgar_xbrl",
+            promoter_pct=float(ex_c["promoter_pct"]) if ex_c and float(ex_c.get("promoter_pct") or 0) > 0 else insider_pct,
+            inst_pct=float(ex_c["inst_pct"]) if ex_c and float(ex_c.get("inst_pct") or 0) > 0 else inst_pct,
+            market="US",
+            currency="USD",
+            index_tag=idx_tag,
+        )
+
         ret_6m = ((cur_px / float(closes[-min(len(closes), 126)])) - 1.0) * 100.0
-        rel_6m_vs_ndx = ret_6m - bm_6m_ret
+        rel_6m_vs_bm = ret_6m - bm_6m_ret
 
         if len(closes) >= 252:
             mom_12_1 = ((float(closes[-21]) / float(closes[-252])) - 1.0) * 100.0
@@ -1028,7 +1345,7 @@ def ingest_nasdaq100_universe(db: Optional[Database] = None) -> Dict[str, Any]:
 
         risk_adj = mom_12_1 / max(14.0, ann_vol)
         s_mom = _lin(mom_12_1, -15.0, 48.0)
-        s_rel = _lin(rel_6m_vs_ndx, -14.0, 26.0)
+        s_rel = _lin(rel_6m_vs_bm, -14.0, 26.0)
         s_trend = 0.55 * _lin(dist_52w_high, -32.0, -2.0) + 0.45 * _lin(pct_vs_200dma, -12.0, 22.0)
         s_stab = 0.65 * _lin(risk_adj, -0.5, 1.6) + 0.35 * _lin(ann_vol, 48.0, 18.0)
         stage1_score = round(_clamp(0.35 * s_mom + 0.25 * s_rel + 0.25 * s_trend + 0.15 * s_stab), 1)
@@ -1036,7 +1353,7 @@ def ingest_nasdaq100_universe(db: Optional[Database] = None) -> Dict[str, Any]:
         stage1_items.append(
             {
                 "ticker": tk,
-                "name": name,
+                "name": name[:80],
                 "sector": sector,
                 "industry": industry,
                 "last_price": round(cur_px, 2),
@@ -1047,71 +1364,48 @@ def ingest_nasdaq100_universe(db: Optional[Database] = None) -> Dict[str, Any]:
                 "above_200dma": above_200,
                 "avg_turnover_cr": round(risk_adj, 2),
                 "stage1_score": stage1_score,
+                "index_tag": idx_tag,
             }
         )
 
     stage1_items.sort(key=lambda x: x["stage1_score"], reverse=True)
     now_ts = int(time.time())
-    stage1_rows: List[Tuple[Any, ...]] = []
-    all_annual_rows: List[Tuple[Any, ...]] = []
-
-    for rank_idx, item in enumerate(stage1_items, start=1):
-        tk = item["ticker"]
-        parsed = parsed_by_tk[tk]
-        db.upsert_company(
-            ticker=tk,
-            name=parsed["name"],
-            sector=parsed["sector"],
-            cap_tier=parsed["cap_tier"],
-            is_financial=parsed["is_financial"],
-            data_source="real_sec_edgar_xbrl",
-            promoter_pct=parsed["promoter_pct"],
-            inst_pct=parsed["inst_pct"],
-            market="US",
-            currency="USD",
-        )
-        all_annual_rows.extend(parsed["annual_rows"])
-        db.upsert_quarterly_signals(parsed["quarterly_signals"])
-        stage1_rows.append(
-            (
-                tk,
-                parsed["name"],
-                parsed["sector"],
-                item["industry"],
-                item["last_price"],
-                item["ret_6m_pct"],
-                item["mom_12_1_pct"],
-                item["volatility_pct"],
-                item["dist_52w_high_pct"],
-                item["above_200dma"],
-                item["avg_turnover_cr"],
-                item["stage1_score"],
-                rank_idx,
-                1,
-                1,
-                now_ts,
-                "US",
-                "USD",
-            )
-        )
-
-    if all_annual_rows:
-        db.upsert_fundamentals(all_annual_rows)
+    stage1_rows = [
+        {
+            **item,
+            "stage1_rank": rank_idx,
+            "shortlisted": 1,
+            "deep_scored": 1,
+            "updated_at": now_ts,
+            "market": "US",
+            "currency": "USD",
+        }
+        for rank_idx, item in enumerate(stage1_items, start=1)
+    ]
     if stage1_rows:
         db.upsert_stage1_rows(stage1_rows)
 
+    nasdaq_cnt = sum(1 for r in stage1_rows if r["index_tag"] == "NASDAQ100")
+    sp500_cnt = sum(1 for r in stage1_rows if r["index_tag"] == "SP500")
     elapsed = round(time.time() - t0, 1)
     summary = {
-        "us_stocks_ingested": len(stage1_rows),
-        "benchmark_ndx_days": len(bm_rows),
-        "annual_fy_rows": len(all_annual_rows),
+        "us_stocks_total": len(stage1_rows),
+        "nasdaq100_tagged": nasdaq_cnt,
+        "sp500_non_overlap_tagged": sp500_cnt,
+        "benchmark_ndx_days": len(bm_ndx_rows),
+        "benchmark_gspc_days": len(bm_gspc_rows),
         "elapsed_sec": elapsed,
     }
-    logger.info("Completed Nasdaq-100 ingestion: %s", summary)
+    logger.info("Completed S&P 500 + Nasdaq-100 US ingestion: %s", summary)
     return summary
+
+
+def ingest_nasdaq100_universe(db: Optional[Database] = None) -> Dict[str, Any]:
+    """Backward-compatible entrypoint invoking full US (`NASDAQ100` + `SP500`) ingestion."""
+    return ingest_us_universe(db=db)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    result = ingest_nasdaq100_universe()
-    print("Nasdaq-100 ingestion summary:", result)
+    result = ingest_us_universe()
+    print("US S&P 500 + Nasdaq-100 ingestion summary:", result)

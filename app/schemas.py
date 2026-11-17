@@ -11,6 +11,7 @@ TICKER_RE = re.compile(r"^[A-Z0-9&-]{1,20}(\.(NS|BO))?$")
 
 StrategyPreset = Literal[
     "qglp_compounder",
+    "street_quant",
     "artha_blend",
     "coffee_can",
     "magic_formula",
@@ -21,7 +22,7 @@ StrategyPreset = Literal[
 WeightingScheme = Literal["equal", "score", "inv_vol"]
 RebalanceFrequency = Literal["quarterly", "semiannual", "annual"]
 RiskProfile = Literal["equity_direct", "conservative", "moderate", "aggressive"]
-MarketFilter = Literal["ALL", "IN", "US"]
+MarketFilter = Literal["ALL", "IN", "US", "NASDAQ100", "SP500"]
 
 
 class AuthCredentials(BaseModel):

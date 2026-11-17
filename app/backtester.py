@@ -16,12 +16,13 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from app.factors import score_universe_point_in_time
+from app.factors import matches_market_filter, resolve_market_and_index_tag, score_universe_point_in_time
 from app.universe import BENCHMARK_TICKER
 
 INDIA_RISK_FREE_RATE = 0.068  # ~6.8% 10Y Government of India G-Sec yield
 US_RISK_FREE_RATE = 0.043  # ~4.3% 10Y US Treasury yield
 NASDAQ_BENCHMARK_TICKER = "^NDX"
+SP500_BENCHMARK_TICKER = "^GSPC"
 
 REBALANCE_STEP_DAYS = {
     "quarterly": 63,
@@ -63,13 +64,18 @@ def run_point_in_time_backtest(
     initial_capital: float = 1_000_000.0,
     cost_bps: float = 25.0,
     market: str = "IN",
+    street_signals: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     if price_matrix.empty:
         raise ValueError("Insufficient market price history for backtest.")
 
-    eff_market = market if market in ("ALL", "IN", "US") else "IN"
-    if eff_market in ("IN", "US"):
-        eval_companies = [c for c in companies if (c.get("market") or "IN") == eff_market]
+    eff_market = market if market in ("ALL", "IN", "US", "NASDAQ100", "SP500") else "IN"
+    if eff_market != "ALL":
+        eval_companies = []
+        for c in companies:
+            c_mkt, c_idx, _, _ = resolve_market_and_index_tag(c)
+            if matches_market_filter(c_mkt, c_idx, eff_market):
+                eval_companies.append(c)
     else:
         eval_companies = list(companies)
     if not eval_companies:
@@ -79,10 +85,19 @@ def run_point_in_time_backtest(
         NASDAQ_BENCHMARK_TICKER in price_matrix.columns
         and int(price_matrix[NASDAQ_BENCHMARK_TICKER].dropna().shape[0]) >= 60
     )
-    if eff_market == "US" and has_ndx:
-        bm_ticker = NASDAQ_BENCHMARK_TICKER
+    has_gspc = (
+        SP500_BENCHMARK_TICKER in price_matrix.columns
+        and int(price_matrix[SP500_BENCHMARK_TICKER].dropna().shape[0]) >= 60
+    )
+    if eff_market == "NASDAQ100" and (has_ndx or has_gspc):
+        bm_ticker = NASDAQ_BENCHMARK_TICKER if has_ndx else SP500_BENCHMARK_TICKER
         risk_free_rate = US_RISK_FREE_RATE
-        benchmark_name = "Nasdaq 100 (^NDX)"
+        benchmark_name = "Nasdaq 100 (^NDX)" if bm_ticker == NASDAQ_BENCHMARK_TICKER else "S&P 500 (^GSPC)"
+        currency = "USD"
+    elif eff_market in ("US", "SP500") and (has_gspc or has_ndx):
+        bm_ticker = SP500_BENCHMARK_TICKER if has_gspc else NASDAQ_BENCHMARK_TICKER
+        risk_free_rate = US_RISK_FREE_RATE
+        benchmark_name = "S&P 500 (^GSPC)" if bm_ticker == SP500_BENCHMARK_TICKER else "Nasdaq 100 (^NDX)"
         currency = "USD"
     else:
         if BENCHMARK_TICKER not in price_matrix.columns:
@@ -123,10 +138,11 @@ def run_point_in_time_backtest(
         ranked = score_universe_point_in_time(
             companies=eval_companies,
             fundamentals_df=fundamentals_df,
-            price_matrix=active_price_mat,
+            price_matrix=price_matrix,
             as_of_date=reb_date,
             preset=preset,
             custom_weights=custom_weights,
+            street_signals=street_signals,
         )
         # Exclude severe forensic red-flag / Avoid names when sufficient Buy/Hold candidates exist
         investable = [r for r in ranked if r["rating"] != "Avoid"]
@@ -179,24 +195,24 @@ def run_point_in_time_backtest(
 
         prev_weights = new_weights
         if idx_pos == len(rebal_indices) - 1:
-            latest_holdings = [
-                {
-                    "ticker": s["ticker"],
-                    "name": s["name"],
-                    "sector": s["sector"],
-                    "market": s.get("market", "IN"),
-                    "market_label": s.get(
-                        "market_label",
-                        "US Stock" if s.get("market") == "US" else "Indian Stock",
-                    ),
-                    "currency": s.get("currency", "USD" if s.get("market") == "US" else "INR"),
-                    "price": s.get("price"),
-                    "weight_pct": round(new_weights.get(s["ticker"], 0.0) * 100.0, 2),
-                    "composite_score": s["composite_score"],
-                    "rating": s["rating"],
-                }
-                for s in selected
-            ]
+            latest_holdings = []
+            for s in selected:
+                s_mkt, s_idx_tag, s_label, s_ccy = resolve_market_and_index_tag(s)
+                latest_holdings.append(
+                    {
+                        "ticker": s["ticker"],
+                        "name": s["name"],
+                        "sector": s["sector"],
+                        "market": s_mkt,
+                        "index_tag": s_idx_tag,
+                        "market_label": s_label,
+                        "currency": s_ccy,
+                        "price": s.get("price"),
+                        "weight_pct": round(new_weights.get(s["ticker"], 0.0) * 100.0, 2),
+                        "composite_score": s["composite_score"],
+                        "rating": s["rating"],
+                    }
+                )
 
     port_nav = pd.Series(initial_capital * np.cumprod(1.0 + port_daily_rets), index=sim_dates)
     bm_nav = pd.Series(initial_capital * np.cumprod(1.0 + bm_daily_rets), index=sim_dates)

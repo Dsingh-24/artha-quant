@@ -1,8 +1,8 @@
-"""Export sanitized public NSE Nifty 200 market data from SQLite into `static/data/market_snapshot.json`.
+"""Export sanitized public global (`IN` + `US` Nasdaq-100 & S&P 500) market data into `static/data/market_snapshot.json`.
 
 Security guarantee:
 - Reads ONLY public market tables (`companies`, `stage1_funnel`, `fundamentals_annual`,
-  `company_quarterly_signals`, `daily_prices`).
+  `company_quarterly_signals`, `company_street_signals`, `daily_prices`).
 - NEVER reads or exports `users`, `sessions`, or `saved_plans`.
 """
 
@@ -37,6 +37,7 @@ def export_public_snapshot(db_path: Path = DEFAULT_DB_PATH, out_path: Path | Non
             "data_source": c.get("data_source", "real_nse_screener"),
             "market": c.get("market", "IN"),
             "currency": c.get("currency", "INR"),
+            "index_tag": c.get("index_tag") or ("NIFTY200" if c.get("market", "IN") == "IN" else "NASDAQ100"),
         }
         for c in db.get_all_companies()
     ]
@@ -59,12 +60,43 @@ def export_public_snapshot(db_path: Path = DEFAULT_DB_PATH, out_path: Path | Non
             "deep_scored": int(r["deep_scored"]),
             "market": r.get("market", "IN"),
             "currency": r.get("currency", "INR"),
+            "index_tag": r.get("index_tag") or ("NIFTY200" if r.get("market", "IN") == "IN" else "NASDAQ100"),
         }
         for r in db.get_stage1_funnel()
     ]
 
     fundamentals = db.get_all_fundamentals()
     qtr_signals = db.get_all_quarterly_signals()
+    raw_street = db.get_all_street_signals()
+    street_signals = {
+        tk: {
+            "ticker": tk,
+            "signals_as_of_date": str(s.get("signals_as_of_date") or ""),
+            "analyst_count": int(s.get("analyst_count") or 0),
+            "strong_buy_count": int(s.get("strong_buy_count") or 0),
+            "buy_count": int(s.get("buy_count") or 0),
+            "hold_count": int(s.get("hold_count") or 0),
+            "sell_count": int(s.get("sell_count") or 0),
+            "strong_sell_count": int(s.get("strong_sell_count") or 0),
+            "consensus_buy_pct": round(float(s.get("consensus_buy_pct") or 0.0), 1),
+            "recommendation_key": str(s.get("recommendation_key") or "none"),
+            "target_mean_price": round(float(s.get("target_mean_price") or 0.0), 2),
+            "target_high_price": round(float(s.get("target_high_price") or 0.0), 2),
+            "target_low_price": round(float(s.get("target_low_price") or 0.0), 2),
+            "forward_pe": round(float(s.get("forward_pe") or 0.0), 2),
+            "fwd_eps_growth_fy1_pct": round(float(s.get("fwd_eps_growth_fy1_pct") or 0.0), 2),
+            "fwd_eps_growth_fy2_pct": round(float(s.get("fwd_eps_growth_fy2_pct") or 0.0), 2),
+            "eps_rev_up_30d": int(s.get("eps_rev_up_30d") or 0),
+            "eps_rev_down_30d": int(s.get("eps_rev_down_30d") or 0),
+            "eps_rev_up_90d": int(s.get("eps_rev_up_90d") or 0),
+            "eps_rev_down_90d": int(s.get("eps_rev_down_90d") or 0),
+            "rev_breadth_pct": round(float(s.get("rev_breadth_pct") or 0.0), 1),
+            "inst_held_pct": round(float(s.get("inst_held_pct") or 0.0), 2),
+            "recent_bank_actions": list(s.get("recent_bank_actions") or []),
+            "top_holders": list(s.get("top_holders") or []),
+        }
+        for tk, s in raw_street.items()
+    }
     raw_prices = db.get_all_prices()
 
     # Build compact aligned price matrix: dates[] + prices[ticker] -> list of floats/None
@@ -91,12 +123,13 @@ def export_public_snapshot(db_path: Path = DEFAULT_DB_PATH, out_path: Path | Non
                 arr[i] = last_val
 
     payload = {
-        "snapshot_version": "1.2.0",
-        "as_of_date": all_dates[-1] if all_dates else "2026-11-13",
+        "snapshot_version": "2.5.0",
+        "as_of_date": all_dates[-1] if all_dates else "2026-11-16",
         "companies": companies,
         "stage1_funnel": stage1_funnel,
         "fundamentals": fundamentals,
         "quarterly_signals": qtr_signals,
+        "street_signals": street_signals,
         "price_dates": all_dates,
         "prices": prices_by_tk,
     }
@@ -108,6 +141,7 @@ def export_public_snapshot(db_path: Path = DEFAULT_DB_PATH, out_path: Path | Non
         "size_kb": round(len(encoded) / 1024.0, 1),
         "companies": len(companies),
         "fundamentals": len(fundamentals),
+        "street_signals": len(street_signals),
         "price_dates": len(all_dates),
     }
 

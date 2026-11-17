@@ -12,6 +12,8 @@ from typing import Any, Dict, List
 
 import numpy as np
 
+from app.factors import matches_market_filter, resolve_market_and_index_tag
+
 USD_INR_RATE = 84.5
 
 RISK_PROFILES: Dict[str, Dict[str, Any]] = {
@@ -106,13 +108,18 @@ US_RISK_PROFILES: Dict[str, Dict[str, Any]] = {
 
 
 def _resolve_risk_profile(risk_profile: str, market: str) -> Dict[str, Any]:
-    if market == "US":
-        return US_RISK_PROFILES.get(risk_profile, US_RISK_PROFILES["equity_direct"])
+    if market in ("US", "NASDAQ100", "SP500"):
+        base_us = US_RISK_PROFILES.get(risk_profile, US_RISK_PROFILES["equity_direct"])
+        if market == "SP500":
+            return {**base_us, "label": base_us["label"].replace("Nasdaq-100", "S&P 500")}
+        if market == "US":
+            return {**base_us, "label": base_us["label"].replace("Nasdaq-100", "US S&P 500 + Nasdaq-100")}
+        return base_us
     base = RISK_PROFILES.get(risk_profile, RISK_PROFILES["equity_direct"])
     if market == "ALL":
         return {
             **base,
-            "label": base["label"].replace("NSE ", "Global NSE + Nasdaq-100 "),
+            "label": base["label"].replace("NSE ", "Global NSE + US "),
         }
     return base
 
@@ -135,22 +142,23 @@ def _build_why_buy_memo(stock: Dict[str, Any]) -> str:
     m = stock["metrics"]
     stab = int(m.get("moat_stability_score", 70))
     if stock["is_financial"]:
-        npa_str = f", NNPA {m['nnpa_pct']}%" if m.get("gnpa_pct", 0) > 0 else ""
-        cap_str = f"5Y Med ROE {m['med_5y_roce_pct']}% (Floor {m.get('cycle_floor_roce_pct', m['med_5y_roce_pct'])}%{npa_str})"
+        npa_str = f", NNPA {m['nnpa_pct']:.2f}%" if m.get("gnpa_pct", 0) > 0 else ""
+        floor_v = m.get("cycle_floor_roce_pct", m["med_5y_roce_pct"])
+        cap_str = f"5Y Med ROE {m['med_5y_roce_pct']:.1f}% (Floor {floor_v:.1f}%{npa_str})"
     else:
         cap_str = (
-            f"5Y Med ROCE {m['med_5y_roce_pct']}% (8Y Stab {stab}/100, D/E {m['debt_to_equity']}x)"
+            f"5Y Med ROCE {m['med_5y_roce_pct']:.1f}% (8Y Stab {stab}/100, D/E {m['debt_to_equity']:.2f}x)"
         )
     qtr_str = (
         f"2Q PAT {m['qtr_pat_yoy_pct']:+.1f}% YoY"
         if m.get("latest_qtr_label")
-        else f"5Y PAT CAGR {m['pat_cagr_5y_pct']}%"
+        else f"5Y PAT CAGR {m['pat_cagr_5y_pct']:.1f}%"
     )
     inst_chg = m.get("inst_chg_1y_pct", 0.0)
     own_str = f"4Q Inst {inst_chg:+.1f}%" if inst_chg != 0.0 else f"Piotroski {m['piotroski_f_score']}/9"
     return (
         f"{cap_str} • {qtr_str} • "
-        f"P/E {m['pe_ratio']}x (Fair ~{m['fair_pe']}x, PEG {m['peg_ratio']}x) • "
+        f"P/E {m['pe_ratio']:.1f}x (Fair ~{m['fair_pe']:.1f}x, PEG {m['peg_ratio']:.2f}x) • "
         f"{own_str}"
     )
 
@@ -165,18 +173,21 @@ def build_investment_plan(
     max_stocks: int = 8,
     market: str = "ALL",
 ) -> Dict[str, Any]:
-    eff_market = market if market in ("ALL", "IN", "US") else "ALL"
-    plan_currency = "USD" if eff_market == "US" else "INR"
+    eff_market = market if market in ("ALL", "IN", "US", "NASDAQ100", "SP500") else "ALL"
+    plan_currency = "USD" if eff_market in ("US", "NASDAQ100", "SP500") else "INR"
     prof = _resolve_risk_profile(risk_profile, eff_market)
 
-    if eff_market in ("IN", "US"):
-        pool_stocks = [s for s in ranked_stocks if (s.get("market") or "IN") == eff_market]
+    if eff_market != "ALL":
+        pool_stocks = []
+        for s in ranked_stocks:
+            s_mkt, s_idx, _, _ = resolve_market_and_index_tag(s)
+            if matches_market_filter(s_mkt, s_idx, eff_market):
+                pool_stocks.append(s)
     else:
         pool_stocks = list(ranked_stocks)
 
     def _px_in_plan_ccy(stock: Dict[str, Any]) -> float:
-        s_mkt = "US" if stock.get("market") == "US" else "IN"
-        s_ccy = stock.get("currency") or ("USD" if s_mkt == "US" else "INR")
+        s_mkt, _, _, s_ccy = resolve_market_and_index_tag(stock)
         native_px = max(0.01, float(stock["price"]))
         if plan_currency == "USD":
             return native_px if s_ccy == "USD" else (native_px / USD_INR_RATE)
@@ -259,9 +270,7 @@ def build_investment_plan(
         w = float(weights[idx])
         target_alloc = equity_lump_inr * w
         alloc_sip = equity_sip_inr * w
-        s_mkt = "US" if s.get("market") == "US" else "IN"
-        s_label = s.get("market_label") or ("US Stock" if s_mkt == "US" else "Indian Stock")
-        s_ccy = s.get("currency") or ("USD" if s_mkt == "US" else "INR")
+        s_mkt, s_idx_tag, s_label, s_ccy = resolve_market_and_index_tag(s)
         px_plan = max(0.01, _px_in_plan_ccy(s))
         remaining_budget = max(0.0, equity_lump_inr - deployed_equity_inr)
         shares_qty = int(math.floor(min(target_alloc * 1.03, remaining_budget) / px_plan))
@@ -292,6 +301,7 @@ def build_investment_plan(
                 "name": s["name"],
                 "sector": s["sector"],
                 "market": s_mkt,
+                "index_tag": s_idx_tag,
                 "market_label": s_label,
                 "currency": s_ccy,
                 "role": _classify_portfolio_role(s),

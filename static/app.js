@@ -1,8 +1,9 @@
-// ArthaQuant V2.0 Frontend Controller
+// ArthaQuant V2.5 Frontend Controller
 // Built exclusively with safe DOM creation (createElement, createElementNS, textContent)
 // and CSS class toggling.
 
 import {
+  createConsensusBarSvg,
   createContributionBarSvg,
   createProgressSvg,
   createScoreRingSvg,
@@ -21,6 +22,7 @@ import {
 
 const DEFAULT_PRESET_WEIGHTS = {
   qglp_compounder: { quality: 45.0, value: 20.0, growth: 25.0, momentum: 10.0 },
+  street_quant: { quality: 35.0, value: 20.0, growth: 25.0, momentum: 20.0 },
   coffee_can: { quality: 55.0, value: 10.0, growth: 30.0, momentum: 5.0 },
   magic_formula: { quality: 45.0, value: 45.0, growth: 5.0, momentum: 5.0 },
   artha_blend: { quality: 35.0, value: 25.0, growth: 20.0, momentum: 20.0 },
@@ -29,6 +31,7 @@ const DEFAULT_PRESET_WEIGHTS = {
 
 const PRESET_NAMES = {
   qglp_compounder: "Long-Term QGLP Compounder",
+  street_quant: "Street EPS Revisions + Quant Compounder",
   coffee_can: "Marcellus Coffee-Can",
   magic_formula: "Greenblatt Magic Formula",
   artha_blend: "Balanced 4-Factor Blend",
@@ -49,7 +52,7 @@ const state = {
   stocks: [],
   visibleStocks: [],
   stage1Funnel: [],
-  marketCounts: { ALL: 0, IN: 0, US: 0 },
+  marketCounts: { ALL: 0, IN: 0, US: 0, NASDAQ100: 0, SP500: 0 },
   presetWeightsMap: DEFAULT_PRESET_WEIGHTS,
   selectedTicker: null,
   drawerOpen: false,
@@ -102,11 +105,30 @@ async function apiRequest(path, options = {}) {
   return data;
 }
 
+function isUsdMarketMode(market) {
+  return market === "US" || market === "NASDAQ100" || market === "SP500";
+}
+
 function isUSStock(item) {
   if (!item) return false;
+  const tag = String(item.index_tag || "").toUpperCase();
+  if (tag === "NASDAQ100" || tag === "SP500") return true;
+  if (tag === "NIFTY200") return false;
   if (item.market) return item.market === "US";
   if (item.currency) return item.currency === "USD";
   return false;
+}
+
+function resolveIndexTag(item) {
+  if (!item) return "NIFTY200";
+  const tag = String(item.index_tag || "").toUpperCase();
+  if (tag === "NASDAQ100" || tag === "SP500" || tag === "NIFTY200") {
+    return tag;
+  }
+  const lbl = String(item.market_label || "").toUpperCase();
+  if (lbl.includes("S&P") || lbl.includes("SP500")) return "SP500";
+  if (lbl.includes("NASDAQ")) return "NASDAQ100";
+  return isUSStock(item) ? "NASDAQ100" : "NIFTY200";
 }
 
 function stockCurrency(item) {
@@ -118,12 +140,14 @@ function displaySymbol(ticker) {
 }
 
 function createMarketTag(item) {
-  const us = isUSStock(item);
-  return el(
-    "span",
-    us ? "tag-market tag-market-us" : "tag-market tag-market-in",
-    us ? "US Stock · NASDAQ" : "Indian Stock · NSE"
-  );
+  const tag = resolveIndexTag(item);
+  if (tag === "NASDAQ100") {
+    return el("span", "tag-market tag-market-nasdaq", "US Stock · NASDAQ 100");
+  }
+  if (tag === "SP500") {
+    return el("span", "tag-market tag-market-sp500", "US Stock · S&P 500");
+  }
+  return el("span", "tag-market tag-market-in", "Indian Stock · NIFTY 200");
 }
 
 function formatExactAmount(amount, currency = "INR") {
@@ -313,7 +337,7 @@ async function enterWorkspace() {
   document.getElementById("auth-screen").classList.add("hidden");
   document.getElementById("app-shell").classList.remove("hidden");
   document.getElementById("user-badge").textContent = state.staticMode
-    ? "Mode: Cloud Snapshot (NSE + Nasdaq)"
+    ? "Mode: Cloud Snapshot (Nifty 200 + Nasdaq 100 + S&P 500)"
     : `Advisor: ${state.username}`;
   await loadScreener(true);
 }
@@ -350,18 +374,38 @@ async function setScreenerMarket(market) {
 
   const searchEl = document.getElementById("screener-search");
   const secLabel = document.getElementById("screener-sector-label");
+  const mktSub = document.getElementById("screener-market-sub");
+
   if (market === "IN") {
     searchEl.placeholder =
-      "Search Indian NSE stocks (e.g. Muthoot, ICICI, Polycab, TCS, Dixon)...";
-    secLabel.textContent = "NSE Sector";
+      "Search India Nifty 200 stocks (e.g. Muthoot, ICICI, Polycab, TCS, Dixon)...";
+    secLabel.textContent = "Nifty 200 Sector";
+    mktSub.textContent =
+      "Showing Indian Stock · NIFTY 200 compounders in native ₹ INR";
+  } else if (market === "NASDAQ100") {
+    searchEl.placeholder =
+      "Search US Nasdaq 100 stocks (e.g. NVDA, MSFT, AAPL, COST, META, AVGO)...";
+    secLabel.textContent = "Nasdaq 100 Sector";
+    mktSub.textContent =
+      "Showing US Stock · NASDAQ 100 constituents (takes tag priority over S&P 500 overlap)";
+  } else if (market === "SP500") {
+    searchEl.placeholder =
+      "Search US S&P 500 non-Nasdaq stocks (e.g. JPM, LLY, V, MA, WMT, GS, BRK-B)...";
+    secLabel.textContent = "S&P 500 Sector";
+    mktSub.textContent =
+      "Showing US Stock · S&P 500 non-Nasdaq stocks • Overlap mega-caps (AAPL, MSFT, NVDA) carry the NASDAQ 100 tag";
   } else if (market === "US") {
     searchEl.placeholder =
-      "Search US Nasdaq-100 stocks (e.g. NVDA, MSFT, AAPL, COST, META, AVGO)...";
-    secLabel.textContent = "Nasdaq-100 Sector";
+      "Search all US stocks — Nasdaq 100 & S&P 500 (e.g. NVDA, JPM, MSFT, LLY, V, COST)...";
+    secLabel.textContent = "US Sector";
+    mktSub.textContent =
+      "Showing combined US universe (Nasdaq 100 + S&P 500) • Overlap names carry the NASDAQ 100 priority tag";
   } else {
     searchEl.placeholder =
-      "Search NSE & Nasdaq-100 stocks (e.g. Muthoot, NVDA, MSFT, ICICI, Apple, Dixon)...";
+      "Search Nifty 200, Nasdaq 100 & S&P 500 stocks (e.g. NVDA, JPM, LLY, MSFT, Muthoot, ICICI)...";
     secLabel.textContent = "Sector Filter";
+    mktSub.textContent =
+      "Index tag priority: NASDAQ 100 > S&P 500 > NIFTY 200 • Dual-listed US overlap names carry the NASDAQ 100 tag";
   }
 
   document.getElementById("screener-sector").value = "ALL";
@@ -370,6 +414,8 @@ async function setScreenerMarket(market) {
 
 async function setPlannerMarket(market) {
   const prevMarket = state.plannerMarket;
+  const wasUsd = isUsdMarketMode(prevMarket);
+  const nowUsd = isUsdMarketMode(market);
   state.plannerMarket = market;
   updateSwitcherActiveButtons("planner-market-switcher", market);
 
@@ -384,17 +430,26 @@ async function setPlannerMarket(market) {
   const navTab = document.getElementById("nav-planner-tab");
   const marketSub = document.getElementById("pl-market-sub");
 
-  if (market === "US") {
+  if (nowUsd) {
     lumpLbl.textContent = "Capital to Deploy Today ($ USD)";
     sipLbl.textContent = "Optional Monthly SIP ($ USD)";
     targetLbl.textContent = "Target Corpus Goal ($ USD)";
     runBtn.textContent = "Build $ Blueprint";
     coneTitle.textContent = "1,000-Path Wealth Projection Cone ($ USD)";
     navTab.textContent = "$10K Investment Planner";
-    marketSub.textContent =
-      "Deploying USD directly into whole Nasdaq-100 US compounder shares";
 
-    if (prevMarket !== "US" || Number(lumpInput.value) >= 100000) {
+    if (market === "NASDAQ100") {
+      marketSub.textContent =
+        "Deploying USD directly into whole Nasdaq 100 US compounder shares";
+    } else if (market === "SP500") {
+      marketSub.textContent =
+        "Deploying USD into S&P 500 (non-Nasdaq) compounders • Overlap names carry the NASDAQ 100 tag";
+    } else {
+      marketSub.textContent =
+        "Deploying USD across combined US Nasdaq 100 & S&P 500 compounder shares";
+    }
+
+    if (!wasUsd || Number(lumpInput.value) >= 100000) {
       lumpInput.step = "1000";
       lumpInput.value = "10000";
       sipInput.step = "250";
@@ -411,10 +466,10 @@ async function setPlannerMarket(market) {
     navTab.textContent = "₹5L Investment Planner";
     marketSub.textContent =
       market === "IN"
-        ? "Deploying ₹ INR across audited Indian NSE Nifty-200 compounders"
+        ? "Deploying ₹ INR across audited Indian NSE Nifty 200 compounders"
         : "Deploying ₹ INR across Global All-Market leaders (US prices sized at ₹84.5/$)";
 
-    if (prevMarket === "US" || Number(lumpInput.value) <= 50000) {
+    if (wasUsd || Number(lumpInput.value) <= 50000) {
       lumpInput.step = "50000";
       lumpInput.value = "500000";
       sipInput.step = "5000";
@@ -466,28 +521,49 @@ async function loadScreener(populateSectors = false) {
       state.presetWeightsMap = data.preset_weights;
     }
 
-    const mc = data.market_counts || {
-      ALL: data.total_deep_scored || state.stocks.length,
-      IN: state.stocks.filter((s) => !isUSStock(s)).length,
-      US: state.stocks.filter((s) => isUSStock(s)).length,
+    const fallbackIn = state.stocks.filter((s) => !isUSStock(s)).length;
+    const fallbackUs = state.stocks.filter((s) => isUSStock(s)).length;
+    const fallbackNasdaq = state.stocks.filter((s) => resolveIndexTag(s) === "NASDAQ100").length;
+    const fallbackSp500 = state.stocks.filter((s) => resolveIndexTag(s) === "SP500").length;
+
+    const rawMc = data.market_counts || {};
+    const mc = {
+      ALL: rawMc.ALL !== undefined ? rawMc.ALL : data.total_deep_scored || state.stocks.length,
+      IN: rawMc.IN !== undefined ? rawMc.IN : fallbackIn,
+      US: rawMc.US !== undefined ? rawMc.US : fallbackUs,
+      NASDAQ100:
+        rawMc.NASDAQ100 !== undefined ? rawMc.NASDAQ100 : fallbackNasdaq || fallbackUs,
+      SP500: rawMc.SP500 !== undefined ? rawMc.SP500 : fallbackSp500,
     };
     state.marketCounts = mc;
 
     document.getElementById("mkt-count-all").textContent = String(mc.ALL || 0);
     document.getElementById("mkt-count-in").textContent = String(mc.IN || 0);
     document.getElementById("mkt-count-us").textContent = String(mc.US || 0);
+    document.getElementById("mkt-count-nasdaq").textContent = String(mc.NASDAQ100 || 0);
+    document.getElementById("mkt-count-sp500").textContent = String(mc.SP500 || 0);
 
     const niftyVal = Number(data.benchmark_nifty50 || 0);
+    const sp500Val = Number(data.benchmark_sp500 || 0);
     const ndxVal = Number(data.benchmark_nasdaq100 || 0);
-    const niftyPart = niftyVal > 0 ? `Nifty 50: ${niftyVal.toLocaleString("en-IN")}` : "";
+    const niftyPart =
+      niftyVal > 0
+        ? `Nifty 50 (^NSEI): ${niftyVal.toLocaleString("en-IN", { maximumFractionDigits: 2 })}`
+        : "";
+    const sp500Part =
+      sp500Val > 0
+        ? `S&P 500 (^GSPC): ${sp500Val.toLocaleString("en-US", { maximumFractionDigits: 2 })}`
+        : "";
     const ndxPart =
       ndxVal > 0
-        ? `Nasdaq 100: ${ndxVal.toLocaleString("en-US", { maximumFractionDigits: 2 })}`
+        ? `Nasdaq 100 (^NDX): ${ndxVal.toLocaleString("en-US", { maximumFractionDigits: 2 })}`
         : "";
-    const idxJoined = [niftyPart, ndxPart].filter(Boolean).join("  •  ");
+    const idxJoined = [niftyPart, sp500Part, ndxPart].filter(Boolean).join("  •  ");
     const countPart =
-      mc.US > 0
-        ? `Audited Universe: ${mc.IN} Indian (NSE) + ${mc.US} US (Nasdaq-100)`
+      mc.SP500 > 0
+        ? `Universe: ${mc.IN} Nifty 200 + ${mc.NASDAQ100} Nasdaq 100 + ${mc.SP500} S&P 500`
+        : mc.US > 0
+        ? `Universe: ${mc.IN} Nifty 200 + ${mc.US} US`
         : `Audited Universe: ${data.total_deep_scored} Stocks`;
     document.getElementById("market-status-line").textContent = [
       idxJoined,
@@ -499,7 +575,9 @@ async function loadScreener(populateSectors = false) {
 
     if (state.staticMode) {
       document.getElementById("user-badge").textContent =
-        mc.US > 0
+        mc.SP500 > 0
+          ? `Cloud Snapshot (${mc.IN} IN + ${mc.US} US)`
+          : mc.US > 0
           ? `Cloud Snapshot (${mc.IN} NSE + ${mc.US} Nasdaq)`
           : `Cloud Snapshot (${data.total_deep_scored} Audited)`;
     }
@@ -523,7 +601,11 @@ async function loadScreener(populateSectors = false) {
       const prevVal = sel.value;
       const allLabel =
         state.screenerMarket === "IN"
-          ? "All Indian Sectors"
+          ? "All Nifty 200 Sectors"
+          : state.screenerMarket === "NASDAQ100"
+          ? "All Nasdaq 100 Sectors"
+          : state.screenerMarket === "SP500"
+          ? "All S&P 500 Sectors"
           : state.screenerMarket === "US"
           ? "All US Sectors"
           : "All Global Sectors";
@@ -565,9 +647,9 @@ function renderFormulaBar() {
 
   const items = [
     ["dot-emerald", `Quality & 8Y Moat ${w.quality.toFixed(0)}%`],
-    ["dot-indigo", `5Y + 2Q Growth ${w.growth.toFixed(0)}%`],
+    ["dot-indigo", `5Y + 2Q + Street Growth ${w.growth.toFixed(0)}%`],
     ["dot-cyan", `GARP Valuation ${w.value.toFixed(0)}%`],
-    ["dot-amber", `Piotroski & Smart Money ${w.momentum.toFixed(0)}%`],
+    ["dot-amber", `Piotroski, Revisions & Smart Money ${w.momentum.toFixed(0)}%`],
   ];
 
   items.forEach(([dotCls, label], idx) => {
@@ -596,11 +678,20 @@ function setFunnelView(mode) {
 
 function matchesSearch(item, q) {
   if (!q) return true;
+  const tag = resolveIndexTag(item);
+  const canonicalBadge =
+    tag === "NASDAQ100"
+      ? "US Stock NASDAQ 100"
+      : tag === "SP500"
+      ? "US Stock S&P 500 SP500"
+      : "Indian Stock NIFTY 200 NSE";
   const hay = [
     item.name || "",
     item.ticker || "",
     item.sector || "",
-    item.market_label || (isUSStock(item) ? "US Stock NASDAQ" : "Indian Stock NSE"),
+    item.index_tag || "",
+    item.market_label || "",
+    canonicalBadge,
   ]
     .join(" ")
     .toLowerCase();
@@ -713,9 +804,13 @@ function renderTopPodium(visibleStocks) {
 
   const marketTitle =
     state.screenerMarket === "IN"
-      ? "Top Indian NSE Conviction Leaders"
+      ? "Top India · Nifty 200 Conviction Leaders"
+      : state.screenerMarket === "NASDAQ100"
+      ? "Top US · Nasdaq 100 Conviction Leaders"
+      : state.screenerMarket === "SP500"
+      ? "Top US · S&P 500 (Non-Nasdaq) Conviction Leaders"
       : state.screenerMarket === "US"
-      ? "Top US Nasdaq-100 Conviction Leaders"
+      ? "Top All-US (Nasdaq 100 + S&P 500) Conviction Leaders"
       : "Top Global Conviction Leaders";
   document.getElementById("podium-heading").textContent = marketTitle;
 
@@ -825,13 +920,17 @@ function applyClientFiltersAndRender() {
 function renderStage2Table(stocks) {
   const marketHeadline =
     state.screenerMarket === "IN"
-      ? "Indian Stocks — NSE Nifty-200 Fundamental Rankings"
+      ? "India · Nifty 200 — Audited Fundamental Rankings"
+      : state.screenerMarket === "NASDAQ100"
+      ? "US · Nasdaq 100 — Audited Fundamental Rankings"
+      : state.screenerMarket === "SP500"
+      ? "US · S&P 500 (Non-Nasdaq) — Audited Rankings (Overlap Names Carry NASDAQ 100 Tag)"
       : state.screenerMarket === "US"
-      ? "US Stocks — Nasdaq-100 Fundamental Rankings"
-      : "Global Multi-Market Fundamental Rankings (NSE + Nasdaq-100)";
+      ? "All US Stocks (Nasdaq 100 + S&P 500) — Audited Fundamental Rankings"
+      : "Global Multi-Market Fundamental Rankings (Nifty 200 + Nasdaq 100 + S&P 500)";
   document.getElementById("table-panel-title").textContent = marketHeadline;
   document.getElementById("table-panel-sub").textContent =
-    "Scored on 8Y Anti-Cyclical Moat, Latest 2Q YoY Earnings, GARP Fair P/E & Piotroski Health — click any row for exact score math";
+    "Scored on 8Y Anti-Cyclical Moat, 2Q + Street EPS Revisions, GARP Fair P/E & Piotroski Health — click any row for exact score math";
   document.getElementById("visible-count-badge").textContent =
     `Showing ${stocks.length} of ${state.stocks.length} Ranked`;
 
@@ -1175,6 +1274,239 @@ function buildEvidenceMetricRow(name, target, valueText, valueColorClass = "") {
   return row;
 }
 
+function normalizeBankAction(rawAction) {
+  const raw = String(rawAction || "").trim();
+  const low = raw.toLowerCase();
+  if (low === "up" || low.includes("upgrade")) {
+    return { label: "Upgrade", cls: "action-upgrade" };
+  }
+  if (low === "down" || low.includes("downgrade")) {
+    return { label: "Downgrade", cls: "action-downgrade" };
+  }
+  if (low === "init" || low.includes("initiat")) {
+    return { label: "Initiated", cls: "action-init" };
+  }
+  if (low === "reit" || low.includes("reiterat")) {
+    return { label: "Reiterated", cls: "action-main" };
+  }
+  if (low === "main" || low.includes("maintain")) {
+    return { label: "Maintained", cls: "action-main" };
+  }
+  const fallback = raw ? raw.charAt(0).toUpperCase() + raw.slice(1) : "Maintained";
+  return { label: fallback, cls: "action-main" };
+}
+
+function buildStreetMetricBox(label, primaryText, subtitleText, colorCls = "") {
+  const box = el("div", "street-metric-box");
+  box.appendChild(el("div", "street-m-label", label));
+  box.appendChild(el("div", `street-m-val ${colorCls}`.trim(), primaryText));
+  if (subtitleText) {
+    box.appendChild(el("div", "street-m-sub", subtitleText));
+  }
+  return box;
+}
+
+function buildStreetConsensusCard(sc, mergedMarketObj, ccy) {
+  const st = sc.street || {};
+  const m = sc.metrics || {};
+  const us = isUSStock(mergedMarketObj);
+
+  const card = el("div", "street-card");
+
+  // 1. Header + Coverage Badge
+  const header = el("div", "street-header");
+  const headLeft = document.createElement("div");
+  headLeft.appendChild(
+    el("div", "dd-section-title", "Wall Street & Dalal Street Institutional Consensus")
+  );
+  headLeft.appendChild(
+    el(
+      "div",
+      "muted-note",
+      "Sell-side analyst targets, 30d/90d EPS revision breadth & verified long-only institutional holdings"
+    )
+  );
+  header.appendChild(headLeft);
+
+  const covRow = el("div", "street-coverage-row");
+  const analystCount = Math.max(0, Math.round(Number(st.analyst_count || 0)));
+  const buyPct = Math.max(0, Math.min(100, Number(st.consensus_buy_pct || 0)));
+  covRow.appendChild(
+    el(
+      "span",
+      `street-coverage-badge ${buyPct < 50 ? "street-neutral" : ""}`.trim(),
+      `${analystCount} Covering Analysts • ${Math.round(buyPct)}% Buy`
+    )
+  );
+  header.appendChild(covRow);
+  card.appendChild(header);
+
+  // 2. Analyst Consensus Stacked Bar (SVG + Count Legend)
+  const barWrap = el("div", "street-consensus-bar-wrap");
+  barWrap.appendChild(createConsensusBarSvg(st));
+  card.appendChild(barWrap);
+
+  // 3. 4 Key Street Metrics Strip
+  const strip = el("div", "street-metrics-grid");
+
+  // Metric 1: 12M Mean Target & Implied Upside
+  const targetMean = Number(st.target_mean ?? st.target_mean_price ?? 0);
+  const targetLow = Number(st.target_low ?? st.target_low_price ?? 0);
+  const targetHigh = Number(st.target_high ?? st.target_high_price ?? 0);
+  const cmp = Number(sc.price || 0);
+  const upsidePct =
+    st.target_upside_pct !== undefined && st.target_upside_pct !== null
+      ? Number(st.target_upside_pct)
+      : targetMean > 0 && cmp > 0
+      ? ((targetMean - cmp) / cmp) * 100
+      : 0;
+
+  if (targetMean > 0) {
+    const tgtCls = upsidePct >= 10 ? "text-pos" : upsidePct <= -5 ? "text-neg" : "text-cyan";
+    const rangeSub =
+      targetLow > 0 && targetHigh > 0
+        ? `${formatStockPrice(targetLow, ccy)} — ${formatStockPrice(targetHigh, ccy)} range`
+        : "Consensus 12-month target";
+    strip.appendChild(
+      buildStreetMetricBox(
+        "12M Mean Target & Upside",
+        `${formatStockPrice(targetMean, ccy)} (${fmtSigned(upsidePct, 1)}%)`,
+        rangeSub,
+        tgtCls
+      )
+    );
+  } else {
+    strip.appendChild(
+      buildStreetMetricBox(
+        "12M Mean Target & Upside",
+        "Target N/A",
+        "Consensus ratings active; price objective undisclosed"
+      )
+    );
+  }
+
+  // Metric 2: EPS Revision Momentum (30d/90d)
+  const up30 = Math.max(0, Math.round(Number(st.eps_rev_up_30d || 0)));
+  const dn30 = Math.max(0, Math.round(Number(st.eps_rev_down_30d || 0)));
+  const up90 = Math.max(0, Math.round(Number(st.eps_rev_up_90d || 0)));
+  const dn90 = Math.max(0, Math.round(Number(st.eps_rev_down_90d || 0)));
+  const use30d = up30 + dn30 >= 3 || up90 + dn90 === 0;
+  const upShow = use30d ? up30 : up90;
+  const dnShow = use30d ? dn30 : dn90;
+  const winTag = use30d ? "30d" : "90d";
+  const revBreadth = Number(st.rev_breadth_pct || 0);
+
+  if (upShow + dnShow > 0) {
+    const revCls = revBreadth >= 15 ? "text-pos" : revBreadth <= -15 ? "text-neg" : "text-warn";
+    const revSub =
+      use30d && up90 + dn90 > 0
+        ? `${winTag} window • 90d: ${up90} Up vs ${dn90} Down`
+        : `${winTag} consensus EPS revision window`;
+    strip.appendChild(
+      buildStreetMetricBox(
+        "EPS Revision Momentum",
+        `${upShow} Up vs ${dnShow} Down (${fmtSigned(revBreadth, 0)}% Breadth)`,
+        revSub,
+        revCls
+      )
+    );
+  } else {
+    strip.appendChild(
+      buildStreetMetricBox(
+        "EPS Revision Momentum",
+        "0 Up vs 0 Down (Steady)",
+        "Unchanged FY1 consensus EPS over 30d/90d",
+        "text-cyan"
+      )
+    );
+  }
+
+  // Metric 3: Forward Consensus Growth + Forward P/E
+  const fy1 = Number(st.fwd_eps_growth_fy1_pct || 0);
+  const fy2 = Number(st.fwd_eps_growth_fy2_pct || 0);
+  const fwdPe = Number(st.forward_pe || 0);
+  const fwdGrowthText =
+    fy1 !== 0 || fy2 !== 0
+      ? `FY1 ${fmtSigned(fy1, 1)}% • FY2 ${fmtSigned(fy2, 1)}%`
+      : "Consensus Est. Pending";
+  const fwdCls = fy1 >= 12 ? "text-pos" : fy1 < 0 ? "text-neg" : "text-indigo";
+  const fwdPeSub =
+    fwdPe > 0
+      ? `Forward P/E: ${fwdPe.toFixed(1)}x${
+          m.pe_ratio > 0 && m.pe_ratio < 99 ? ` (Trailing ${Number(m.pe_ratio).toFixed(1)}x)` : ""
+        }`
+      : `Trailing P/E: ${m.pe_ratio > 0 && m.pe_ratio < 99 ? `${Number(m.pe_ratio).toFixed(1)}x` : "N/M"}`;
+  strip.appendChild(
+    buildStreetMetricBox("Forward Consensus Growth", fwdGrowthText, fwdPeSub, fwdCls)
+  );
+
+  // Metric 4: Long-Only Institutional Ownership
+  const instHeld = Number(st.inst_held_pct || m.inst_pct || 0);
+  const promPct = Number(m.promoter_pct || 0);
+  const holders = Array.isArray(st.top_holders)
+    ? st.top_holders
+        .map((h) => (typeof h === "string" ? h : (h && (h.name || h.organization)) || ""))
+        .filter(Boolean)
+    : [];
+  const ownPrimary = us
+    ? `${instHeld.toFixed(1)}% Institutional Held`
+    : promPct > 0
+    ? `${instHeld.toFixed(1)}% FII/DII • ${promPct.toFixed(1)}% Promoter`
+    : `${instHeld.toFixed(1)}% Institutional Held`;
+  const ownSub =
+    holders.length > 0
+      ? holders.slice(0, 3).join(", ")
+      : us
+      ? "Verified long-only 13F asset managers"
+      : "Promoter + FII/DII long-term core";
+  strip.appendChild(
+    buildStreetMetricBox("Long-Only Institutional Ownership", ownPrimary, ownSub, "text-cyan")
+  );
+
+  card.appendChild(strip);
+
+  // Subtle Market-Maker Exclusion Footnote
+  card.appendChild(
+    el(
+      "div",
+      "street-footnote",
+      "Options market-maker 13F noise (e.g. Jane Street/Citadel hedges) excluded."
+    )
+  );
+
+  // 4. Recent Tier-1 Bank Rating Actions
+  const actions = Array.isArray(st.recent_bank_actions) ? st.recent_bank_actions : [];
+  if (actions.length > 0) {
+    const actWrap = el("div", "street-actions-wrap");
+    actWrap.appendChild(
+      el("div", "street-actions-title", "Recent Tier-1 Bank & Institutional Rating Actions")
+    );
+    const actList = el("div", "bank-actions-list");
+    for (const item of actions.slice(0, 5)) {
+      const pill = el("div", "bank-action-pill");
+      pill.appendChild(el("span", "bank-firm", item.firm || "Institutional Desk"));
+
+      const toG = String(item.to_grade || "").trim();
+      const fromG = String(item.from_grade || "").trim();
+      const gradeLabel =
+        fromG && toG && fromG !== toG ? `${fromG} → ${toG}` : toG || fromG || "Rated";
+      pill.appendChild(el("span", "bank-grade", gradeLabel));
+
+      const normAct = normalizeBankAction(item.action);
+      pill.appendChild(el("span", `bank-action-tag ${normAct.cls}`, normAct.label));
+
+      if (item.date) {
+        pill.appendChild(el("span", "bank-date", String(item.date)));
+      }
+      actList.appendChild(pill);
+    }
+    actWrap.appendChild(actList);
+    card.appendChild(actWrap);
+  }
+
+  return card;
+}
+
 function renderCompanyDetail(detail) {
   const container = document.getElementById("company-detail-content");
   container.replaceChildren();
@@ -1190,8 +1522,11 @@ function renderCompanyDetail(detail) {
   const mergedMarketObj = {
     market: sc.market || comp.market || "IN",
     currency: sc.currency || comp.currency || "INR",
+    index_tag: sc.index_tag || comp.index_tag || "",
+    market_label: sc.market_label || comp.market_label || "",
   };
   const us = isUSStock(mergedMarketObj);
+  const idxTag = resolveIndexTag(mergedMarketObj);
   const ccy = stockCurrency(mergedMarketObj);
   const m = sc.metrics || {};
   const bd = resolveScoreBreakdown(sc);
@@ -1259,7 +1594,7 @@ function renderCompanyDetail(detail) {
       "text-pos",
     ],
     [
-      "2. 5Y Compounding + Latest 2Q Growth",
+      "2. 5Y Compounding + 2Q + Street Growth",
       sc.pillars.growth,
       bd.weights_pct.growth,
       bd.contributions.growth,
@@ -1273,7 +1608,7 @@ function renderCompanyDetail(detail) {
       "text-cyan",
     ],
     [
-      "4. Piotroski 9-Point & Smart Money",
+      "4. Piotroski, EPS Revisions & Smart Money",
       sc.pillars.momentum,
       bd.weights_pct.momentum,
       bd.contributions.momentum,
@@ -1384,6 +1719,11 @@ function renderCompanyDetail(detail) {
   flagBox.appendChild(flagList);
   thesisGrid.appendChild(flagBox);
   container.appendChild(thesisGrid);
+
+  // c2) Street & Institutional Consensus Panel (rendered whenever analyst coverage exists)
+  if (sc.street && sc.street.has_coverage && Number(sc.street.analyst_count || 0) > 0) {
+    container.appendChild(buildStreetConsensusCard(sc, mergedMarketObj, ccy));
+  }
 
   // d) 4-Pillar Evidence Breakdown (2x2 Grid)
   const evGrid = el("div", "dd-two-col");
@@ -1530,10 +1870,10 @@ function renderCompanyDetail(detail) {
   gCard.appendChild(gMetrics);
   evGrid.appendChild(gCard);
 
-  // Card 4: Piotroski & Smart Money
+  // Card 4: Piotroski, Street Revisions & Smart Money
   const mCard = el("div", "evidence-card");
   const mHead = el("div", "ev-header");
-  mHead.appendChild(el("span", "ev-title", "Piotroski 9-Point & Smart Money"));
+  mHead.appendChild(el("span", "ev-title", "Piotroski, Revisions & Smart Money"));
   mHead.appendChild(el("span", "ev-score text-warn", `${sc.pillars.momentum.toFixed(1)} / 100`));
   mCard.appendChild(mHead);
   mCard.appendChild(createProgressSvg(sc.pillars.momentum, "#f59e0b"));
@@ -1546,6 +1886,22 @@ function renderCompanyDetail(detail) {
       m.piotroski_f_score >= 7 ? "text-pos" : m.piotroski_f_score <= 4 ? "text-neg" : ""
     )
   );
+  if (
+    sc.street &&
+    sc.street.has_coverage &&
+    bd.sub_scores &&
+    bd.sub_scores.eps_revision_momentum !== undefined
+  ) {
+    const revSubScore = Number(bd.sub_scores.eps_revision_momentum || 50);
+    mMetrics.appendChild(
+      buildEvidenceMetricRow(
+        "Street EPS Revision Sub-Score",
+        "30d/90d sell-side upgrade breadth",
+        `${revSubScore.toFixed(0)} / 100 (${Math.round(Number(sc.street.consensus_buy_pct || 0))}% Buy)`,
+        revSubScore >= 60 ? "text-pos" : revSubScore <= 35 ? "text-neg" : "text-cyan"
+      )
+    );
+  }
   const ownVal = us
     ? `Inst ${m.inst_pct}%${m.promoter_pct > 0 ? ` • Insider ${m.promoter_pct}%` : ""}`
     : `Prom ${m.promoter_pct}% • Inst ${m.inst_pct}% (4Q Δ ${fmtSigned(m.inst_chg_1y_pct)}%)`;
@@ -1578,12 +1934,21 @@ function renderCompanyDetail(detail) {
 
   // e1) 5-Year Price Chart
   const chartCard = el("div", "dd-section-card");
+  const idxChartLabel =
+    idxTag === "NASDAQ100"
+      ? "NASDAQ 100 · USD $"
+      : idxTag === "SP500"
+      ? "S&P 500 · USD $"
+      : "NIFTY 200 · INR ₹";
+  const lineHex = idxTag === "SP500" ? "#a78bfa" : idxTag === "NASDAQ100" ? "#38bdf8" : "#10b981";
+  const fillRgba =
+    idxTag === "SP500"
+      ? "rgba(167, 139, 250, 0.14)"
+      : idxTag === "NASDAQ100"
+      ? "rgba(56, 189, 248, 0.14)"
+      : "rgba(16, 185, 129, 0.12)";
   chartCard.appendChild(
-    el(
-      "div",
-      "dd-section-title",
-      `5-Year Historical Price Trajectory (${us ? "NASDAQ · USD $" : "NSE · INR ₹"})`
-    )
+    el("div", "dd-section-title", `5-Year Historical Price Trajectory (${idxChartLabel})`)
   );
   chartCard.appendChild(
     el("div", "dd-section-sub", "Daily adjusted close history used for point-in-time valuation & momentum")
@@ -1599,8 +1964,8 @@ function renderCompanyDetail(detail) {
       {
         name: sc.ticker,
         values: ph.map((p) => p.close_price),
-        color: us ? "#818cf8" : "#38bdf8",
-        areaFill: us ? "rgba(129, 140, 248, 0.14)" : "rgba(56, 189, 248, 0.12)",
+        color: lineHex,
+        areaFill: fillRgba,
       },
     ],
     ph.map((p) => p.trade_date),
@@ -1838,7 +2203,7 @@ async function handleCsvUpload() {
 
 async function runPlanner() {
   const btn = document.getElementById("run-planner-btn");
-  const isUsdMode = state.plannerMarket === "US";
+  const isUsdMode = isUsdMarketMode(state.plannerMarket);
   btn.textContent = "Building Blueprint...";
   btn.disabled = true;
 
@@ -1871,23 +2236,32 @@ async function runPlanner() {
   } catch (err) {
     showToast(err.message, true);
   } finally {
-    btn.textContent = state.plannerMarket === "US" ? "Build $ Blueprint" : "Build ₹ Blueprint";
+    btn.textContent = isUsdMarketMode(state.plannerMarket)
+      ? "Build $ Blueprint"
+      : "Build ₹ Blueprint";
     btn.disabled = false;
   }
 }
 
 function renderPlannerResults(plan) {
-  const planCcy = plan.plan_currency || (state.plannerMarket === "US" ? "USD" : "INR");
+  const planCcy =
+    plan.plan_currency || (isUsdMarketMode(state.plannerMarket) ? "USD" : "INR");
   const g = plan.goal_summary || {};
   const d = plan.deployment_summary || {};
   const kpis = document.getElementById("pl-kpis");
   kpis.replaceChildren();
 
   const basketTitle = document.getElementById("pl-basket-title");
-  if (state.plannerMarket === "US") {
-    basketTitle.textContent = "Recommended US Nasdaq-100 Buy Basket — Where to Invest & Why";
+  if (state.plannerMarket === "NASDAQ100") {
+    basketTitle.textContent = "Recommended US · Nasdaq 100 Buy Basket — Where to Invest & Why";
+  } else if (state.plannerMarket === "SP500") {
+    basketTitle.textContent =
+      "Recommended US · S&P 500 (Non-Nasdaq) Buy Basket — Where to Invest & Why";
+  } else if (state.plannerMarket === "US") {
+    basketTitle.textContent =
+      "Recommended All-US (Nasdaq 100 + S&P 500) Buy Basket — Where to Invest & Why";
   } else if (state.plannerMarket === "IN") {
-    basketTitle.textContent = "Recommended Indian NSE Buy Basket — Where to Invest & Why";
+    basketTitle.textContent = "Recommended India · Nifty 200 Buy Basket — Where to Invest & Why";
   } else {
     basketTitle.textContent = "Recommended Global Compounder Basket — Where to Invest & Why";
   }
@@ -2097,7 +2471,7 @@ async function runBacktest() {
   btn.disabled = true;
 
   try {
-    const isUsBt = state.backtestMarket === "US";
+    const isUsBt = isUsdMarketMode(state.backtestMarket);
     const payload = {
       market: state.backtestMarket,
       preset: document.getElementById("bt-preset").value,
@@ -2127,10 +2501,20 @@ async function runBacktest() {
 
 function renderBacktestResults(res) {
   const s = res.summary || {};
-  const btCcy = s.currency || (state.backtestMarket === "US" ? "USD" : "INR");
-  const bmName =
-    s.benchmark_name || (btCcy === "USD" ? "Nasdaq 100 (^NDX)" : "Nifty 50 (^NSEI)");
-  const bmShort = bmName.includes("Nasdaq") ? "Nasdaq 100" : "Nifty 50";
+  const isUsBt = isUsdMarketMode(state.backtestMarket);
+  const btCcy = s.currency || (isUsBt ? "USD" : "INR");
+  const defaultBm =
+    state.backtestMarket === "NASDAQ100"
+      ? "Nasdaq 100 (^NDX)"
+      : isUsBt
+      ? "S&P 500 (^GSPC)"
+      : "Nifty 50 (^NSEI)";
+  const bmName = s.benchmark_name || defaultBm;
+  const bmShort = bmName.includes("S&P")
+    ? "S&P 500"
+    : bmName.includes("Nasdaq")
+    ? "Nasdaq 100"
+    : "Nifty 50";
   const initLabel = btCcy === "USD" ? "$10,000" : "₹5,00,000";
 
   document.getElementById("bt-equity-title").textContent =
@@ -2142,19 +2526,30 @@ function renderBacktestResults(res) {
 
   document.getElementById("bt-guardrail-note").textContent =
     btCcy === "USD"
-      ? `Bias Guardrails Active: 60-day SEC 10-K/10-Q point-in-time reporting lag enforced • 25 bps US execution slippage/friction per turnover • ${
+      ? `Bias Guardrails Active: 60-day SEC 10-K/10-Q point-in-time reporting lag enforced • Point-in-time Street signals guard active • 25 bps US execution slippage/friction • ${
           s.risk_free_rate_pct || 4.3
         }% US 10Y Treasury Sharpe risk-free rate.`
-      : `Bias Guardrails Active: 60-day SEBI LODR reporting lag enforced on annual statements • 25 bps delivery friction/slippage per turnover • ${
+      : `Bias Guardrails Active: 60-day SEBI LODR reporting lag enforced on annual statements • Point-in-time Street signals guard active • 25 bps delivery friction/slippage • ${
           s.risk_free_rate_pct || 6.8
         }% India 10Y G-Sec Sharpe risk-free rate.`;
 
   const kpis = document.getElementById("bt-kpis");
   kpis.replaceChildren();
 
+  const btScopeLabel =
+    state.backtestMarket === "NASDAQ100"
+      ? "Nasdaq 100"
+      : state.backtestMarket === "SP500"
+      ? "S&P 500"
+      : state.backtestMarket === "US"
+      ? "All US"
+      : state.backtestMarket === "IN"
+      ? "Nifty 200"
+      : "Global";
+
   kpis.appendChild(
     buildKpiCard(
-      `Strategy CAGR (${state.backtestMarket === "US" ? "Nasdaq-100" : state.backtestMarket === "IN" ? "NSE" : "Global"})`,
+      `Strategy CAGR (${btScopeLabel})`,
       `${s.portfolio_cagr_pct}%`,
       `vs ${bmShort}: ${s.benchmark_cagr_pct}% (${s.start_date} → ${s.end_date})`,
       s.portfolio_cagr_pct >= s.benchmark_cagr_pct ? "text-pos" : "text-warn"

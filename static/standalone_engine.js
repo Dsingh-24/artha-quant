@@ -7,12 +7,28 @@
 
 const BENCHMARK_TICKER = "^NSEI";
 const NASDAQ_BENCHMARK_TICKER = "^NDX";
+const SP500_BENCHMARK_TICKER = "^GSPC";
 const INDIA_RISK_FREE_RATE = 0.068;
 const US_RISK_FREE_RATE = 0.043;
 const USD_INR_RATE = 84.5;
+const ALLOWED_MARKETS = new Set(["ALL", "IN", "US", "NASDAQ100", "SP500"]);
+
+const MARKET_MAKER_NOISE = [
+  "jane street",
+  "citadel",
+  "susquehanna",
+  "simplex",
+  "wolverine",
+  "group one",
+  "imc",
+  "optiver",
+  "two sigma",
+  "millennium",
+];
 
 export const PRESET_WEIGHTS = {
   qglp_compounder: { quality: 45.0, value: 20.0, growth: 25.0, momentum: 10.0 },
+  street_quant: { quality: 35.0, value: 20.0, growth: 25.0, momentum: 20.0 },
   artha_blend: { quality: 35.0, value: 25.0, growth: 20.0, momentum: 20.0 },
   coffee_can: { quality: 55.0, value: 10.0, growth: 30.0, momentum: 5.0 },
   magic_formula: { quality: 45.0, value: 45.0, growth: 5.0, momentum: 5.0 },
@@ -109,15 +125,192 @@ const US_RISK_PROFILES = {
   },
 };
 
+function resolveMarketAndIndexTag(item) {
+  const rawTag = String((item && item.index_tag) || "")
+    .trim()
+    .toUpperCase();
+  let marketCode;
+  let indexTag;
+  if ((item && item.market === "US") || rawTag === "NASDAQ100" || rawTag === "SP500") {
+    marketCode = "US";
+    indexTag = rawTag === "SP500" ? "SP500" : "NASDAQ100";
+  } else {
+    marketCode = "IN";
+    indexTag = "NIFTY200";
+  }
+  let marketLabel;
+  if (indexTag === "NASDAQ100") {
+    marketLabel = "US Stock · NASDAQ 100";
+  } else if (indexTag === "SP500") {
+    marketLabel = "US Stock · S&P 500";
+  } else {
+    marketLabel = "Indian Stock · NIFTY 200";
+  }
+  const currency = marketCode === "US" ? "USD" : "INR";
+  return { marketCode, indexTag, marketLabel, currency };
+}
+
+function matchesMarketFilter(marketCode, indexTag, filterVal) {
+  if (filterVal === "IN") return marketCode === "IN";
+  if (filterVal === "US") return marketCode === "US";
+  if (filterVal === "NASDAQ100") return indexTag === "NASDAQ100";
+  if (filterVal === "SP500") return indexTag === "SP500";
+  return true;
+}
+
+function safeFloat(val, fallback = 0.0) {
+  if (val === null || val === undefined || val === "") return fallback;
+  const n = Number(val);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function safeInt(val, fallback = 0) {
+  if (val === null || val === undefined || val === "") return fallback;
+  const n = Number(val);
+  return Number.isFinite(n) ? Math.round(n) : fallback;
+}
+
+function jsRoundInt(val) {
+  const r = Math.floor(val + 0.5);
+  return r === 0 ? 0 : r;
+}
+
+function buildStreetPayload(ssig, streetAvail, curPrice) {
+  if (!streetAvail || !ssig) {
+    return {
+      has_coverage: false,
+      analyst_count: 0,
+      strong_buy: 0,
+      buy: 0,
+      hold: 0,
+      sell: 0,
+      strong_sell: 0,
+      consensus_buy_pct: 0.0,
+      recommendation_key: "",
+      target_mean: 0.0,
+      target_high: 0.0,
+      target_low: 0.0,
+      target_upside_pct: 0.0,
+      forward_pe: 0.0,
+      fwd_eps_growth_fy1_pct: 0.0,
+      fwd_eps_growth_fy2_pct: 0.0,
+      eps_rev_up_30d: 0,
+      eps_rev_down_30d: 0,
+      eps_rev_up_90d: 0,
+      eps_rev_down_90d: 0,
+      rev_breadth_pct: 0.0,
+      inst_held_pct: 0.0,
+      recent_bank_actions: [],
+      top_holders: [],
+    };
+  }
+
+  const analystCount = Math.max(0, safeInt(ssig.analyst_count, 0));
+  const hasCoverage = analystCount > 0;
+  const strongBuy = Math.max(0, safeInt(ssig.strong_buy ?? ssig.strong_buy_count, 0));
+  const buy = Math.max(0, safeInt(ssig.buy ?? ssig.buy_count, 0));
+  const hold = Math.max(0, safeInt(ssig.hold ?? ssig.hold_count, 0));
+  const sell = Math.max(0, safeInt(ssig.sell ?? ssig.sell_count, 0));
+  const strongSell = Math.max(0, safeInt(ssig.strong_sell ?? ssig.strong_sell_count, 0));
+
+  const targetMean = roundTo(safeFloat(ssig.target_mean ?? ssig.target_mean_price, 0.0), 2);
+  const targetHigh = roundTo(safeFloat(ssig.target_high ?? ssig.target_high_price, 0.0), 2);
+  const targetLow = roundTo(safeFloat(ssig.target_low ?? ssig.target_low_price, 0.0), 2);
+  const targetUpsidePct =
+    hasCoverage && targetMean > 0.0 && curPrice > 0.0
+      ? roundTo((targetMean / curPrice - 1.0) * 100.0, 1)
+      : 0.0;
+
+  let rawActions = ssig.recent_bank_actions;
+  if (rawActions === undefined && ssig.recent_bank_actions_json) {
+    try {
+      rawActions = JSON.parse(String(ssig.recent_bank_actions_json));
+    } catch (_err) {
+      rawActions = [];
+    }
+  }
+  const actionsOut = [];
+  if (Array.isArray(rawActions)) {
+    for (const act of rawActions.slice(0, 5)) {
+      if (act && typeof act === "object") {
+        actionsOut.push({
+          firm: String(act.firm || ""),
+          to_grade: String(act.to_grade || act.toGrade || ""),
+          from_grade: String(act.from_grade || act.fromGrade || ""),
+          action: String(act.action || ""),
+          date: String(act.date || ""),
+        });
+      }
+    }
+  }
+
+  let rawHolders = ssig.top_holders;
+  if (rawHolders === undefined && ssig.top_holders_json) {
+    try {
+      rawHolders = JSON.parse(String(ssig.top_holders_json));
+    } catch (_err) {
+      rawHolders = [];
+    }
+  }
+  const holdersOut = [];
+  if (Array.isArray(rawHolders)) {
+    for (const h of rawHolders) {
+      const hName =
+        h && typeof h === "object"
+          ? String(h.organization || h.name || "").trim()
+          : String(h || "").trim();
+      if (!hName) continue;
+      const hLow = hName.toLowerCase();
+      if (MARKET_MAKER_NOISE.some((noise) => hLow.includes(noise))) continue;
+      holdersOut.push(hName);
+      if (holdersOut.length >= 4) break;
+    }
+  }
+
+  return {
+    has_coverage: hasCoverage,
+    analyst_count: analystCount,
+    strong_buy: strongBuy,
+    buy,
+    hold,
+    sell,
+    strong_sell: strongSell,
+    consensus_buy_pct: roundTo(safeFloat(ssig.consensus_buy_pct, 0.0), 1),
+    recommendation_key: String(ssig.recommendation_key || ""),
+    target_mean: targetMean,
+    target_high: targetHigh,
+    target_low: targetLow,
+    target_upside_pct: targetUpsidePct,
+    forward_pe: roundTo(safeFloat(ssig.forward_pe, 0.0), 1),
+    fwd_eps_growth_fy1_pct: roundTo(safeFloat(ssig.fwd_eps_growth_fy1_pct, 0.0), 1),
+    fwd_eps_growth_fy2_pct: roundTo(safeFloat(ssig.fwd_eps_growth_fy2_pct, 0.0), 1),
+    eps_rev_up_30d: Math.max(0, safeInt(ssig.eps_rev_up_30d, 0)),
+    eps_rev_down_30d: Math.max(0, safeInt(ssig.eps_rev_down_30d, 0)),
+    eps_rev_up_90d: Math.max(0, safeInt(ssig.eps_rev_up_90d, 0)),
+    eps_rev_down_90d: Math.max(0, safeInt(ssig.eps_rev_down_90d, 0)),
+    rev_breadth_pct: roundTo(safeFloat(ssig.rev_breadth_pct, 0.0), 1),
+    inst_held_pct: roundTo(safeFloat(ssig.inst_held_pct, 0.0), 1),
+    recent_bank_actions: actionsOut,
+    top_holders: holdersOut,
+  };
+}
+
 function resolveRiskProfile(riskProfile, market) {
-  if (market === "US") {
-    return US_RISK_PROFILES[riskProfile] || US_RISK_PROFILES.equity_direct;
+  if (market === "US" || market === "NASDAQ100" || market === "SP500") {
+    const baseUs = US_RISK_PROFILES[riskProfile] || US_RISK_PROFILES.equity_direct;
+    if (market === "SP500") {
+      return { ...baseUs, label: baseUs.label.replace("Nasdaq-100", "S&P 500") };
+    }
+    if (market === "US") {
+      return { ...baseUs, label: baseUs.label.replace("Nasdaq-100", "US S&P 500 + Nasdaq-100") };
+    }
+    return baseUs;
   }
   const base = RISK_PROFILES[riskProfile] || RISK_PROFILES.equity_direct;
   if (market === "ALL") {
     return {
       ...base,
-      label: base.label.replace("NSE ", "Global NSE + Nasdaq-100 "),
+      label: base.label.replace("NSE ", "Global NSE + US "),
     };
   }
   return base;
@@ -399,7 +592,8 @@ export function scoreUniversePointInTime(
   preset = "qglp_compounder",
   customWeights = null,
   includeQuarterlySignals = true,
-  companiesOverride = null
+  companiesOverride = null,
+  streetSignalsOverride = null
 ) {
   const weights = resolveWeights(preset, customWeights);
   const idx = snapshot._indexed;
@@ -411,6 +605,7 @@ export function scoreUniversePointInTime(
   if (endIdx < 0) return [];
 
   const qtrMap = includeQuarterlySignals ? snapshot.quarterly_signals || {} : {};
+  const streetMap = streetSignalsOverride || snapshot.street_signals || {};
   const results = [];
   const companiesList = companiesOverride || snapshot.companies || [];
 
@@ -437,14 +632,18 @@ export function scoreUniversePointInTime(
     const latest = fundRecords[fundRecords.length - 1];
     const prev = fundRecords.length >= 2 ? fundRecords[fundRecords.length - 2] : null;
     const isFin = Boolean(comp.is_financial);
-    const marketCode = comp.market === "US" ? "US" : "IN";
-    const marketLabel = marketCode === "US" ? "US Stock" : "Indian Stock";
-    const currency = marketCode === "US" ? "USD" : "INR";
+    const { marketCode, indexTag, marketLabel, currency } = resolveMarketAndIndexTag(comp);
     const promoterPct = Number(comp.promoter_pct || 0.0);
     const instPct = Number(comp.inst_pct || 0.0);
 
     const qsig = qtrMap[tk];
     const useLiveQtr = Boolean(qsig && String(qsig.signals_reported_date || "9999-12-31") <= asOfDate);
+
+    const ssig = streetMap[tk];
+    const streetAvail = Boolean(ssig && String(ssig.signals_as_of_date || "9999-12-31") <= asOfDate);
+    const streetAnalystCnt = streetAvail && ssig ? safeInt(ssig.analyst_count, 0) : 0;
+    const useStreet = Boolean(streetAvail && ssig && streetAnalystCnt >= 3);
+    const fwdG = useStreet && ssig ? clamp(safeFloat(ssig.fwd_eps_growth_fy1_pct, 0.0), -25.0, 45.0) : 0.0;
 
     const sharesCr = Math.max(0.01, Number(latest.shares_cr));
     const marketCapCr = curPrice * sharesCr;
@@ -575,11 +774,14 @@ export function scoreUniversePointInTime(
       0.34 * qReturn + 0.22 * moatStability + 0.16 * qLev + 0.18 * qCash + 0.1 * qMargin
     );
 
-    const effectiveGrowthAnchor = clamp(
+    let effectiveGrowthAnchor = clamp(
       0.7 * normalizedPatCagr + 0.3 * (hasQtrData ? qtrPatYoy : patCagr3y),
       5.0,
       !isCyclicalProfile ? 28.0 : 16.0
     );
+    if (useStreet && fwdG !== 0.0) {
+      effectiveGrowthAnchor = 0.8 * effectiveGrowthAnchor + 0.2 * clamp(fwdG, 5.0, 30.0);
+    }
     const pegRatio = patCr > 0 ? peRatio / effectiveGrowthAnchor : 9.9;
 
     let fairPe;
@@ -634,6 +836,9 @@ export function scoreUniversePointInTime(
     } else {
       growthScore = annualGrowthScore;
     }
+    if (useStreet && fwdG !== 0.0) {
+      growthScore = clamp(0.2 * linearScore(fwdG, -2.0, 24.0) + 0.8 * growthScore);
+    }
 
     const mPiotroski = (fScore / 9.0) * 100.0;
     const smartMoneyChg = promoterChg1y + instChg1y;
@@ -646,8 +851,33 @@ export function scoreUniversePointInTime(
       ? linearScore(promoterPct + instPct, 40.0, 80.0)
       : 60.0;
 
+    const up30 = useStreet && ssig ? safeInt(ssig.eps_rev_up_30d, 0) : 0;
+    const dn30 = useStreet && ssig ? safeInt(ssig.eps_rev_down_30d, 0) : 0;
+    const up90 = useStreet && ssig ? safeInt(ssig.eps_rev_up_90d, 0) : 0;
+    const dn90 = useStreet && ssig ? safeInt(ssig.eps_rev_down_90d, 0) : 0;
+    const use30dRevs = up30 + dn30 >= 3;
+    const totRevs = use30dRevs ? up30 + dn30 : up90 + dn90;
+    const revBreadth = useStreet && ssig ? safeFloat(ssig.rev_breadth_pct, 0.0) : 0.0;
+    const buyPct = useStreet && ssig ? safeFloat(ssig.consensus_buy_pct, 50.0) : 50.0;
+
+    let revisionScore = 50.0;
     let momentumScore;
-    if (preset === "qglp_compounder" || preset === "coffee_can") {
+    if (useStreet) {
+      revisionScore = totRevs >= 3 ? linearScore(revBreadth, -60.0, 70.0) : linearScore(buyPct, 30.0, 85.0);
+      if (preset === "qglp_compounder" || preset === "coffee_can") {
+        const mTrend = above200dma ? 75.0 : 35.0;
+        const mSteady = linearScore(mom12_1Pct, -18.0, 28.0);
+        momentumScore = clamp(
+          0.38 * mPiotroski + 0.25 * ownershipScore + 0.22 * revisionScore + 0.1 * mSteady + 0.05 * mTrend
+        );
+      } else {
+        const m121 = linearScore(mom12_1Pct, -12.0, 38.0);
+        const mRiskAdj = linearScore(riskAdjMom, -0.4, 1.5);
+        momentumScore = clamp(
+          0.3 * m121 + 0.2 * mRiskAdj + 0.2 * mPiotroski + 0.15 * ownershipScore + 0.15 * revisionScore
+        );
+      }
+    } else if (preset === "qglp_compounder" || preset === "coffee_can") {
       const mTrend = above200dma ? 75.0 : 35.0;
       const mSteady = linearScore(mom12_1Pct, -18.0, 28.0);
       momentumScore = clamp(0.45 * mPiotroski + 0.3 * ownershipScore + 0.15 * mSteady + 0.1 * mTrend);
@@ -674,6 +904,15 @@ export function scoreUniversePointInTime(
     }
     if (profitableYrs < Math.max(1, window5y.length - 1)) {
       addFlag(`Inconsistent profitability (${profitableYrs}/${window5y.length} profitable years)`, 10.0);
+    }
+    if (useStreet && streetAnalystCnt >= 5 && totRevs >= 5 && revBreadth <= -55.0) {
+      const actUp = use30dRevs ? up30 : up90;
+      const actDn = use30dRevs ? dn30 : dn90;
+      const actWin = use30dRevs ? "30d" : "90d";
+      addFlag(
+        `Widespread sell-side EPS cuts (${actDn} down vs ${actUp} up over ${actWin}, ${jsRoundInt(revBreadth)}% breadth)`,
+        6.0
+      );
     }
     if (equityCr <= 0) {
       addFlag("Negative net worth / eroded book equity", 15.0);
@@ -716,7 +955,7 @@ export function scoreUniversePointInTime(
     }
     if ((peRatio > 56.0 && pegRatio > 2.1) || (isCyclicalProfile && peRatio > fairPe * 1.75)) {
       addFlag(
-        `Valuation rich at ${peRatio.toFixed(1)}x P/E (Fair ~${fairPe}x, PEG ${pegRatio.toFixed(1)}x) — wait for pullback`,
+        `Valuation rich at ${peRatio.toFixed(1)}x P/E (Fair ~${fairPe.toFixed(1)}x, PEG ${pegRatio.toFixed(1)}x) — wait for pullback`,
         8.0
       );
       valuationCapped = true;
@@ -741,6 +980,14 @@ export function scoreUniversePointInTime(
         `Healthy latest 2Q trajectory (+${qtrPatYoy.toFixed(1)}% YoY PAT, +${qtrRevYoy.toFixed(1)}% YoY Sales through ${latestQtrLabel})`
       );
     }
+    if (useStreet && totRevs >= 5 && revBreadth >= 55.0) {
+      const actUp = use30dRevs ? up30 : up90;
+      const actDn = use30dRevs ? dn30 : dn90;
+      const actWin = use30dRevs ? "30d" : "90d";
+      strengths.push(
+        `Strong Street EPS upgrade momentum (${actUp} up vs ${actDn} down over ${actWin}, +${jsRoundInt(revBreadth)}% breadth)`
+      );
+    }
     if (!isFin && cumCfoEbitda5y >= 82.0) {
       strengths.push(`Clean 5Y cash-flow conversion (${Math.round(cumCfoEbitda5y)}% cumulative CFO/EBITDA)`);
     }
@@ -749,7 +996,7 @@ export function scoreUniversePointInTime(
     }
     if (patCr > 0 && peRatio <= fairPe * 1.1) {
       strengths.push(
-        `Reasonable GARP entry price (${peRatio.toFixed(1)}x P/E vs Fair ~${fairPe}x, PEG ${pegRatio.toFixed(2)}x)`
+        `Reasonable GARP entry price (${peRatio.toFixed(1)}x P/E vs Fair ~${fairPe.toFixed(1)}x, PEG ${pegRatio.toFixed(2)}x)`
       );
     }
     if (hasShTrend && instChg1y >= 1.0 && promoterChg1y >= -0.4) {
@@ -768,11 +1015,13 @@ export function scoreUniversePointInTime(
       }
     }
     if (strengths.length === 0) {
-      strengths.push(
-        marketCode === "US"
-          ? "Established Nasdaq-100 operating franchise"
-          : "Established NSE Nifty-200 operating franchise"
-      );
+      if (indexTag === "SP500") {
+        strengths.push("Established S&P 500 operating franchise");
+      } else if (indexTag === "NASDAQ100") {
+        strengths.push("Established Nasdaq-100 operating franchise");
+      } else {
+        strengths.push("Established NSE Nifty-200 operating franchise");
+      }
     }
 
     const rawComposite =
@@ -788,27 +1037,27 @@ export function scoreUniversePointInTime(
     if (valuationCapped && compositeScore >= 45.0 && patCr > 0) {
       rating = "Hold";
       conviction = "Great Business, Rich Price — Buy on Dip";
-      ratingRule = `Score ${compositeScore}/100 passes quality threshold, but Valuation Guardrail fired (P/E ${peRatio.toFixed(1)}x vs Fair ~${fairPe}x) → Capped at Hold until pullback.`;
+      ratingRule = `Score ${compositeScore.toFixed(1)}/100 passes quality threshold, but Valuation Guardrail fired (P/E ${peRatio.toFixed(1)}x vs Fair ~${fairPe.toFixed(1)}x) → Capped at Hold until pullback.`;
     } else if (compositeScore >= 68.0 && redFlags.length === 0) {
       rating = "Strong Buy";
       conviction = "Core Long-Term Compounder";
-      ratingRule = `Composite Score ${compositeScore}/100 ≥ 68.0 with 0 forensic or valuation red flags → Strong Buy.`;
+      ratingRule = `Composite Score ${compositeScore.toFixed(1)}/100 ≥ 68.0 with 0 forensic or valuation red flags → Strong Buy.`;
     } else if (compositeScore >= 57.0 && patCr > 0 && profitableYrs >= window5y.length - 1) {
       rating = "Buy";
       conviction = "Accumulate for 3-5Y+";
       ratingRule =
-        `Composite Score ${compositeScore}/100 ≥ 57.0 with ${profitableYrs}/${window5y.length} profitable years ` +
+        `Composite Score ${compositeScore.toFixed(1)}/100 ≥ 57.0 with ${profitableYrs}/${window5y.length} profitable years ` +
         (redFlags.length > 0 && compositeScore >= 68.0
           ? "(prevented from Strong Buy due to guardrail flag)"
           : "→ Buy.");
     } else if (compositeScore >= 45.0 && patCr > 0) {
       rating = "Hold";
       conviction = "Watchlist / Hold Existing";
-      ratingRule = `Composite Score ${compositeScore}/100 is in the 45–57 neutral zone (or profit consistency < 4/5 yrs) → Hold.`;
+      ratingRule = `Composite Score ${compositeScore.toFixed(1)}/100 is in the 45–57 neutral zone (or profit consistency < 4/5 yrs) → Hold.`;
     } else {
       rating = "Avoid";
       conviction = "Fundamental / Balance-Sheet Caution";
-      ratingRule = `Composite Score ${compositeScore}/100 < 45.0 or negative TTM/FY profit → Avoid.`;
+      ratingRule = `Composite Score ${compositeScore.toFixed(1)}/100 < 45.0 or negative TTM/FY profit → Avoid.`;
     }
 
     const scoreBreakdown = {
@@ -843,6 +1092,7 @@ export function scoreUniversePointInTime(
         quarterly_momentum: Math.round(qtrGrowthScore),
         piotroski_health: Math.round(mPiotroski),
         ownership_conviction: Math.round(ownershipScore),
+        eps_revision_momentum: Math.round(revisionScore),
       },
     };
 
@@ -852,6 +1102,7 @@ export function scoreUniversePointInTime(
       name: comp.name,
       sector: comp.sector,
       market: marketCode,
+      index_tag: indexTag,
       market_label: marketLabel,
       currency,
       cap_tier: comp.cap_tier || "Large Cap",
@@ -910,8 +1161,9 @@ export function scoreUniversePointInTime(
         inst_pct: roundTo(instPct, 1),
         latest_fy: Number(latest.fiscal_year),
       },
-      strengths: strengths.slice(0, 4),
-      red_flags: redFlags.slice(0, 4),
+      street: buildStreetPayload(ssig, streetAvail, curPrice),
+      strengths: strengths.slice(0, 5),
+      red_flags: redFlags.slice(0, 5),
       piotroski_checks: fChecks,
       score_breakdown: scoreBreakdown,
     });
@@ -931,33 +1183,45 @@ export async function runScreenerSnapshot(payload) {
   const preset = payload.preset || "qglp_compounder";
   const sector = payload.sector || "ALL";
   const minScore = Number(payload.min_score || 0);
-  const market = payload.market === "IN" || payload.market === "US" ? payload.market : "ALL";
+  const market = ALLOWED_MARKETS.has(payload.market) ? payload.market : "ALL";
 
   const allScored = scoreUniversePointInTime(snapshot, asOf, preset, payload.weights || null, true);
-  const countIn = allScored.filter((s) => (s.market || "IN") === "IN").length;
+  const countIn = allScored.filter((s) => s.market === "IN").length;
   const countUs = allScored.filter((s) => s.market === "US").length;
-  const marketCounts = { ALL: allScored.length, IN: countIn, US: countUs };
+  const countNdx = allScored.filter((s) => s.index_tag === "NASDAQ100").length;
+  const countSp500 = allScored.filter((s) => s.index_tag === "SP500").length;
+  const marketCounts = {
+    ALL: allScored.length,
+    IN: countIn,
+    US: countUs,
+    NASDAQ100: countNdx,
+    SP500: countSp500,
+  };
 
   const normStage1 = (snapshot.stage1_funnel || []).map((r) => {
-    const rMkt = r.market === "US" ? "US" : "IN";
+    const { marketCode, indexTag, marketLabel, currency } = resolveMarketAndIndexTag(r);
     return {
       ...r,
-      market: rMkt,
-      market_label: rMkt === "US" ? "US Stock" : "Indian Stock",
-      currency: r.currency || (rMkt === "US" ? "USD" : "INR"),
+      market: marketCode,
+      index_tag: indexTag,
+      market_label: marketLabel,
+      currency,
     };
   });
 
   let scored;
   let stage1View;
   let companiesView;
-  if (market === "IN" || market === "US") {
-    scored = allScored.filter((s) => (s.market || "IN") === market);
+  if (market !== "ALL") {
+    scored = allScored.filter((s) => matchesMarketFilter(s.market, s.index_tag, market));
     scored.forEach((item, idx) => {
       item.rank = idx + 1;
     });
-    stage1View = normStage1.filter((r) => r.market === market);
-    companiesView = (snapshot.companies || []).filter((c) => (c.market || "IN") === market);
+    stage1View = normStage1.filter((r) => matchesMarketFilter(r.market, r.index_tag, market));
+    companiesView = (snapshot.companies || []).filter((c) => {
+      const { marketCode, indexTag } = resolveMarketAndIndexTag(c);
+      return matchesMarketFilter(marketCode, indexTag, market);
+    });
   } else {
     scored = allScored;
     stage1View = normStage1;
@@ -976,6 +1240,7 @@ export async function runScreenerSnapshot(payload) {
   }
 
   const bmNifty = latestValidPrice(snapshot.prices[BENCHMARK_TICKER]);
+  const bmSp500 = latestValidPrice(snapshot.prices[SP500_BENCHMARK_TICKER]);
   const bmNasdaq = latestValidPrice(snapshot.prices[NASDAQ_BENCHMARK_TICKER]);
   const unscoredRemaining = stage1View.filter((r) => !r.deep_scored).length;
 
@@ -984,6 +1249,7 @@ export async function runScreenerSnapshot(payload) {
     market,
     market_counts: marketCounts,
     benchmark_nifty50: roundTo(bmNifty, 2),
+    benchmark_sp500: roundTo(bmSp500, 2),
     benchmark_nasdaq100: roundTo(bmNasdaq, 2),
     preset_weights: PRESET_WEIGHTS,
     sectors,
@@ -1011,12 +1277,18 @@ export async function getCompanyDetailSnapshot(ticker, preset = "qglp_compounder
   if (!comp) {
     throw new Error(`Company ${cleaned} not found in snapshot.`);
   }
-  const cMkt = comp.market === "US" ? "US" : "IN";
+  const {
+    marketCode: cMkt,
+    indexTag: cIdxTag,
+    marketLabel: cLabel,
+    currency: cCcy,
+  } = resolveMarketAndIndexTag(comp);
   const compOut = {
     ...comp,
     market: cMkt,
-    market_label: cMkt === "US" ? "US Stock" : "Indian Stock",
-    currency: comp.currency || (cMkt === "US" ? "USD" : "INR"),
+    index_tag: cIdxTag,
+    market_label: cLabel,
+    currency: cCcy,
   };
 
   const dates = snapshot.price_dates || [];
@@ -1077,26 +1349,34 @@ export async function runBacktestSnapshot(payload) {
     throw new Error("Insufficient price history in snapshot for backtesting.");
   }
 
-  const effMarket =
-    payload.market === "ALL" || payload.market === "IN" || payload.market === "US" ? payload.market : "IN";
+  const effMarket = ALLOWED_MARKETS.has(payload.market) ? payload.market : "IN";
   const allCompanies = snapshot.companies || [];
   const evalCompanies =
-    effMarket === "IN" || effMarket === "US"
-      ? allCompanies.filter((c) => (c.market || "IN") === effMarket)
+    effMarket !== "ALL"
+      ? allCompanies.filter((c) => {
+          const { marketCode, indexTag } = resolveMarketAndIndexTag(c);
+          return matchesMarketFilter(marketCode, indexTag, effMarket);
+        })
       : allCompanies;
   if (evalCompanies.length === 0) {
     throw new Error(`No companies available in snapshot for market '${effMarket}'.`);
   }
 
   const hasNdx = countNonNullPrices(snapshot.prices[NASDAQ_BENCHMARK_TICKER]) >= 60;
+  const hasGspc = countNonNullPrices(snapshot.prices[SP500_BENCHMARK_TICKER]) >= 60;
   let bmTicker;
   let riskFreeRate;
   let benchmarkName;
   let currency;
-  if (effMarket === "US" && hasNdx) {
-    bmTicker = NASDAQ_BENCHMARK_TICKER;
+  if (effMarket === "NASDAQ100" && (hasNdx || hasGspc)) {
+    bmTicker = hasNdx ? NASDAQ_BENCHMARK_TICKER : SP500_BENCHMARK_TICKER;
     riskFreeRate = US_RISK_FREE_RATE;
-    benchmarkName = "Nasdaq 100 (^NDX)";
+    benchmarkName = bmTicker === NASDAQ_BENCHMARK_TICKER ? "Nasdaq 100 (^NDX)" : "S&P 500 (^GSPC)";
+    currency = "USD";
+  } else if ((effMarket === "US" || effMarket === "SP500") && (hasGspc || hasNdx)) {
+    bmTicker = hasGspc ? SP500_BENCHMARK_TICKER : NASDAQ_BENCHMARK_TICKER;
+    riskFreeRate = US_RISK_FREE_RATE;
+    benchmarkName = bmTicker === SP500_BENCHMARK_TICKER ? "S&P 500 (^GSPC)" : "Nasdaq 100 (^NDX)";
     currency = "USD";
   } else {
     if (!snapshot.prices[BENCHMARK_TICKER]) {
@@ -1113,7 +1393,8 @@ export async function runBacktestSnapshot(payload) {
   const topN = Number(payload.top_n || 8);
   const rebalance = payload.rebalance || "annual";
   const weighting = payload.weighting || "equal";
-  const initialCapital = Number(payload.initial_capital || (effMarket === "US" ? 10000 : 500000));
+  const isUsMode = effMarket === "US" || effMarket === "NASDAQ100" || effMarket === "SP500";
+  const initialCapital = Number(payload.initial_capital || (isUsMode ? 10000 : 500000));
   const costBps = Number(payload.cost_bps ?? 25);
 
   const s0Bm = Math.max(0, idx.firstValidIdx.get(bmTicker) ?? 0);
@@ -1212,18 +1493,22 @@ export async function runBacktestSnapshot(payload) {
 
     prevWeights = newWeights;
     if (pos === rebalIndices.length - 1) {
-      latestHoldings = selected.map((s) => ({
-        ticker: s.ticker,
-        name: s.name,
-        sector: s.sector,
-        market: s.market || "IN",
-        market_label: s.market_label || (s.market === "US" ? "US Stock" : "Indian Stock"),
-        currency: s.currency || (s.market === "US" ? "USD" : "INR"),
-        price: s.price,
-        weight_pct: roundTo((newWeights[s.ticker] || 0.0) * 100.0, 2),
-        composite_score: s.composite_score,
-        rating: s.rating,
-      }));
+      latestHoldings = selected.map((s) => {
+        const { marketCode, indexTag, marketLabel, currency: sCcy } = resolveMarketAndIndexTag(s);
+        return {
+          ticker: s.ticker,
+          name: s.name,
+          sector: s.sector,
+          market: marketCode,
+          index_tag: indexTag,
+          market_label: marketLabel,
+          currency: sCcy,
+          price: s.price,
+          weight_pct: roundTo((newWeights[s.ticker] || 0.0) * 100.0, 2),
+          composite_score: s.composite_score,
+          rating: s.rating,
+        };
+      });
     }
   }
 
@@ -1362,18 +1647,19 @@ function buildWhyBuyMemo(stock) {
   const stab = Number(m.moat_stability_score ?? 70);
   let capStr;
   if (stock.is_financial) {
-    const npaStr = m.gnpa_pct > 0 ? `, NNPA ${m.nnpa_pct}%` : "";
-    capStr = `5Y Med ROE ${m.med_5y_roce_pct}% (Floor ${m.cycle_floor_roce_pct ?? m.med_5y_roce_pct}%${npaStr})`;
+    const npaStr = m.gnpa_pct > 0 ? `, NNPA ${Number(m.nnpa_pct).toFixed(2)}%` : "";
+    const floorV = Number(m.cycle_floor_roce_pct ?? m.med_5y_roce_pct);
+    capStr = `5Y Med ROE ${Number(m.med_5y_roce_pct).toFixed(1)}% (Floor ${floorV.toFixed(1)}%${npaStr})`;
   } else {
-    capStr = `5Y Med ROCE ${m.med_5y_roce_pct}% (8Y Stab ${stab}/100, D/E ${m.debt_to_equity}x)`;
+    capStr = `5Y Med ROCE ${Number(m.med_5y_roce_pct).toFixed(1)}% (8Y Stab ${stab}/100, D/E ${Number(m.debt_to_equity).toFixed(2)}x)`;
   }
   const qtrStr = m.latest_qtr_label
-    ? `2Q PAT ${m.qtr_pat_yoy_pct >= 0 ? "+" : ""}${m.qtr_pat_yoy_pct.toFixed(1)}% YoY`
-    : `5Y PAT CAGR ${m.pat_cagr_5y_pct}%`;
+    ? `2Q PAT ${m.qtr_pat_yoy_pct >= 0 ? "+" : ""}${Number(m.qtr_pat_yoy_pct).toFixed(1)}% YoY`
+    : `5Y PAT CAGR ${Number(m.pat_cagr_5y_pct).toFixed(1)}%`;
   const instChg = Number(m.inst_chg_1y_pct || 0);
   const ownStr =
     instChg !== 0 ? `4Q Inst ${instChg >= 0 ? "+" : ""}${instChg.toFixed(1)}%` : `Piotroski ${m.piotroski_f_score}/9`;
-  return `${capStr} • ${qtrStr} • P/E ${m.pe_ratio}x (Fair ~${m.fair_pe}x, PEG ${m.peg_ratio}x) • ${ownStr}`;
+  return `${capStr} • ${qtrStr} • P/E ${Number(m.pe_ratio).toFixed(1)}x (Fair ~${Number(m.fair_pe).toFixed(1)}x, PEG ${Number(m.peg_ratio).toFixed(2)}x) • ${ownStr}`;
 }
 
 function createSeededNormal(seed) {
@@ -1408,16 +1694,19 @@ export async function runPlannerSnapshot(payload) {
   const preset = PRESET_WEIGHTS[payload.preset] ? payload.preset : "qglp_compounder";
   const rankedStocks = scoreUniversePointInTime(snapshot, asOf, preset, null, true);
 
-  const effMarket = payload.market === "IN" || payload.market === "US" ? payload.market : "ALL";
-  const planCurrency = effMarket === "US" ? "USD" : "INR";
+  const effMarket = ALLOWED_MARKETS.has(payload.market) ? payload.market : "ALL";
+  const isUsPlan = effMarket === "US" || effMarket === "NASDAQ100" || effMarket === "SP500";
+  const planCurrency = isUsPlan ? "USD" : "INR";
   const poolStocks =
-    effMarket === "IN" || effMarket === "US"
-      ? rankedStocks.filter((s) => (s.market || "IN") === effMarket)
+    effMarket !== "ALL"
+      ? rankedStocks.filter((s) => {
+          const { marketCode, indexTag } = resolveMarketAndIndexTag(s);
+          return matchesMarketFilter(marketCode, indexTag, effMarket);
+        })
       : rankedStocks;
 
   function pxInPlanCcy(stock) {
-    const sMkt = stock.market === "US" ? "US" : "IN";
-    const sCcy = stock.currency || (sMkt === "US" ? "USD" : "INR");
+    const { currency: sCcy } = resolveMarketAndIndexTag(stock);
     const nativePx = Math.max(0.01, Number(stock.price));
     if (planCurrency === "USD") {
       return sCcy === "USD" ? nativePx : nativePx / USD_INR_RATE;
@@ -1428,7 +1717,7 @@ export async function runPlannerSnapshot(payload) {
   const lumpSumInr = Number(payload.lump_sum_inr || 0);
   const monthlySipInr = Number(payload.monthly_sip_inr || 0);
   const horizonYears = Number(payload.horizon_years || 7);
-  const targetCorpusInr = Number(payload.target_corpus_inr || (effMarket === "US" ? 25000 : 1300000));
+  const targetCorpusInr = Number(payload.target_corpus_inr || (isUsPlan ? 25000 : 1300000));
   const riskProfile = payload.risk_profile || "equity_direct";
   const maxStocks = Number(payload.max_stocks || 8);
 
@@ -1512,9 +1801,12 @@ export async function runPlannerSnapshot(payload) {
     const w = weights[idx];
     const targetAlloc = equityLumpInr * w;
     const allocSip = equitySipInr * w;
-    const sMkt = s.market === "US" ? "US" : "IN";
-    const sLabel = s.market_label || (sMkt === "US" ? "US Stock" : "Indian Stock");
-    const sCcy = s.currency || (sMkt === "US" ? "USD" : "INR");
+    const {
+      marketCode: sMkt,
+      indexTag: sIdxTag,
+      marketLabel: sLabel,
+      currency: sCcy,
+    } = resolveMarketAndIndexTag(s);
     const pxPlan = Math.max(0.01, pxInPlanCcy(s));
     const remainingBudget = Math.max(0.0, equityLumpInr - deployedEquityInr);
     let sharesQty = Math.floor(Math.min(targetAlloc * 1.03, remainingBudget) / pxPlan);
@@ -1543,6 +1835,7 @@ export async function runPlannerSnapshot(payload) {
       name: s.name,
       sector: s.sector,
       market: sMkt,
+      index_tag: sIdxTag,
       market_label: sLabel,
       currency: sCcy,
       role: classifyPortfolioRole(s),
@@ -1715,6 +2008,7 @@ export async function importCsvInMemory(csvText) {
         name,
         sector,
         market: "IN",
+        index_tag: "NIFTY200",
         currency: "INR",
         cap_tier: "Custom CSV",
         is_financial: sector.toLowerCase().includes("bank") || sector.toLowerCase().includes("fin"),

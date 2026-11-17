@@ -11,6 +11,7 @@ Designed for long-term Indian equity investors with strict point-in-time (`as_of
 
 from __future__ import annotations
 
+import json
 import math
 import statistics
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,11 +20,205 @@ import pandas as pd
 
 PRESET_WEIGHTS: Dict[str, Dict[str, float]] = {
     "qglp_compounder": {"quality": 45.0, "value": 20.0, "growth": 25.0, "momentum": 10.0},
+    "street_quant": {"quality": 35.0, "value": 20.0, "growth": 25.0, "momentum": 20.0},
     "artha_blend": {"quality": 35.0, "value": 25.0, "growth": 20.0, "momentum": 20.0},
     "coffee_can": {"quality": 55.0, "value": 10.0, "growth": 30.0, "momentum": 5.0},
     "magic_formula": {"quality": 45.0, "value": 45.0, "growth": 5.0, "momentum": 5.0},
     "value_momentum": {"quality": 10.0, "value": 45.0, "growth": 5.0, "momentum": 40.0},
 }
+
+MARKET_MAKER_NOISE = (
+    "jane street",
+    "citadel",
+    "susquehanna",
+    "simplex",
+    "wolverine",
+    "group one",
+    "imc",
+    "optiver",
+    "two sigma",
+    "millennium",
+)
+
+
+def resolve_market_and_index_tag(item: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """Return normalized `(market, index_tag, market_label, currency)` with NASDAQ100 > SP500 > NIFTY200."""
+    raw_tag = str(item.get("index_tag") or "").strip().upper()
+    if item.get("market") == "US" or raw_tag in ("NASDAQ100", "SP500"):
+        market_code = "US"
+        index_tag = "SP500" if raw_tag == "SP500" else "NASDAQ100"
+    else:
+        market_code = "IN"
+        index_tag = "NIFTY200"
+
+    if index_tag == "NASDAQ100":
+        market_label = "US Stock · NASDAQ 100"
+    elif index_tag == "SP500":
+        market_label = "US Stock · S&P 500"
+    else:
+        market_label = "Indian Stock · NIFTY 200"
+
+    currency = "USD" if market_code == "US" else "INR"
+    return market_code, index_tag, market_label, currency
+
+
+def matches_market_filter(market_code: str, index_tag: str, filter_val: str) -> bool:
+    if filter_val == "IN":
+        return market_code == "IN"
+    if filter_val == "US":
+        return market_code == "US"
+    if filter_val == "NASDAQ100":
+        return index_tag == "NASDAQ100"
+    if filter_val == "SP500":
+        return index_tag == "SP500"
+    return True
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    if val is None:
+        return default
+    try:
+        out = float(val)
+        return default if (math.isnan(out) or math.isinf(out)) else out
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(val: Any, default: int = 0) -> int:
+    if val is None:
+        return default
+    try:
+        return int(round(float(val)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _js_round_int(val: float) -> int:
+    return int(math.floor(val + 0.5))
+
+
+def _js_round(val: float, decimals: int = 1) -> float:
+    f = 10.0 ** decimals
+    return math.floor(val * f + 0.5) / f
+
+
+def _build_street_payload(
+    ssig: Optional[Dict[str, Any]],
+    street_avail: bool,
+    cur_price: float,
+) -> Dict[str, Any]:
+    if not street_avail or not ssig:
+        return {
+            "has_coverage": False,
+            "analyst_count": 0,
+            "strong_buy": 0,
+            "buy": 0,
+            "hold": 0,
+            "sell": 0,
+            "strong_sell": 0,
+            "consensus_buy_pct": 0.0,
+            "recommendation_key": "",
+            "target_mean": 0.0,
+            "target_high": 0.0,
+            "target_low": 0.0,
+            "target_upside_pct": 0.0,
+            "forward_pe": 0.0,
+            "fwd_eps_growth_fy1_pct": 0.0,
+            "fwd_eps_growth_fy2_pct": 0.0,
+            "eps_rev_up_30d": 0,
+            "eps_rev_down_30d": 0,
+            "eps_rev_up_90d": 0,
+            "eps_rev_down_90d": 0,
+            "rev_breadth_pct": 0.0,
+            "inst_held_pct": 0.0,
+            "recent_bank_actions": [],
+            "top_holders": [],
+        }
+
+    analyst_count = max(0, _safe_int(ssig.get("analyst_count"), 0))
+    has_coverage = analyst_count > 0
+    strong_buy = max(0, _safe_int(ssig.get("strong_buy", ssig.get("strong_buy_count")), 0))
+    buy = max(0, _safe_int(ssig.get("buy", ssig.get("buy_count")), 0))
+    hold = max(0, _safe_int(ssig.get("hold", ssig.get("hold_count")), 0))
+    sell = max(0, _safe_int(ssig.get("sell", ssig.get("sell_count")), 0))
+    strong_sell = max(0, _safe_int(ssig.get("strong_sell", ssig.get("strong_sell_count")), 0))
+
+    target_mean = _js_round(_safe_float(ssig.get("target_mean", ssig.get("target_mean_price")), 0.0), 2)
+    target_high = _js_round(_safe_float(ssig.get("target_high", ssig.get("target_high_price")), 0.0), 2)
+    target_low = _js_round(_safe_float(ssig.get("target_low", ssig.get("target_low_price")), 0.0), 2)
+    target_upside_pct = (
+        _js_round(((target_mean / cur_price) - 1.0) * 100.0, 1)
+        if (has_coverage and target_mean > 0.0 and cur_price > 0.0)
+        else 0.0
+    )
+
+    raw_actions = ssig.get("recent_bank_actions")
+    if raw_actions is None and ssig.get("recent_bank_actions_json"):
+        try:
+            raw_actions = json.loads(str(ssig.get("recent_bank_actions_json")))
+        except (TypeError, ValueError):
+            raw_actions = []
+    actions_out: List[Dict[str, str]] = []
+    for act in (raw_actions if isinstance(raw_actions, list) else [])[:5]:
+        if isinstance(act, dict):
+            actions_out.append(
+                {
+                    "firm": str(act.get("firm") or ""),
+                    "to_grade": str(act.get("to_grade") or act.get("toGrade") or ""),
+                    "from_grade": str(act.get("from_grade") or act.get("fromGrade") or ""),
+                    "action": str(act.get("action") or ""),
+                    "date": str(act.get("date") or ""),
+                }
+            )
+
+    raw_holders = ssig.get("top_holders")
+    if raw_holders is None and ssig.get("top_holders_json"):
+        try:
+            raw_holders = json.loads(str(ssig.get("top_holders_json")))
+        except (TypeError, ValueError):
+            raw_holders = []
+    holders_out: List[str] = []
+    for h in raw_holders if isinstance(raw_holders, list) else []:
+        h_name = (
+            str(h.get("organization") or h.get("name") or "").strip()
+            if isinstance(h, dict)
+            else str(h).strip()
+        )
+        if not h_name:
+            continue
+        h_low = h_name.lower()
+        if any(noise in h_low for noise in MARKET_MAKER_NOISE):
+            continue
+        holders_out.append(h_name)
+        if len(holders_out) >= 4:
+            break
+
+    return {
+        "has_coverage": has_coverage,
+        "analyst_count": analyst_count,
+        "strong_buy": strong_buy,
+        "buy": buy,
+        "hold": hold,
+        "sell": sell,
+        "strong_sell": strong_sell,
+        "consensus_buy_pct": _js_round(_safe_float(ssig.get("consensus_buy_pct"), 0.0), 1),
+        "recommendation_key": str(ssig.get("recommendation_key") or ""),
+        "target_mean": target_mean,
+        "target_high": target_high,
+        "target_low": target_low,
+        "target_upside_pct": target_upside_pct,
+        "forward_pe": _js_round(_safe_float(ssig.get("forward_pe"), 0.0), 1),
+        "fwd_eps_growth_fy1_pct": _js_round(_safe_float(ssig.get("fwd_eps_growth_fy1_pct"), 0.0), 1),
+        "fwd_eps_growth_fy2_pct": _js_round(_safe_float(ssig.get("fwd_eps_growth_fy2_pct"), 0.0), 1),
+        "eps_rev_up_30d": max(0, _safe_int(ssig.get("eps_rev_up_30d"), 0)),
+        "eps_rev_down_30d": max(0, _safe_int(ssig.get("eps_rev_down_30d"), 0)),
+        "eps_rev_up_90d": max(0, _safe_int(ssig.get("eps_rev_up_90d"), 0)),
+        "eps_rev_down_90d": max(0, _safe_int(ssig.get("eps_rev_down_90d"), 0)),
+        "rev_breadth_pct": _js_round(_safe_float(ssig.get("rev_breadth_pct"), 0.0), 1),
+        "inst_held_pct": _js_round(_safe_float(ssig.get("inst_held_pct"), 0.0), 1),
+        "recent_bank_actions": actions_out,
+        "top_holders": holders_out,
+    }
 
 
 def resolve_weights(preset: str, custom: Optional[Dict[str, float]] = None) -> Dict[str, float]:
@@ -151,6 +346,7 @@ def score_universe_point_in_time(
     custom_weights: Optional[Dict[str, float]] = None,
     stage1_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
     quarterly_signals: Optional[Dict[str, Dict[str, Any]]] = None,
+    street_signals: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Evaluate all deep-scored companies strictly using data available on or before `as_of_date`."""
     weights = resolve_weights(preset, custom_weights)
@@ -195,9 +391,7 @@ def score_universe_point_in_time(
         latest = fund_records[-1]
         prev = fund_records[-2] if len(fund_records) >= 2 else None
         is_fin = bool(comp.get("is_financial"))
-        market_code = "US" if comp.get("market") == "US" else "IN"
-        market_label = "US Stock" if market_code == "US" else "Indian Stock"
-        currency = "USD" if market_code == "US" else "INR"
+        market_code, index_tag, market_label, currency = resolve_market_and_index_tag(comp)
         promoter_pct = float(comp.get("promoter_pct") or 0.0)
         inst_pct = float(comp.get("inst_pct") or 0.0)
 
@@ -205,6 +399,19 @@ def score_universe_point_in_time(
         qsig = (quarterly_signals or {}).get(tk)
         use_live_qtr = bool(
             qsig and str(qsig.get("signals_reported_date", "9999-12-31")) <= as_of_date
+        )
+
+        # Strict Point-in-Time Guard for Sell-Side & Buy-Side Street Signals (Zero Backtest Look-Ahead Bias)
+        ssig = (street_signals or {}).get(tk)
+        street_avail = bool(
+            ssig and str(ssig.get("signals_as_of_date", "9999-12-31")) <= as_of_date
+        )
+        street_analyst_cnt = _safe_int(ssig.get("analyst_count"), 0) if (street_avail and ssig) else 0
+        use_street = bool(street_avail and ssig and street_analyst_cnt >= 3)
+        fwd_g = (
+            _clamp(_safe_float(ssig.get("fwd_eps_growth_fy1_pct"), 0.0), -25.0, 45.0)
+            if (use_street and ssig)
+            else 0.0
         )
 
         shares_cr = max(0.01, float(latest["shares_cr"]))
@@ -357,6 +564,8 @@ def score_universe_point_in_time(
             5.0,
             28.0 if not is_cyclical_profile else 16.0,
         )
+        if use_street and fwd_g != 0.0:
+            effective_growth_anchor = 0.80 * effective_growth_anchor + 0.20 * _clamp(fwd_g, 5.0, 30.0)
         peg_ratio = (pe_ratio / effective_growth_anchor) if pat_cr > 0 else 9.9
 
         if is_fin:
@@ -399,7 +608,7 @@ def score_universe_point_in_time(
         else:
             valuation_zone = "Slightly Rich (Stagger SIP)"
 
-        # --- Pillar 3: Multi-Year Compounding + Latest 2-Quarter Earnings Inflection ---
+        # --- Pillar 3: Multi-Year Compounding + Latest 2-Quarter + Forward Street Growth ---
         g_rev = _linear_score(blended_rev_cagr, 4.0, 20.0)
         g_pat = _linear_score(normalized_pat_cagr, 5.0, 23.0)
         annual_growth_score = _clamp(0.42 * g_rev + 0.58 * g_pat)
@@ -414,7 +623,10 @@ def score_universe_point_in_time(
             qtr_growth_score = annual_growth_score
             growth_score = annual_growth_score
 
-        # --- Pillar 4: Piotroski Health, 4Q Institutional/Promoter Conviction & Trend ---
+        if use_street and fwd_g != 0.0:
+            growth_score = _clamp(0.20 * _linear_score(fwd_g, -2.0, 24.0) + 0.80 * growth_score)
+
+        # --- Pillar 4: Piotroski Health, Institutional Conviction & Street EPS Revisions ---
         m_piotroski = (f_score / 9.0) * 100.0
         smart_money_chg = promoter_chg_1y + inst_chg_1y
         if has_sh_trend:
@@ -425,18 +637,55 @@ def score_universe_point_in_time(
         else:
             ownership_score = _linear_score(promoter_pct + inst_pct, 40.0, 80.0) if (promoter_pct + inst_pct) > 0 else 60.0
 
-        if preset in {"qglp_compounder", "coffee_can"}:
-            m_trend = 75.0 if above_200dma else 35.0
-            m_steady = _linear_score(mom_12_1_pct, -18.0, 28.0)
-            momentum_score = _clamp(
-                0.45 * m_piotroski + 0.30 * ownership_score + 0.15 * m_steady + 0.10 * m_trend
-            )
-        else:
-            m_12_1 = _linear_score(mom_12_1_pct, -12.0, 38.0)
-            m_risk_adj = _linear_score(risk_adj_mom, -0.4, 1.5)
-            momentum_score = _clamp(0.35 * m_12_1 + 0.25 * m_risk_adj + 0.25 * m_piotroski + 0.15 * ownership_score)
+        up30 = _safe_int(ssig.get("eps_rev_up_30d"), 0) if (use_street and ssig) else 0
+        dn30 = _safe_int(ssig.get("eps_rev_down_30d"), 0) if (use_street and ssig) else 0
+        up90 = _safe_int(ssig.get("eps_rev_up_90d"), 0) if (use_street and ssig) else 0
+        dn90 = _safe_int(ssig.get("eps_rev_down_90d"), 0) if (use_street and ssig) else 0
+        use_30d_revs = (up30 + dn30) >= 3
+        tot_revs = (up30 + dn30) if use_30d_revs else (up90 + dn90)
+        rev_breadth = _safe_float(ssig.get("rev_breadth_pct"), 0.0) if (use_street and ssig) else 0.0
+        buy_pct = _safe_float(ssig.get("consensus_buy_pct"), 50.0) if (use_street and ssig) else 50.0
 
-        # --- Forensic, Governance, Quarterly Inflection & Valuation Guardrails ---
+        if use_street:
+            revision_score = (
+                _linear_score(rev_breadth, -60.0, 70.0)
+                if tot_revs >= 3
+                else _linear_score(buy_pct, 30.0, 85.0)
+            )
+            if preset in {"qglp_compounder", "coffee_can"}:
+                m_trend = 75.0 if above_200dma else 35.0
+                m_steady = _linear_score(mom_12_1_pct, -18.0, 28.0)
+                momentum_score = _clamp(
+                    0.38 * m_piotroski
+                    + 0.25 * ownership_score
+                    + 0.22 * revision_score
+                    + 0.10 * m_steady
+                    + 0.05 * m_trend
+                )
+            else:
+                m_12_1 = _linear_score(mom_12_1_pct, -12.0, 38.0)
+                m_risk_adj = _linear_score(risk_adj_mom, -0.4, 1.5)
+                momentum_score = _clamp(
+                    0.30 * m_12_1
+                    + 0.20 * m_risk_adj
+                    + 0.20 * m_piotroski
+                    + 0.15 * ownership_score
+                    + 0.15 * revision_score
+                )
+        else:
+            revision_score = 50.0
+            if preset in {"qglp_compounder", "coffee_can"}:
+                m_trend = 75.0 if above_200dma else 35.0
+                m_steady = _linear_score(mom_12_1_pct, -18.0, 28.0)
+                momentum_score = _clamp(
+                    0.45 * m_piotroski + 0.30 * ownership_score + 0.15 * m_steady + 0.10 * m_trend
+                )
+            else:
+                m_12_1 = _linear_score(mom_12_1_pct, -12.0, 38.0)
+                m_risk_adj = _linear_score(risk_adj_mom, -0.4, 1.5)
+                momentum_score = _clamp(0.35 * m_12_1 + 0.25 * m_risk_adj + 0.25 * m_piotroski + 0.15 * ownership_score)
+
+        # --- Forensic, Governance, Quarterly Inflection, Street Cuts & Valuation Guardrails ---
         red_flags: List[str] = []
         penalty_items: List[Dict[str, Any]] = []
         strengths: List[str] = []
@@ -453,6 +702,14 @@ def score_universe_point_in_time(
             _add_flag("Loss-making in latest fiscal year or TTM (PAT <= 0)", 20.0)
         if profitable_yrs < max(1, len(window_5y) - 1):
             _add_flag(f"Inconsistent profitability ({profitable_yrs}/{len(window_5y)} profitable years)", 10.0)
+        if use_street and street_analyst_cnt >= 5 and tot_revs >= 5 and rev_breadth <= -55.0:
+            act_up = up30 if use_30d_revs else up90
+            act_dn = dn30 if use_30d_revs else dn90
+            act_win = "30d" if use_30d_revs else "90d"
+            _add_flag(
+                f"Widespread sell-side EPS cuts ({act_dn} down vs {act_up} up over {act_win}, {_js_round_int(rev_breadth)}% breadth)",
+                6.0,
+            )
         if equity_cr <= 0:
             _add_flag("Negative net worth / eroded book equity", 15.0)
         if not is_fin and de_cur > 1.8:
@@ -485,7 +742,7 @@ def score_universe_point_in_time(
             _add_flag(f"Weak Piotroski financial health ({f_score}/9)", 10.0)
         if (pe_ratio > 56.0 and peg_ratio > 2.1) or (is_cyclical_profile and pe_ratio > fair_pe * 1.75):
             _add_flag(
-                f"Valuation rich at {pe_ratio:.1f}x P/E (Fair ~{fair_pe}x, PEG {peg_ratio:.1f}x) — wait for pullback",
+                f"Valuation rich at {pe_ratio:.1f}x P/E (Fair ~{fair_pe:.1f}x, PEG {peg_ratio:.1f}x) — wait for pullback",
                 8.0,
             )
             valuation_capped = True
@@ -508,13 +765,20 @@ def score_universe_point_in_time(
             strengths.append(
                 f"Healthy latest 2Q trajectory ({qtr_pat_yoy:+.1f}% YoY PAT, {qtr_rev_yoy:+.1f}% YoY Sales through {latest_qtr_label})"
             )
+        if use_street and tot_revs >= 5 and rev_breadth >= 55.0:
+            act_up = up30 if use_30d_revs else up90
+            act_dn = dn30 if use_30d_revs else dn90
+            act_win = "30d" if use_30d_revs else "90d"
+            strengths.append(
+                f"Strong Street EPS upgrade momentum ({act_up} up vs {act_dn} down over {act_win}, +{_js_round_int(rev_breadth)}% breadth)"
+            )
         if not is_fin and cum_cfo_ebitda_5y >= 82.0:
             strengths.append(f"Clean 5Y cash-flow conversion ({cum_cfo_ebitda_5y:.0f}% cumulative CFO/EBITDA)")
         if not is_fin and de_cur <= 0.25 and equity_cr > 0:
             strengths.append(f"Fortress balance sheet with minimal debt (D/E {de_cur:.2f}x)")
         if pat_cr > 0 and pe_ratio <= fair_pe * 1.10:
             strengths.append(
-                f"Reasonable GARP entry price ({pe_ratio:.1f}x P/E vs Fair ~{fair_pe}x, PEG {peg_ratio:.2f}x)"
+                f"Reasonable GARP entry price ({pe_ratio:.1f}x P/E vs Fair ~{fair_pe:.1f}x, PEG {peg_ratio:.2f}x)"
             )
         if has_sh_trend and inst_chg_1y >= 1.0 and promoter_chg_1y >= -0.4:
             strengths.append(
@@ -536,82 +800,84 @@ def score_universe_point_in_time(
             + weights["growth"] * growth_score
             + weights["momentum"] * momentum_score
         )
-        composite_score = round(_clamp(raw_composite - penalty), 1)
+        composite_score = _js_round(_clamp(raw_composite - penalty), 1)
 
         if valuation_capped and composite_score >= 45.0 and pat_cr > 0:
             rating = "Hold"
             conviction = "Great Business, Rich Price — Buy on Dip"
             rating_rule = (
-                f"Score {composite_score}/100 passes quality threshold, but Valuation Guardrail fired "
-                f"(P/E {pe_ratio:.1f}x vs Fair ~{fair_pe}x) → Capped at Hold until pullback."
+                f"Score {composite_score:.1f}/100 passes quality threshold, but Valuation Guardrail fired "
+                f"(P/E {pe_ratio:.1f}x vs Fair ~{fair_pe:.1f}x) → Capped at Hold until pullback."
             )
         elif composite_score >= 68.0 and len(red_flags) == 0:
             rating = "Strong Buy"
             conviction = "Core Long-Term Compounder"
             rating_rule = (
-                f"Composite Score {composite_score}/100 ≥ 68.0 with 0 forensic or valuation red flags → Strong Buy."
+                f"Composite Score {composite_score:.1f}/100 ≥ 68.0 with 0 forensic or valuation red flags → Strong Buy."
             )
         elif composite_score >= 57.0 and pat_cr > 0 and profitable_yrs >= len(window_5y) - 1:
             rating = "Buy"
             conviction = "Accumulate for 3-5Y+"
             rating_rule = (
-                f"Composite Score {composite_score}/100 ≥ 57.0 with {profitable_yrs}/{len(window_5y)} profitable years "
+                f"Composite Score {composite_score:.1f}/100 ≥ 57.0 with {profitable_yrs}/{len(window_5y)} profitable years "
                 + ("(prevented from Strong Buy due to guardrail flag)" if red_flags and composite_score >= 68.0 else "→ Buy.")
             )
         elif composite_score >= 45.0 and pat_cr > 0:
             rating = "Hold"
             conviction = "Watchlist / Hold Existing"
             rating_rule = (
-                f"Composite Score {composite_score}/100 is in the 45–57 neutral zone (or profit consistency < 4/5 yrs) → Hold."
+                f"Composite Score {composite_score:.1f}/100 is in the 45–57 neutral zone (or profit consistency < 4/5 yrs) → Hold."
             )
         else:
             rating = "Avoid"
             conviction = "Fundamental / Balance-Sheet Caution"
             rating_rule = (
-                f"Composite Score {composite_score}/100 < 45.0 or negative TTM/FY profit → Avoid."
+                f"Composite Score {composite_score:.1f}/100 < 45.0 or negative TTM/FY profit → Avoid."
             )
 
         if not strengths:
-            strengths.append(
-                "Established Nasdaq-100 operating franchise"
-                if market_code == "US"
-                else "Established NSE Nifty-200 operating franchise"
-            )
+            if index_tag == "SP500":
+                strengths.append("Established S&P 500 operating franchise")
+            elif index_tag == "NASDAQ100":
+                strengths.append("Established Nasdaq-100 operating franchise")
+            else:
+                strengths.append("Established NSE Nifty-200 operating franchise")
 
         s1_info = (stage1_lookup or {}).get(tk, {})
 
         score_breakdown = {
             "preset_used": preset,
             "weights_pct": {
-                "quality": round(weights["quality"] * 100.0, 1),
-                "value": round(weights["value"] * 100.0, 1),
-                "growth": round(weights["growth"] * 100.0, 1),
-                "momentum": round(weights["momentum"] * 100.0, 1),
+                "quality": _js_round(weights["quality"] * 100.0, 1),
+                "value": _js_round(weights["value"] * 100.0, 1),
+                "growth": _js_round(weights["growth"] * 100.0, 1),
+                "momentum": _js_round(weights["momentum"] * 100.0, 1),
             },
             "contributions": {
-                "quality": round(weights["quality"] * quality_score, 1),
-                "value": round(weights["value"] * value_score, 1),
-                "growth": round(weights["growth"] * growth_score, 1),
-                "momentum": round(weights["momentum"] * momentum_score, 1),
+                "quality": _js_round(weights["quality"] * quality_score, 1),
+                "value": _js_round(weights["value"] * value_score, 1),
+                "growth": _js_round(weights["growth"] * growth_score, 1),
+                "momentum": _js_round(weights["momentum"] * momentum_score, 1),
             },
-            "raw_composite": round(raw_composite, 1),
-            "total_penalty": round(penalty, 1),
+            "raw_composite": _js_round(raw_composite, 1),
+            "total_penalty": _js_round(penalty, 1),
             "penalty_items": penalty_items,
             "final_score": composite_score,
             "valuation_capped": valuation_capped,
             "rating_rule": rating_rule,
             "sub_scores": {
-                "capital_return": round(q_return, 0),
-                "moat_stability": round(moat_stability, 0),
-                "balance_sheet": round(q_lev, 0),
-                "cash_conversion": round(q_cash, 0),
-                "operating_margin": round(q_margin, 0),
-                "peg_attractiveness": round(v_peg, 0),
-                "fair_pe_discount": round(v_pe_rel, 0),
-                "multi_year_cagr": round(annual_growth_score, 0),
-                "quarterly_momentum": round(qtr_growth_score, 0),
-                "piotroski_health": round(m_piotroski, 0),
-                "ownership_conviction": round(ownership_score, 0),
+                "capital_return": _js_round_int(q_return),
+                "moat_stability": _js_round_int(moat_stability),
+                "balance_sheet": _js_round_int(q_lev),
+                "cash_conversion": _js_round_int(q_cash),
+                "operating_margin": _js_round_int(q_margin),
+                "peg_attractiveness": _js_round_int(v_peg),
+                "fair_pe_discount": _js_round_int(v_pe_rel),
+                "multi_year_cagr": _js_round_int(annual_growth_score),
+                "quarterly_momentum": _js_round_int(qtr_growth_score),
+                "piotroski_health": _js_round_int(m_piotroski),
+                "ownership_conviction": _js_round_int(ownership_score),
+                "eps_revision_momentum": _js_round_int(revision_score),
             },
         }
 
@@ -621,6 +887,7 @@ def score_universe_point_in_time(
                 "name": comp["name"],
                 "sector": comp["sector"],
                 "market": market_code,
+                "index_tag": index_tag,
                 "market_label": market_label,
                 "currency": currency,
                 "cap_tier": comp.get("cap_tier", "Large Cap"),
@@ -636,10 +903,10 @@ def score_universe_point_in_time(
                 "conviction": conviction,
                 "valuation_zone": valuation_zone,
                 "pillars": {
-                    "quality": round(quality_score, 1),
-                    "value": round(value_score, 1),
-                    "growth": round(growth_score, 1),
-                    "momentum": round(momentum_score, 1),
+                    "quality": _js_round(quality_score, 1),
+                    "value": _js_round(value_score, 1),
+                    "growth": _js_round(growth_score, 1),
+                    "momentum": _js_round(momentum_score, 1),
                 },
                 "metrics": {
                     "roce_pct": round(roe_cur if is_fin else roce_cur, 1),
@@ -679,8 +946,9 @@ def score_universe_point_in_time(
                     "inst_pct": round(inst_pct, 1),
                     "latest_fy": int(latest["fiscal_year"]),
                 },
-                "strengths": strengths[:4],
-                "red_flags": red_flags[:4],
+                "street": _build_street_payload(ssig, street_avail, cur_price),
+                "strengths": strengths[:5],
+                "red_flags": red_flags[:5],
                 "piotroski_checks": f_checks,
                 "score_breakdown": score_breakdown,
             }

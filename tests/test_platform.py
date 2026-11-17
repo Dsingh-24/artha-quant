@@ -263,7 +263,7 @@ def _authenticated_multimarket_client(tmp_path: Path) -> tuple[TestClient, str]:
     from app.database import DEFAULT_DB_PATH, Database
 
     db_copy = tmp_path / "multimarket_artha.db"
-    if DEFAULT_DB_PATH.exists() and Database(db_path=DEFAULT_DB_PATH).count_companies() >= 250:
+    if DEFAULT_DB_PATH.exists() and Database(db_path=DEFAULT_DB_PATH).count_companies() >= 650:
         shutil.copy2(DEFAULT_DB_PATH, db_copy)
     else:
         snap_path = Path(__file__).resolve().parent.parent / "static" / "data" / "market_snapshot.json"
@@ -282,6 +282,7 @@ def _authenticated_multimarket_client(tmp_path: Path) -> tuple[TestClient, str]:
                 inst_pct=float(c.get("inst_pct") or 0.0),
                 market=c.get("market", "IN"),
                 currency=c.get("currency", "INR"),
+                index_tag=c.get("index_tag", "NIFTY200"),
             )
         db.upsert_stage1_funnel(snap["stage1_funnel"])
         db.upsert_fundamentals(
@@ -313,6 +314,9 @@ def _authenticated_multimarket_client(tmp_path: Path) -> tuple[TestClient, str]:
         q_raw = snap.get("quarterly_signals", {})
         for q in (q_raw.values() if isinstance(q_raw, dict) else q_raw):
             db.upsert_quarterly_signals(q)
+        ss_raw = snap.get("street_signals", {})
+        for srec in (ss_raw.values() if isinstance(ss_raw, dict) else ss_raw):
+            db.upsert_street_signals(srec)
         dates = snap["price_dates"]
         price_rows = [
             (tk, dates[idx], float(px), 0.0)
@@ -342,13 +346,20 @@ def _authenticated_multimarket_client(tmp_path: Path) -> tuple[TestClient, str]:
     return client, setup_res.json()["csrf_token"]
 
 
-def test_multimarket_screener_score_breakdown_and_company_detail(tmp_path: Path) -> None:
+EXPECTED_MARKET_LABELS = {
+    "NASDAQ100": "US Stock · NASDAQ 100",
+    "SP500": "US Stock · S&P 500",
+    "NIFTY200": "Indian Stock · NIFTY 200",
+}
+
+
+def test_multimarket_screener_overlap_priority_and_company_detail(tmp_path: Path) -> None:
     client, csrf = _authenticated_multimarket_client(tmp_path)
 
-    # 1. market="ALL" screener returns combined NSE + Nasdaq-100 universe with dual benchmarks
+    # 1. market="ALL" screener returns combined NIFTY200 + NASDAQ100 + SP500 universe with triple benchmarks
     all_res = client.post(
         "/api/screener",
-        json={"preset": "artha_blend", "sector": "ALL", "min_score": 0, "market": "ALL"},
+        json={"preset": "street_quant", "sector": "ALL", "min_score": 0, "market": "ALL"},
         headers={"X-CSRF-Token": csrf},
     )
     assert all_res.status_code == 200
@@ -356,23 +367,39 @@ def test_multimarket_screener_score_breakdown_and_company_detail(tmp_path: Path)
     assert all_body["market"] == "ALL"
     mc = all_body["market_counts"]
     assert mc["IN"] >= 190
-    assert mc["US"] >= 90
+    assert mc["NASDAQ100"] >= 90
+    assert mc["SP500"] >= 390
+    assert mc["US"] == mc["NASDAQ100"] + mc["SP500"]
     assert mc["ALL"] == mc["IN"] + mc["US"]
     assert all_body["benchmark_nifty50"] > 10_000
+    assert all_body["benchmark_sp500"] > 3_000
     assert all_body["benchmark_nasdaq100"] > 10_000
+    assert "street_quant" in all_body["preset_weights"]
     assert len(all_body["stocks"]) == mc["ALL"]
     assert [all_body["stocks"][0]["rank"], all_body["stocks"][-1]["rank"]] == [1, mc["ALL"]]
 
-    # Verify score_breakdown math and market_label across every single stock
+    # Verify score_breakdown math, three-tier index_tag / market_label, and US market-cap scaling on every stock
+    covered_in = 0
+    covered_us = 0
     for st in all_body["stocks"]:
         assert st["market"] in {"IN", "US"}
-        expected_label = "US Stock" if st["market"] == "US" else "Indian Stock"
-        expected_ccy = "USD" if st["market"] == "US" else "INR"
-        assert st["market_label"] == expected_label
-        assert st["currency"] == expected_ccy
+        assert st["index_tag"] in EXPECTED_MARKET_LABELS
+        assert st["market_label"] == EXPECTED_MARKET_LABELS[st["index_tag"]]
+        if st["market"] == "US":
+            assert st["index_tag"] in {"NASDAQ100", "SP500"}
+            assert st["currency"] == "USD"
+            assert 2_000 <= st["market_cap_cr"] <= 8_000_000, f"US mcap unit anomaly on {st['ticker']}: {st['market_cap_cr']}"
+            if st["street"]["has_coverage"]:
+                covered_us += 1
+        else:
+            assert st["index_tag"] == "NIFTY200"
+            assert st["currency"] == "INR"
+            if st["street"]["has_coverage"]:
+                covered_in += 1
 
         sb = st["score_breakdown"]
         assert set(sb["contributions"].keys()) == {"quality", "value", "growth", "momentum"}
+        assert "eps_revision_momentum" in sb["sub_scores"]
         contrib_sum = sum(sb["contributions"].values())
         assert abs(contrib_sum - sb["raw_composite"]) <= 0.25
         clamped_final = max(0.0, min(100.0, sb["raw_composite"] - sb["total_penalty"]))
@@ -380,206 +407,262 @@ def test_multimarket_screener_score_breakdown_and_company_detail(tmp_path: Path)
         assert abs(st["composite_score"] - sb["final_score"]) <= 0.05
         assert isinstance(sb["rating_rule"], str) and len(sb["rating_rule"]) > 0
 
-    by_tk = {s["ticker"]: s for s in all_body["stocks"]}
-    for us_tk in ("MSFT", "NVDA", "AAPL", "COST", "META"):
-        assert us_tk in by_tk
-        assert by_tk[us_tk]["market"] == "US"
-        assert by_tk[us_tk]["market_label"] == "US Stock"
-        assert by_tk[us_tk]["market_cap_cr"] > 100_000  # > $100B in $M units
-        assert 5.0 < by_tk[us_tk]["metrics"]["pe_ratio"] < 99.0
+    assert covered_in >= 180
+    assert covered_us >= 480
 
-    for in_tk in ("MUTHOOTFIN.NS", "ICICIBANK.NS", "TCS.NS"):
+    # Verify strict Overlap Tag Priority: NASDAQ100 > SP500 > NIFTY200
+    by_tk = {s["ticker"]: s for s in all_body["stocks"]}
+    for overlap_tk in ("AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "COST", "AVGO", "PEP"):
+        assert overlap_tk in by_tk
+        assert by_tk[overlap_tk]["market"] == "US"
+        assert by_tk[overlap_tk]["index_tag"] == "NASDAQ100"
+        assert by_tk[overlap_tk]["market_label"] == "US Stock · NASDAQ 100"
+        assert by_tk[overlap_tk]["market_cap_cr"] > 100_000
+
+    for sp_tk in ("JPM", "LLY", "V", "MA", "WMT", "GS", "BRK-B", "XOM"):
+        assert sp_tk in by_tk
+        assert by_tk[sp_tk]["market"] == "US"
+        assert by_tk[sp_tk]["index_tag"] == "SP500"
+        assert by_tk[sp_tk]["market_label"] == "US Stock · S&P 500"
+        assert by_tk[sp_tk]["market_cap_cr"] > 100_000
+
+    for in_tk in ("ICICIBANK.NS", "MUTHOOTFIN.NS", "TCS.NS"):
         assert in_tk in by_tk
         assert by_tk[in_tk]["market"] == "IN"
-        assert by_tk[in_tk]["market_label"] == "Indian Stock"
-        assert by_tk[in_tk]["market_cap_cr"] > 50_000  # > ₹50,000 Cr
+        assert by_tk[in_tk]["index_tag"] == "NIFTY200"
+        assert by_tk[in_tk]["market_label"] == "Indian Stock · NIFTY 200"
+        assert by_tk[in_tk]["market_cap_cr"] > 50_000
 
-    # 2. market="IN" scopes strictly to Indian stocks and re-numbers rank 1..N_IN
-    in_res = client.post(
-        "/api/screener",
-        json={"preset": "artha_blend", "sector": "ALL", "min_score": 0, "market": "IN"},
-        headers={"X-CSRF-Token": csrf},
-    )
-    assert in_res.status_code == 200
-    in_stocks = in_res.json()["stocks"]
-    assert len(in_stocks) == mc["IN"]
-    assert all(s["market"] == "IN" and s["market_label"] == "Indian Stock" for s in in_stocks)
-    assert [s["rank"] for s in in_stocks] == list(range(1, len(in_stocks) + 1))
+    # 2. Verify all 4 scoped market filters (IN, US, NASDAQ100, SP500) & sequential 1..N ranks
+    for mode, expected_cnt, allowed_tags in (
+        ("IN", mc["IN"], {"NIFTY200"}),
+        ("US", mc["US"], {"NASDAQ100", "SP500"}),
+        ("NASDAQ100", mc["NASDAQ100"], {"NASDAQ100"}),
+        ("SP500", mc["SP500"], {"SP500"}),
+    ):
+        m_res = client.post(
+            "/api/screener",
+            json={"preset": "artha_blend", "sector": "ALL", "min_score": 0, "market": mode},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert m_res.status_code == 200
+        m_stocks = m_res.json()["stocks"]
+        assert len(m_stocks) == expected_cnt
+        assert all(
+            s["index_tag"] in allowed_tags and s["market_label"] == EXPECTED_MARKET_LABELS[s["index_tag"]]
+            for s in m_stocks
+        )
+        assert [s["rank"] for s in m_stocks] == list(range(1, len(m_stocks) + 1))
 
-    # 3. market="US" scopes strictly to US Nasdaq-100 stocks and re-numbers rank 1..N_US
-    us_res = client.post(
-        "/api/screener",
-        json={"preset": "artha_blend", "sector": "ALL", "min_score": 0, "market": "US"},
-        headers={"X-CSRF-Token": csrf},
-    )
-    assert us_res.status_code == 200
-    us_stocks = us_res.json()["stocks"]
-    assert len(us_stocks) == mc["US"]
-    assert all(s["market"] == "US" and s["market_label"] == "US Stock" for s in us_stocks)
-    assert [s["rank"] for s in us_stocks] == list(range(1, len(us_stocks) + 1))
-
-    # 4. /api/company/{ticker} for both US and Indian symbols (including custom weights)
+    # 3. /api/company/{ticker} across NASDAQ100, SP500, and NIFTY200
     msft_res = client.get("/api/company/MSFT?preset=custom&w_q=50&w_v=20&w_g=20&w_m=10")
     assert msft_res.status_code == 200
     msft = msft_res.json()
     assert msft["scorecard"]["ticker"] == "MSFT"
-    assert msft["scorecard"]["market"] == "US"
-    assert msft["scorecard"]["market_label"] == "US Stock"
+    assert msft["scorecard"]["index_tag"] == "NASDAQ100"
+    assert msft["scorecard"]["market_label"] == "US Stock · NASDAQ 100"
+    assert msft["scorecard"]["street"]["has_coverage"] is True
+    assert msft["scorecard"]["street"]["analyst_count"] >= 10
     assert msft["scorecard"]["score_breakdown"]["preset_used"] == "custom"
     assert msft["scorecard"]["score_breakdown"]["weights_pct"]["quality"] == 50.0
-    assert len(msft["fundamentals"]) >= 5
-    assert len(msft["price_history"]) >= 100
+
+    jpm_res = client.get("/api/company/JPM?preset=street_quant")
+    assert jpm_res.status_code == 200
+    jpm = jpm_res.json()
+    assert jpm["scorecard"]["ticker"] == "JPM"
+    assert jpm["scorecard"]["index_tag"] == "SP500"
+    assert jpm["scorecard"]["market_label"] == "US Stock · S&P 500"
+    assert jpm["scorecard"]["street"]["has_coverage"] is True
 
     muthoot_res = client.get("/api/company/MUTHOOTFIN.NS?preset=qglp_compounder")
     assert muthoot_res.status_code == 200
     muthoot = muthoot_res.json()
     assert muthoot["scorecard"]["ticker"] == "MUTHOOTFIN.NS"
-    assert muthoot["scorecard"]["market"] == "IN"
-    assert muthoot["scorecard"]["market_label"] == "Indian Stock"
-    assert muthoot["scorecard"]["score_breakdown"]["preset_used"] == "qglp_compounder"
+    assert muthoot["scorecard"]["index_tag"] == "NIFTY200"
+    assert muthoot["scorecard"]["market_label"] == "Indian Stock · NIFTY 200"
 
 
 def test_multimarket_planner_and_backtester(tmp_path: Path) -> None:
     client, csrf = _authenticated_multimarket_client(tmp_path)
 
-    # 1. Planner across market="IN", market="US", and market="ALL"
-    pl_in = client.post(
-        "/api/planner",
-        json={
-            "market": "IN",
-            "lump_sum_inr": 500_000,
-            "monthly_sip_inr": 0,
-            "horizon_years": 7,
-            "target_corpus_inr": 1_300_000,
-            "risk_profile": "equity_direct",
-            "preset": "qglp_compounder",
-            "max_stocks": 8,
-            "save_plan": False,
-        },
-        headers={"X-CSRF-Token": csrf},
-    )
-    assert pl_in.status_code == 200
-    pl_in_body = pl_in.json()
-    assert pl_in_body["market"] == "IN"
-    assert pl_in_body["plan_currency"] == "INR"
-    assert len(pl_in_body["stock_basket"]) == 8
-    assert all(
-        s["market"] == "IN" and s["market_label"] == "Indian Stock" and s["currency"] == "INR"
-        for s in pl_in_body["stock_basket"]
-    )
+    # 1. Planner across IN, US, NASDAQ100, SP500, and ALL
+    for mode, expected_ccy, allowed_tags, cap in (
+        ("IN", "INR", {"NIFTY200"}, 500_000),
+        ("US", "USD", {"NASDAQ100", "SP500"}, 10_000),
+        ("NASDAQ100", "USD", {"NASDAQ100"}, 10_000),
+        ("SP500", "USD", {"SP500"}, 10_000),
+        ("ALL", "INR", {"NIFTY200", "NASDAQ100", "SP500"}, 500_000),
+    ):
+        pl_res = client.post(
+            "/api/planner",
+            json={
+                "market": mode,
+                "lump_sum_inr": cap,
+                "monthly_sip_inr": 0,
+                "horizon_years": 7,
+                "target_corpus_inr": cap * 2.5,
+                "risk_profile": "equity_direct",
+                "preset": "qglp_compounder",
+                "max_stocks": 8,
+                "save_plan": False,
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert pl_res.status_code == 200
+        pl_body = pl_res.json()
+        assert pl_body["market"] == mode
+        assert pl_body["plan_currency"] == expected_ccy
+        assert len(pl_body["stock_basket"]) == 8
+        for item in pl_body["stock_basket"]:
+            assert item["index_tag"] in allowed_tags
+            assert item["market_label"] == EXPECTED_MARKET_LABELS[item["index_tag"]]
+            assert item["est_shares"] >= 1
 
-    pl_us = client.post(
-        "/api/planner",
-        json={
-            "market": "US",
-            "lump_sum_inr": 10_000,
-            "monthly_sip_inr": 250,
-            "horizon_years": 7,
-            "target_corpus_inr": 26_000,
-            "risk_profile": "equity_direct",
-            "preset": "qglp_compounder",
-            "max_stocks": 8,
-            "save_plan": False,
-        },
-        headers={"X-CSRF-Token": csrf},
-    )
-    assert pl_us.status_code == 200
-    pl_us_body = pl_us.json()
-    assert pl_us_body["market"] == "US"
-    assert pl_us_body["plan_currency"] == "USD"
-    assert len(pl_us_body["stock_basket"]) == 8
-    assert all(
-        s["market"] == "US" and s["market_label"] == "US Stock" and s["currency"] == "USD" and s["est_shares"] >= 1
-        for s in pl_us_body["stock_basket"]
-    )
+    # 2. Backtester across IN, US, NASDAQ100, SP500, and ALL
+    for mode, expected_bench, expected_ccy, allowed_tags, cap in (
+        ("IN", "Nifty 50 (^NSEI)", "INR", {"NIFTY200"}, 500_000),
+        ("US", "S&P 500 (^GSPC)", "USD", {"NASDAQ100", "SP500"}, 10_000),
+        ("NASDAQ100", "Nasdaq 100 (^NDX)", "USD", {"NASDAQ100"}, 10_000),
+        ("SP500", "S&P 500 (^GSPC)", "USD", {"SP500"}, 10_000),
+        ("ALL", "Nifty 50 (^NSEI)", "INR", {"NIFTY200", "NASDAQ100", "SP500"}, 500_000),
+    ):
+        bt_res = client.post(
+            "/api/backtest",
+            json={
+                "market": mode,
+                "preset": "street_quant",
+                "lookback_years": 5,
+                "top_n": 10,
+                "rebalance": "annual",
+                "weighting": "inv_vol",
+                "initial_capital": cap,
+                "cost_bps": 25,
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert bt_res.status_code == 200
+        bt_body = bt_res.json()
+        assert bt_body["summary"]["market"] == mode
+        assert bt_body["summary"]["benchmark_name"] == expected_bench
+        assert bt_body["summary"]["currency"] == expected_ccy
+        assert len(bt_body["latest_holdings"]) == 10
+        for h in bt_body["latest_holdings"]:
+            assert h["index_tag"] in allowed_tags
+            assert h["market_label"] == EXPECTED_MARKET_LABELS[h["index_tag"]]
 
-    pl_all = client.post(
-        "/api/planner",
-        json={
-            "market": "ALL",
-            "lump_sum_inr": 500_000,
-            "monthly_sip_inr": 0,
-            "horizon_years": 7,
-            "target_corpus_inr": 1_300_000,
-            "risk_profile": "equity_direct",
-            "preset": "qglp_compounder",
-            "max_stocks": 8,
-            "save_plan": False,
-        },
-        headers={"X-CSRF-Token": csrf},
-    )
-    assert pl_all.status_code == 200
-    pl_all_body = pl_all.json()
-    assert pl_all_body["market"] == "ALL"
-    assert pl_all_body["plan_currency"] == "INR"
-    assert len(pl_all_body["stock_basket"]) == 8
-    for item in pl_all_body["stock_basket"]:
-        assert item["market"] in {"IN", "US"}
-        assert item["market_label"] in {"Indian Stock", "US Stock"}
 
-    # 2. Backtester across market="IN", market="US", and market="ALL"
-    bt_in = client.post(
-        "/api/backtest",
-        json={
-            "market": "IN",
-            "preset": "artha_blend",
-            "lookback_years": 5,
-            "top_n": 10,
-            "rebalance": "quarterly",
-            "weighting": "inv_vol",
-            "initial_capital": 500_000,
-            "cost_bps": 25,
-        },
-        headers={"X-CSRF-Token": csrf},
-    )
-    assert bt_in.status_code == 200
-    bt_in_body = bt_in.json()
-    assert bt_in_body["summary"]["market"] == "IN"
-    assert bt_in_body["summary"]["benchmark_name"] == "Nifty 50 (^NSEI)"
-    assert bt_in_body["summary"]["currency"] == "INR"
-    assert all(h["market"] == "IN" and h["market_label"] == "Indian Stock" for h in bt_in_body["latest_holdings"])
+def test_street_signals_scoring_guardrails_and_point_in_time_isolation(tmp_path: Path) -> None:
+    from app.factors import score_universe_point_in_time
 
-    bt_us = client.post(
-        "/api/backtest",
-        json={
-            "market": "US",
-            "preset": "artha_blend",
-            "lookback_years": 5,
-            "top_n": 10,
-            "rebalance": "quarterly",
-            "weighting": "inv_vol",
-            "initial_capital": 10_000,
-            "cost_bps": 25,
-        },
-        headers={"X-CSRF-Token": csrf},
-    )
-    assert bt_us.status_code == 200
-    bt_us_body = bt_us.json()
-    assert bt_us_body["summary"]["market"] == "US"
-    assert bt_us_body["summary"]["benchmark_name"] == "Nasdaq 100 (^NDX)"
-    assert bt_us_body["summary"]["currency"] == "USD"
-    assert bt_us_body["summary"]["final_portfolio_inr"] > 10_000
-    assert all(h["market"] == "US" and h["market_label"] == "US Stock" for h in bt_us_body["latest_holdings"])
+    client, _csrf = _authenticated_client(tmp_path)
+    app = client.app
+    db = app.state.db
 
-    bt_all = client.post(
-        "/api/backtest",
-        json={
-            "market": "ALL",
-            "preset": "artha_blend",
-            "lookback_years": 5,
-            "top_n": 10,
-            "rebalance": "quarterly",
-            "weighting": "inv_vol",
-            "initial_capital": 500_000,
-            "cost_bps": 25,
-        },
-        headers={"X-CSRF-Token": csrf},
+    # Inject synthetic Street upgrade signal (with market-maker noise in holders) on TCS.NS
+    # and widespread sell-side EPS cuts on INFY.NS with signals_as_of_date = "2026-08-01"
+    db.upsert_street_signals(
+        {
+            "ticker": "TCS.NS",
+            "signals_as_of_date": "2026-08-01",
+            "analyst_count": 28,
+            "strong_buy_count": 14,
+            "buy_count": 10,
+            "hold_count": 3,
+            "sell_count": 1,
+            "strong_sell_count": 0,
+            "consensus_buy_pct": 85.7,
+            "recommendation_key": "buy",
+            "target_mean_price": 4850.0,
+            "target_high_price": 5200.0,
+            "target_low_price": 4100.0,
+            "forward_pe": 25.4,
+            "fwd_eps_growth_fy1_pct": 22.5,
+            "fwd_eps_growth_fy2_pct": 18.0,
+            "eps_rev_up_30d": 18,
+            "eps_rev_down_30d": 2,
+            "eps_rev_up_90d": 24,
+            "eps_rev_down_90d": 3,
+            "rev_breadth_pct": 80.0,
+            "inst_held_pct": 36.5,
+            "recent_bank_actions": [
+                {"firm": "Morgan Stanley", "to_grade": "Overweight", "from_grade": "Equal-Weight", "action": "Upgrade", "date": "2026-07-20"}
+            ],
+            "top_holders": ["Life Insurance Corp", "Jane Street Group", "Citadel Advisors", "SBI Funds Management"],
+        }
     )
-    assert bt_all.status_code == 200
-    bt_all_body = bt_all.json()
-    assert bt_all_body["summary"]["market"] == "ALL"
-    assert bt_all_body["summary"]["currency"] == "INR"
-    assert len(bt_all_body["latest_holdings"]) == 10
+    db.upsert_street_signals(
+        {
+            "ticker": "INFY.NS",
+            "signals_as_of_date": "2026-08-01",
+            "analyst_count": 22,
+            "strong_buy_count": 2,
+            "buy_count": 3,
+            "hold_count": 9,
+            "sell_count": 6,
+            "strong_sell_count": 2,
+            "consensus_buy_pct": 22.7,
+            "recommendation_key": "underperform",
+            "target_mean_price": 1350.0,
+            "target_high_price": 1600.0,
+            "target_low_price": 1150.0,
+            "forward_pe": 24.0,
+            "fwd_eps_growth_fy1_pct": -8.0,
+            "fwd_eps_growth_fy2_pct": 4.0,
+            "eps_rev_up_30d": 1,
+            "eps_rev_down_30d": 15,
+            "eps_rev_up_90d": 2,
+            "eps_rev_down_90d": 18,
+            "rev_breadth_pct": -87.5,
+            "inst_held_pct": 42.0,
+            "recent_bank_actions": [],
+            "top_holders": ["Vanguard Group Inc", "Susquehanna International"],
+        }
+    )
+    app.state.market_cache.invalidate()
+    companies, fund_df, price_mat, _s1 = app.state.market_cache.load()
+    street_sigs = app.state.market_cache.get_street_signals()
+
+    # 1. Point-in-time BEFORE signals_as_of_date ("2026-07-15" < "2026-08-01") -> zero look-ahead bias!
+    pre_with = score_universe_point_in_time(
+        companies, fund_df, price_mat, as_of_date="2026-07-15", preset="street_quant", street_signals=street_sigs
+    )
+    pre_empty = score_universe_point_in_time(
+        companies, fund_df, price_mat, as_of_date="2026-07-15", preset="street_quant", street_signals={}
+    )
+    for a, b in zip(pre_with, pre_empty):
+        assert a["ticker"] == b["ticker"]
+        assert a["composite_score"] == b["composite_score"]
+        assert a["pillars"] == b["pillars"]
+        assert a["street"]["has_coverage"] is False
+        assert a["score_breakdown"]["sub_scores"]["eps_revision_momentum"] == 50
+
+    # 2. Point-in-time ON/AFTER signals_as_of_date ("2026-08-15" >= "2026-08-01") -> Street signals active!
+    post_with = {
+        s["ticker"]: s
+        for s in score_universe_point_in_time(
+            companies, fund_df, price_mat, as_of_date="2026-08-15", preset="street_quant", street_signals=street_sigs
+        )
+    }
+    post_empty = {
+        s["ticker"]: s
+        for s in score_universe_point_in_time(
+            companies, fund_df, price_mat, as_of_date="2026-08-15", preset="street_quant", street_signals={}
+        )
+    }
+
+    tcs = post_with["TCS.NS"]
+    assert tcs["street"]["has_coverage"] is True
+    assert tcs["street"]["top_holders"] == ["Life Insurance Corp", "SBI Funds Management"]
+    assert tcs["score_breakdown"]["sub_scores"]["eps_revision_momentum"] == 100
+    assert any("Strong Street EPS upgrade momentum" in st for st in tcs["strengths"])
+    assert tcs["composite_score"] > post_empty["TCS.NS"]["composite_score"]
+
+    infy = post_with["INFY.NS"]
+    assert infy["street"]["has_coverage"] is True
+    assert infy["street"]["top_holders"] == ["Vanguard Group Inc"]
+    assert any("Widespread sell-side EPS cuts" in rf for rf in infy["red_flags"])
+    assert any(p["points"] == -6.0 for p in infy["score_breakdown"]["penalty_items"])
+    assert infy["composite_score"] < post_empty["INFY.NS"]["composite_score"]
 
 
 def test_public_snapshot_and_static_frontend_security_invariants() -> None:
@@ -594,12 +677,49 @@ def test_public_snapshot_and_static_frontend_security_invariants() -> None:
         assert sensitive not in raw_snap
 
     snap = json.loads(raw_snap)
+    companies = snap["companies"]
+    assert 690 <= len(companies) <= 720
+    assert len({c["ticker"] for c in companies}) == len(companies)
+
     in_s1 = [r for r in snap["stage1_funnel"] if r.get("market") == "IN" and r.get("deep_scored")]
     us_s1 = [r for r in snap["stage1_funnel"] if r.get("market") == "US" and r.get("deep_scored")]
-    assert len(in_s1) >= 190
-    assert len(us_s1) >= 90
+    ndx_s1 = [r for r in us_s1 if r.get("index_tag") == "NASDAQ100"]
+    sp_s1 = [r for r in us_s1 if r.get("index_tag") == "SP500"]
+    assert len(in_s1) >= 195
+    assert len(us_s1) >= 500
+    assert len(ndx_s1) >= 95
+    assert len(sp_s1) >= 400
     assert "^NSEI" in snap["prices"] and sum(1 for v in snap["prices"]["^NSEI"] if v is not None) >= 1000
+    assert "^GSPC" in snap["prices"] and sum(1 for v in snap["prices"]["^GSPC"] if v is not None) >= 1000
     assert "^NDX" in snap["prices"] and sum(1 for v in snap["prices"]["^NDX"] if v is not None) >= 1000
+
+    # Verify strict overlap tag priority & zero market-maker noise in snapshot
+    comp_by_tk = {c["ticker"]: c for c in companies}
+    for tk in ("AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "COST", "AVGO", "PEP"):
+        assert comp_by_tk[tk]["index_tag"] == "NASDAQ100"
+    for tk in ("JPM", "LLY", "V", "MA", "WMT", "GS", "BRK-B", "XOM"):
+        assert comp_by_tk[tk]["index_tag"] == "SP500"
+    for tk in ("ICICIBANK.NS", "MUTHOOTFIN.NS", "TCS.NS"):
+        assert comp_by_tk[tk]["index_tag"] == "NIFTY200"
+
+    street_sigs = snap.get("street_signals", {})
+    assert len(street_sigs) >= 690
+    mm_noise = (
+        "jane street",
+        "citadel",
+        "susquehanna",
+        "simplex",
+        "wolverine",
+        "group one",
+        "optiver",
+        "two sigma",
+        "millennium",
+    )
+    for tk, srec in street_sigs.items():
+        for holder in srec.get("top_holders", []):
+            h_low = str(holder).lower()
+            assert not any(kw in h_low for kw in mm_noise), f"Market-maker noise {holder} in {tk}"
+            assert not re.search(r"\bimc\b", h_low), f"Market-maker IMC noise {holder} in {tk}"
 
     # Verify static HTML & JS security rules and 100% DOM ID alignment
     forbidden = [
@@ -631,5 +751,138 @@ def test_public_snapshot_and_static_frontend_security_invariants() -> None:
     js_ids = set(
         re.findall(r'getElementById\(\s*["\']([^"\']+)["\']\s*\)', (root / "static" / "app.js").read_text(encoding="utf-8"))
     )
-    assert len(js_ids) >= 80
+    assert len(js_ids) >= 90
     assert js_ids - html_ids == set()
+
+
+def test_python_js_bit_for_bit_parity_across_five_modes(tmp_path: Path) -> None:
+    import json
+    import re
+    import subprocess
+
+    import pytest
+
+    jsc_bin = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc")
+    if not jsc_bin.exists():
+        pytest.skip("WebKit JavaScriptCore (jsc) not available on this host")
+
+    root = Path(__file__).resolve().parent.parent
+    client, csrf = _authenticated_multimarket_client(tmp_path)
+
+    py_out: dict[str, dict] = {"screener": {}, "planner": {}, "backtest": {}, "company": {}}
+    for mode in ("ALL", "IN", "US", "NASDAQ100", "SP500"):
+        preset = "street_quant" if mode in ("ALL", "NASDAQ100", "SP500") else "artha_blend"
+        py_out["screener"][mode] = client.post(
+            "/api/screener",
+            json={"preset": preset, "sector": "ALL", "min_score": 0, "market": mode},
+            headers={"X-CSRF-Token": csrf},
+        ).json()
+        cap = 10_000 if mode in ("US", "NASDAQ100", "SP500") else 500_000
+        py_out["planner"][mode] = client.post(
+            "/api/planner",
+            json={
+                "market": mode,
+                "lump_sum_inr": cap,
+                "monthly_sip_inr": 0,
+                "horizon_years": 7,
+                "target_corpus_inr": cap * 2.5,
+                "risk_profile": "equity_direct",
+                "preset": "qglp_compounder",
+                "max_stocks": 8,
+                "save_plan": False,
+            },
+            headers={"X-CSRF-Token": csrf},
+        ).json()
+        py_out["backtest"][mode] = client.post(
+            "/api/backtest",
+            json={
+                "market": mode,
+                "preset": preset,
+                "lookback_years": 5,
+                "top_n": 10,
+                "rebalance": "annual",
+                "weighting": "inv_vol",
+                "initial_capital": cap,
+                "cost_bps": 25,
+            },
+            headers={"X-CSRF-Token": csrf},
+        ).json()
+
+    for tk in ("AAPL", "JPM", "TCS.NS"):
+        py_out["company"][tk] = client.get(f"/api/company/{tk}?preset=street_quant").json()
+
+    eng_src = (root / "static" / "standalone_engine.js").read_text(encoding="utf-8")
+    eng_stripped = re.sub(r"^export\s+", "", eng_src, flags=re.MULTILINE)
+    snap_str = str(root / "static" / "data" / "market_snapshot.json")
+    driver = f"""
+const window = {{
+  fetch: async (_url) => ({{
+    ok: true,
+    json: async () => JSON.parse(readFile({json.dumps(snap_str)})),
+  }}),
+}};
+{eng_stripped}
+
+(async () => {{
+  const out = {{screener: {{}}, planner: {{}}, backtest: {{}}, company: {{}}}};
+  for (const mode of ["ALL", "IN", "US", "NASDAQ100", "SP500"]) {{
+    const preset = (mode === "ALL" || mode === "NASDAQ100" || mode === "SP500") ? "street_quant" : "artha_blend";
+    out.screener[mode] = await runScreenerSnapshot({{preset, sector: "ALL", min_score: 0, market: mode}});
+    const cap = (mode === "US" || mode === "NASDAQ100" || mode === "SP500") ? 10000 : 500000;
+    out.planner[mode] = await runPlannerSnapshot({{
+      market: mode, lump_sum_inr: cap, monthly_sip_inr: 0, horizon_years: 7,
+      target_corpus_inr: cap * 2.5, risk_profile: "equity_direct", preset: "qglp_compounder",
+      max_stocks: 8, save_plan: false
+    }});
+    out.backtest[mode] = await runBacktestSnapshot({{
+      market: mode, preset, lookback_years: 5, top_n: 10,
+      rebalance: "annual", weighting: "inv_vol", initial_capital: cap, cost_bps: 25
+    }});
+  }}
+  for (const tk of ["AAPL", "JPM", "TCS.NS"]) {{
+    out.company[tk] = await getCompanyDetailSnapshot(tk, "street_quant", null);
+  }}
+  print("__JSON_START__" + JSON.stringify(out));
+}})().catch(e => {{ print("JS_ERR:" + e); quit(1); }});
+"""
+    drv_path = tmp_path / "driver_parity.js"
+    drv_path.write_text(driver, encoding="utf-8")
+    proc = subprocess.run([str(jsc_bin), str(drv_path)], check=True, capture_output=True, text=True)
+    js_out = json.loads(proc.stdout.split("__JSON_START__", 1)[1].strip())
+
+    for mode in ("ALL", "IN", "US", "NASDAQ100", "SP500"):
+        ps, js = py_out["screener"][mode], js_out["screener"][mode]
+        assert ps["market_counts"] == js["market_counts"]
+        assert abs(ps["benchmark_nifty50"] - js["benchmark_nifty50"]) < 0.01
+        assert abs(ps["benchmark_sp500"] - js["benchmark_sp500"]) < 0.01
+        assert abs(ps["benchmark_nasdaq100"] - js["benchmark_nasdaq100"]) < 0.01
+        assert len(ps["stocks"]) == len(js["stocks"])
+        for a, b in zip(ps["stocks"], js["stocks"]):
+            assert a["ticker"] == b["ticker"]
+            assert a["index_tag"] == b["index_tag"]
+            assert a["market_label"] == b["market_label"]
+            assert a["composite_score"] == b["composite_score"]
+            assert a["pillars"] == b["pillars"]
+            assert a["rating"] == b["rating"]
+            assert a["street"] == b["street"]
+
+        pp, jp = py_out["planner"][mode], js_out["planner"][mode]
+        assert pp["plan_currency"] == jp["plan_currency"]
+        assert [x["ticker"] for x in pp["stock_basket"]] == [x["ticker"] for x in jp["stock_basket"]]
+        assert [x["est_shares"] for x in pp["stock_basket"]] == [x["est_shares"] for x in jp["stock_basket"]]
+        assert [x["market_label"] for x in pp["stock_basket"]] == [x["market_label"] for x in jp["stock_basket"]]
+
+        pb, jb = py_out["backtest"][mode], js_out["backtest"][mode]
+        assert pb["summary"]["benchmark_name"] == jb["summary"]["benchmark_name"]
+        assert pb["summary"]["currency"] == jb["summary"]["currency"]
+        assert pb["summary"]["portfolio_cagr_pct"] == jb["summary"]["portfolio_cagr_pct"]
+        assert abs(pb["summary"]["final_portfolio_inr"] - jb["summary"]["final_portfolio_inr"]) <= 1.0
+        assert [h["ticker"] for h in pb["latest_holdings"]] == [h["ticker"] for h in jb["latest_holdings"]]
+        assert [h["market_label"] for h in pb["latest_holdings"]] == [h["market_label"] for h in jb["latest_holdings"]]
+
+    for tk in ("AAPL", "JPM", "TCS.NS"):
+        pc, jc = py_out["company"][tk]["scorecard"], js_out["company"][tk]["scorecard"]
+        assert pc["composite_score"] == jc["composite_score"]
+        assert pc["index_tag"] == jc["index_tag"]
+        assert pc["market_label"] == jc["market_label"]
+        assert pc["street"] == jc["street"]

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ArthaQuant V2 — NSE &amp; Nasdaq-100 Stock Rankings, Score Reasoning &amp; Wealth Planner</title>
+  <title>ArthaQuant V2.5 — Nifty 200, Nasdaq 100 &amp; S&amp;P 500 Rankings, Street Consensus &amp; Wealth Planner</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -17,7 +17,7 @@
         <span class="brand-badge">AQ</span>
         <div>
           <h1>ArthaQuant Global</h1>
-          <p class="subtitle">NSE Nifty-200 &amp; US Nasdaq-100 Rankings, Score Reasoning &amp; Wealth Planner</p>
+          <p class="subtitle">Nifty 200, Nasdaq 100 &amp; S&amp;P 500 Rankings, Street Consensus &amp; Wealth Planner</p>
         </div>
       </div>
       <p id="auth-subtitle" class="auth-desc"></p>
@@ -31,6 +31,7 @@
       </form>
       <div class="firm-pills">
         <span class="pill">QGLP Compounders</span>
+        <span class="pill">Street EPS Revisions</span>
         <span class="pill">Marcellus Coffee-Can</span>
         <span class="pill">Greenblatt Magic Formula</span>
         <span class="pill">Piotroski 9-Point</span>
@@ -46,10 +47,11 @@
         <div>
           <div class="brand-title">
             <span>ArthaQuant</span>
-            <span class="tag-nse">NSE NIFTY 200</span>
+            <span class="tag-nse">NIFTY 200</span>
             <span class="tag-nasdaq">NASDAQ 100</span>
+            <span class="tag-sp500">S&amp;P 500</span>
           </div>
-          <div id="market-status-line" class="subtitle">Loading audited Indian NSE &amp; US Nasdaq-100 fundamentals...</div>
+          <div id="market-status-line" class="subtitle">Loading audited Nifty 200, Nasdaq 100 &amp; S&amp;P 500 fundamentals + Street consensus...</div>
         </div>
       </div>
 
@@ -102,23 +104,33 @@
           <!-- Market Switcher Row -->
           <div class="market-bar-row">
             <div class="market-bar-label">
-              <span class="drawer-heading">Equity Market Universe</span>
-              <span class="muted-note">Every company displays its Indian NSE or US Nasdaq-100 listing &amp; native currency</span>
+              <span class="drawer-heading">Equity Market &amp; Index Priority Universe</span>
+              <span id="screener-market-sub" class="muted-note">Index tag priority: NASDAQ 100 &gt; S&amp;P 500 &gt; NIFTY 200 • Dual-listed US overlap names carry the NASDAQ 100 tag</span>
             </div>
             <div id="screener-market-switcher" class="market-switcher" role="group" aria-label="Screener Market Filter">
-              <button type="button" class="market-btn active" data-market="ALL">
-                <span>All Markets</span>
+              <button type="button" class="market-btn active" data-market="ALL" title="All audited Indian Nifty 200 and US Nasdaq 100 + S&amp;P 500 stocks">
+                <span>All Global</span>
                 <span id="mkt-count-all" class="ms-count"></span>
               </button>
-              <button type="button" class="market-btn market-btn-in" data-market="IN">
+              <button type="button" class="market-btn market-btn-in" data-market="IN" title="Indian NSE Nifty 200 stocks (₹ INR)">
                 <span class="ms-dot ms-dot-in"></span>
-                <span>Indian Stocks (NSE)</span>
+                <span>India · Nifty 200</span>
                 <span id="mkt-count-in" class="ms-count"></span>
               </button>
-              <button type="button" class="market-btn market-btn-us" data-market="US">
+              <button type="button" class="market-btn market-btn-us" data-market="US" title="All US stocks (Nasdaq 100 + S&amp;P 500 combined)">
                 <span class="ms-dot ms-dot-us"></span>
-                <span>US Stocks (Nasdaq-100)</span>
+                <span>All US</span>
                 <span id="mkt-count-us" class="ms-count"></span>
+              </button>
+              <button type="button" class="market-btn market-btn-nasdaq" data-market="NASDAQ100" title="Canonical Nasdaq 100 stocks — takes tag priority when also in S&amp;P 500">
+                <span class="ms-dot ms-dot-nasdaq"></span>
+                <span>US · Nasdaq 100</span>
+                <span id="mkt-count-nasdaq" class="ms-count"></span>
+              </button>
+              <button type="button" class="market-btn market-btn-sp500" data-market="SP500" title="S&amp;P 500 non-Nasdaq constituents — overlap mega-caps carry the NASDAQ 100 tag">
+                <span class="ms-dot ms-dot-sp500"></span>
+                <span>US · S&amp;P 500</span>
+                <span id="mkt-count-sp500" class="ms-count"></span>
               </button>
             </div>
           </div>
@@ -126,12 +138,13 @@
           <div class="filter-bar-grid">
             <div>
               <label class="field-label" for="screener-search">Search Company, Ticker, or Sector</label>
-              <input id="screener-search" type="search" placeholder="Search NSE &amp; Nasdaq-100 stocks (e.g. Muthoot, NVDA, MSFT, ICICI, Apple, Dixon)..." class="input-control" />
+              <input id="screener-search" type="search" placeholder="Search Nifty 200, Nasdaq 100 &amp; S&amp;P 500 stocks (e.g. NVDA, JPM, LLY, MSFT, Muthoot, ICICI)..." class="input-control" />
             </div>
             <div>
               <label class="field-label" for="screener-preset">Scoring Philosophy (Ranking Model)</label>
               <select id="screener-preset" class="input-control">
                 <option value="qglp_compounder" selected>Long-Term QGLP Compounder (Recommended)</option>
+                <option value="street_quant">Street EPS Revisions + Quant Compounder</option>
                 <option value="coffee_can">Marcellus Coffee-Can (55% Moat + 30% Growth)</option>
                 <option value="magic_formula">Greenblatt Magic Formula (Quality + Value)</option>
                 <option value="artha_blend">Balanced 4-Factor Blend</option>
@@ -220,19 +233,27 @@
           <div class="market-bar-row">
             <div class="market-bar-label">
               <span class="drawer-heading">Deployment Universe &amp; Plan Currency</span>
-              <span class="muted-note" id="pl-market-sub">Select Indian NSE (₹ INR), US Nasdaq-100 ($ USD), or Global All-Market deployment</span>
+              <span class="muted-note" id="pl-market-sub">Select India · Nifty 200 (₹ INR), US · Nasdaq 100 / S&amp;P 500 ($ USD), or Global All-Market deployment</span>
             </div>
             <div id="planner-market-switcher" class="market-switcher" role="group" aria-label="Planner Market Filter">
-              <button type="button" class="market-btn active" data-market="ALL">
-                <span>All Markets (₹ INR)</span>
+              <button type="button" class="market-btn active" data-market="ALL" title="Global compounder deployment (₹ INR)">
+                <span>All Global</span>
               </button>
-              <button type="button" class="market-btn market-btn-in" data-market="IN">
+              <button type="button" class="market-btn market-btn-in" data-market="IN" title="Indian NSE Nifty 200 deployment (₹ INR)">
                 <span class="ms-dot ms-dot-in"></span>
-                <span>Indian Stocks (NSE · ₹)</span>
+                <span>India · Nifty 200</span>
               </button>
-              <button type="button" class="market-btn market-btn-us" data-market="US">
+              <button type="button" class="market-btn market-btn-us" data-market="US" title="All US compounders — Nasdaq 100 + S&amp;P 500 ($ USD)">
                 <span class="ms-dot ms-dot-us"></span>
-                <span>US Stocks (Nasdaq-100 · $)</span>
+                <span>All US</span>
+              </button>
+              <button type="button" class="market-btn market-btn-nasdaq" data-market="NASDAQ100" title="US Nasdaq 100 compounders ($ USD)">
+                <span class="ms-dot ms-dot-nasdaq"></span>
+                <span>US · Nasdaq 100</span>
+              </button>
+              <button type="button" class="market-btn market-btn-sp500" data-market="SP500" title="US S&amp;P 500 non-Nasdaq compounders ($ USD) — overlap names carry NASDAQ 100 tag">
+                <span class="ms-dot ms-dot-sp500"></span>
+                <span>US · S&amp;P 500</span>
               </button>
             </div>
           </div>
@@ -330,19 +351,27 @@
           <div class="market-bar-row">
             <div class="market-bar-label">
               <span class="drawer-heading">Backtest Market &amp; Benchmark Index</span>
-              <span class="muted-note">Simulates point-in-time portfolios vs. Nifty 50 (^NSEI) or Nasdaq 100 (^NDX)</span>
+              <span class="muted-note">Simulates point-in-time portfolios vs. Nifty 50 (^NSEI), S&amp;P 500 (^GSPC), or Nasdaq 100 (^NDX)</span>
             </div>
             <div id="bt-market-switcher" class="market-switcher" role="group" aria-label="Backtest Market Filter">
-              <button type="button" class="market-btn" data-market="ALL">
-                <span>All Markets</span>
+              <button type="button" class="market-btn" data-market="ALL" title="Global universe vs. Nifty 50 (^NSEI)">
+                <span>All Global</span>
               </button>
-              <button type="button" class="market-btn market-btn-in active" data-market="IN">
+              <button type="button" class="market-btn market-btn-in active" data-market="IN" title="India Nifty 200 vs. Nifty 50 (^NSEI)">
                 <span class="ms-dot ms-dot-in"></span>
-                <span>Indian Stocks (NSE)</span>
+                <span>India · Nifty 200</span>
               </button>
-              <button type="button" class="market-btn market-btn-us" data-market="US">
+              <button type="button" class="market-btn market-btn-us" data-market="US" title="All US (Nasdaq 100 + S&amp;P 500) vs. S&amp;P 500 (^GSPC)">
                 <span class="ms-dot ms-dot-us"></span>
-                <span>US Stocks (Nasdaq-100)</span>
+                <span>All US</span>
+              </button>
+              <button type="button" class="market-btn market-btn-nasdaq" data-market="NASDAQ100" title="US Nasdaq 100 vs. Nasdaq 100 (^NDX)">
+                <span class="ms-dot ms-dot-nasdaq"></span>
+                <span>US · Nasdaq 100</span>
+              </button>
+              <button type="button" class="market-btn market-btn-sp500" data-market="SP500" title="US S&amp;P 500 non-Nasdaq stocks vs. S&amp;P 500 (^GSPC) — overlap names carry NASDAQ 100 tag">
+                <span class="ms-dot ms-dot-sp500"></span>
+                <span>US · S&amp;P 500</span>
               </button>
             </div>
           </div>
@@ -352,6 +381,7 @@
               <label class="field-label" for="bt-preset">Strategy Model</label>
               <select id="bt-preset" class="input-control">
                 <option value="qglp_compounder" selected>Long-Term QGLP Compounder</option>
+                <option value="street_quant">Street EPS Revisions + Quant Compounder</option>
                 <option value="coffee_can">Marcellus Coffee-Can</option>
                 <option value="magic_formula">Greenblatt Magic Formula</option>
                 <option value="artha_blend">Balanced Multi-Factor</option>

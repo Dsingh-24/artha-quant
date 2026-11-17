@@ -13,7 +13,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "arthaquant.db"
 
@@ -75,6 +75,7 @@ class Database:
                     data_source TEXT NOT NULL DEFAULT 'real_nse_live',
                     market TEXT NOT NULL DEFAULT 'IN',
                     currency TEXT NOT NULL DEFAULT 'INR',
+                    index_tag TEXT NOT NULL DEFAULT 'NIFTY200',
                     updated_at INTEGER NOT NULL
                 );
 
@@ -96,6 +97,7 @@ class Database:
                     deep_scored INTEGER NOT NULL DEFAULT 0,
                     market TEXT NOT NULL DEFAULT 'IN',
                     currency TEXT NOT NULL DEFAULT 'INR',
+                    index_tag TEXT NOT NULL DEFAULT 'NIFTY200',
                     updated_at INTEGER NOT NULL
                 );
 
@@ -163,6 +165,34 @@ class Database:
                     updated_at INTEGER NOT NULL,
                     FOREIGN KEY (ticker) REFERENCES companies(ticker) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS company_street_signals (
+                    ticker TEXT PRIMARY KEY,
+                    signals_as_of_date TEXT NOT NULL,
+                    analyst_count INTEGER DEFAULT 0,
+                    strong_buy_count INTEGER DEFAULT 0,
+                    buy_count INTEGER DEFAULT 0,
+                    hold_count INTEGER DEFAULT 0,
+                    sell_count INTEGER DEFAULT 0,
+                    strong_sell_count INTEGER DEFAULT 0,
+                    consensus_buy_pct REAL DEFAULT 0.0,
+                    recommendation_key TEXT DEFAULT 'none',
+                    target_mean_price REAL DEFAULT 0.0,
+                    target_high_price REAL DEFAULT 0.0,
+                    target_low_price REAL DEFAULT 0.0,
+                    forward_pe REAL DEFAULT 0.0,
+                    fwd_eps_growth_fy1_pct REAL DEFAULT 0.0,
+                    fwd_eps_growth_fy2_pct REAL DEFAULT 0.0,
+                    eps_rev_up_30d INTEGER DEFAULT 0,
+                    eps_rev_down_30d INTEGER DEFAULT 0,
+                    eps_rev_up_90d INTEGER DEFAULT 0,
+                    eps_rev_down_90d INTEGER DEFAULT 0,
+                    rev_breadth_pct REAL DEFAULT 0.0,
+                    inst_held_pct REAL DEFAULT 0.0,
+                    recent_bank_actions_json TEXT DEFAULT '[]',
+                    top_holders_json TEXT DEFAULT '[]',
+                    updated_at TEXT
+                );
                 """
             )
             # Ensure backward-compatible migration if existing DB lacks newer columns
@@ -175,12 +205,30 @@ class Database:
                 conn.execute("ALTER TABLE companies ADD COLUMN market TEXT NOT NULL DEFAULT 'IN'")
             if "currency" not in cols:
                 conn.execute("ALTER TABLE companies ADD COLUMN currency TEXT NOT NULL DEFAULT 'INR'")
+            if "index_tag" not in cols:
+                conn.execute("ALTER TABLE companies ADD COLUMN index_tag TEXT NOT NULL DEFAULT 'NIFTY200'")
+                conn.execute("UPDATE companies SET index_tag = 'NIFTY200' WHERE market = 'IN'")
+                conn.execute("UPDATE companies SET index_tag = 'NASDAQ100' WHERE market = 'US' AND index_tag = 'NIFTY200'")
+            else:
+                conn.execute(
+                    "UPDATE companies SET index_tag = 'NIFTY200' WHERE market = 'IN' AND (index_tag IS NULL OR index_tag = '')"
+                )
 
             s1_cols = {r["name"] for r in conn.execute("PRAGMA table_info(stage1_funnel)").fetchall()}
             if "market" not in s1_cols:
                 conn.execute("ALTER TABLE stage1_funnel ADD COLUMN market TEXT NOT NULL DEFAULT 'IN'")
             if "currency" not in s1_cols:
                 conn.execute("ALTER TABLE stage1_funnel ADD COLUMN currency TEXT NOT NULL DEFAULT 'INR'")
+            if "index_tag" not in s1_cols:
+                conn.execute("ALTER TABLE stage1_funnel ADD COLUMN index_tag TEXT NOT NULL DEFAULT 'NIFTY200'")
+                conn.execute("UPDATE stage1_funnel SET index_tag = 'NIFTY200' WHERE market = 'IN'")
+                conn.execute(
+                    "UPDATE stage1_funnel SET index_tag = 'NASDAQ100' WHERE market = 'US' AND index_tag = 'NIFTY200'"
+                )
+            else:
+                conn.execute(
+                    "UPDATE stage1_funnel SET index_tag = 'NIFTY200' WHERE market = 'IN' AND (index_tag IS NULL OR index_tag = '')"
+                )
 
     # --- User & Session Management ---
 
@@ -248,8 +296,11 @@ class Database:
             if syn_cnt > 0:
                 conn.execute("DELETE FROM daily_prices WHERE ticker = ?", ("^NSEI",))
             conn.execute(
-                "DELETE FROM daily_prices WHERE ticker NOT IN (SELECT ticker FROM companies) AND ticker NOT IN (?, ?)",
-                ("^NSEI", "^NDX"),
+                "DELETE FROM daily_prices WHERE ticker NOT IN (SELECT ticker FROM companies) AND ticker NOT IN (?, ?, ?)",
+                ("^NSEI", "^NDX", "^GSPC"),
+            )
+            conn.execute(
+                "DELETE FROM company_street_signals WHERE ticker NOT IN (SELECT ticker FROM companies)"
             )
 
     def count_companies(self) -> int:
@@ -274,16 +325,18 @@ class Database:
         inst_pct: float = 0.0,
         market: str = "IN",
         currency: str = "INR",
+        index_tag: Optional[str] = None,
     ) -> None:
         now = int(time.time())
+        resolved_tag = index_tag or ("NIFTY200" if market == "IN" else "NASDAQ100")
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO companies (
                     ticker, name, sector, cap_tier, is_financial, promoter_pct, inst_pct,
-                    data_source, market, currency, updated_at
+                    data_source, market, currency, index_tag, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ticker) DO UPDATE SET
                     name = excluded.name,
                     sector = excluded.sector,
@@ -294,6 +347,7 @@ class Database:
                     data_source = excluded.data_source,
                     market = excluded.market,
                     currency = excluded.currency,
+                    index_tag = excluded.index_tag,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -307,6 +361,7 @@ class Database:
                     data_source,
                     market,
                     currency,
+                    resolved_tag,
                     now,
                 ),
             )
@@ -316,6 +371,9 @@ class Database:
         normalized: List[Tuple[Any, ...]] = []
         for r in rows:
             if isinstance(r, dict):
+                mkt = str(r.get("market", "IN"))
+                ccy = str(r.get("currency", "INR" if mkt == "IN" else "USD"))
+                idx_tag = str(r.get("index_tag") or ("NIFTY200" if mkt == "IN" else "NASDAQ100"))
                 normalized.append(
                     (
                         r["ticker"],
@@ -334,18 +392,22 @@ class Database:
                         int(r.get("shortlisted", 0)),
                         int(r.get("deep_scored", 0)),
                         int(r.get("updated_at", now_default)),
-                        str(r.get("market", "IN")),
-                        str(r.get("currency", "INR")),
+                        mkt,
+                        ccy,
+                        idx_tag,
                     )
                 )
             else:
                 tup = tuple(r)
                 if len(tup) == 16:
-                    normalized.append((*tup, "IN", "INR"))
+                    normalized.append((*tup, "IN", "INR", "NIFTY200"))
                 elif len(tup) == 18:
+                    mkt = str(tup[16])
+                    normalized.append((*tup, "NIFTY200" if mkt == "IN" else "NASDAQ100"))
+                elif len(tup) == 19:
                     normalized.append(tup)
                 else:
-                    raise ValueError(f"Expected 16- or 18-tuple for stage1_funnel, got length {len(tup)}")
+                    raise ValueError(f"Expected 16-, 18-, or 19-tuple for stage1_funnel, got length {len(tup)}")
 
         with self.connect() as conn:
             conn.executemany(
@@ -353,8 +415,9 @@ class Database:
                 INSERT INTO stage1_funnel (
                     ticker, name, sector, industry, last_price, ret_6m_pct, mom_12_1_pct,
                     volatility_pct, dist_52w_high_pct, above_200dma, avg_turnover_cr,
-                    stage1_score, stage1_rank, shortlisted, deep_scored, updated_at, market, currency
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    stage1_score, stage1_rank, shortlisted, deep_scored, updated_at,
+                    market, currency, index_tag
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ticker) DO UPDATE SET
                     name = excluded.name,
                     sector = excluded.sector,
@@ -372,6 +435,7 @@ class Database:
                     deep_scored = MAX(stage1_funnel.deep_scored, excluded.deep_scored),
                     market = excluded.market,
                     currency = excluded.currency,
+                    index_tag = excluded.index_tag,
                     updated_at = excluded.updated_at
                 """,
                 normalized,
@@ -394,7 +458,8 @@ class Database:
                 """
                 SELECT ticker, name, sector, industry, last_price, ret_6m_pct, mom_12_1_pct,
                        volatility_pct, dist_52w_high_pct, above_200dma, avg_turnover_cr,
-                       stage1_score, stage1_rank, shortlisted, deep_scored, market, currency, updated_at
+                       stage1_score, stage1_rank, shortlisted, deep_scored,
+                       market, currency, index_tag, updated_at
                 FROM stage1_funnel
                 ORDER BY stage1_rank ASC, stage1_score DESC
                 """
@@ -404,7 +469,7 @@ class Database:
     def get_next_unscored_funnel_tickers(self, limit: int = 25) -> List[Dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT ticker, name, sector, market, currency FROM stage1_funnel WHERE deep_scored = 0 AND market = 'IN' ORDER BY stage1_rank ASC LIMIT ?",
+                "SELECT ticker, name, sector, market, currency, index_tag FROM stage1_funnel WHERE deep_scored = 0 AND market = 'IN' ORDER BY stage1_rank ASC LIMIT ?",
                 (limit,),
             ).fetchall()
             return [dict(r) for r in rows]
@@ -462,7 +527,7 @@ class Database:
             rows = conn.execute(
                 """
                 SELECT ticker, name, sector, cap_tier, is_financial, promoter_pct, inst_pct,
-                       data_source, market, currency, updated_at
+                       data_source, market, currency, index_tag, updated_at
                 FROM companies
                 ORDER BY ticker ASC
                 """
@@ -474,7 +539,7 @@ class Database:
             row = conn.execute(
                 """
                 SELECT ticker, name, sector, cap_tier, is_financial, promoter_pct, inst_pct,
-                       data_source, market, currency, updated_at
+                       data_source, market, currency, index_tag, updated_at
                 FROM companies
                 WHERE ticker = ?
                 """,
@@ -547,6 +612,118 @@ class Database:
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM company_quarterly_signals").fetchall()
             return {r["ticker"]: dict(r) for r in rows}
+
+    def upsert_street_signals(self, signals: Union[Dict[str, Any], Iterable[Dict[str, Any]]]) -> None:
+        items: List[Dict[str, Any]] = [signals] if isinstance(signals, dict) else list(signals)
+        if not items:
+            return
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        rows_to_write: List[Tuple[Any, ...]] = []
+        for s in items:
+            raw_actions = s.get("recent_bank_actions")
+            if raw_actions is None:
+                actions_json = str(s.get("recent_bank_actions_json") or "[]")
+            elif isinstance(raw_actions, str):
+                actions_json = raw_actions
+            else:
+                actions_json = json.dumps(raw_actions, separators=(",", ":"))
+
+            raw_holders = s.get("top_holders")
+            if raw_holders is None:
+                holders_json = str(s.get("top_holders_json") or "[]")
+            elif isinstance(raw_holders, str):
+                holders_json = raw_holders
+            else:
+                holders_json = json.dumps(raw_holders, separators=(",", ":"))
+
+            rows_to_write.append(
+                (
+                    str(s["ticker"]),
+                    str(s.get("signals_as_of_date") or "1970-01-01"),
+                    int(s.get("analyst_count") or 0),
+                    int(s.get("strong_buy_count", s.get("strong_buy", 0)) or 0),
+                    int(s.get("buy_count", s.get("buy", 0)) or 0),
+                    int(s.get("hold_count", s.get("hold", 0)) or 0),
+                    int(s.get("sell_count", s.get("sell", 0)) or 0),
+                    int(s.get("strong_sell_count", s.get("strong_sell", 0)) or 0),
+                    round(float(s.get("consensus_buy_pct") or 0.0), 1),
+                    str(s.get("recommendation_key") or "none"),
+                    round(float(s.get("target_mean_price", s.get("target_mean", 0.0)) or 0.0), 2),
+                    round(float(s.get("target_high_price", s.get("target_high", 0.0)) or 0.0), 2),
+                    round(float(s.get("target_low_price", s.get("target_low", 0.0)) or 0.0), 2),
+                    round(float(s.get("forward_pe") or 0.0), 2),
+                    round(float(s.get("fwd_eps_growth_fy1_pct") or 0.0), 2),
+                    round(float(s.get("fwd_eps_growth_fy2_pct") or 0.0), 2),
+                    int(s.get("eps_rev_up_30d") or 0),
+                    int(s.get("eps_rev_down_30d") or 0),
+                    int(s.get("eps_rev_up_90d") or 0),
+                    int(s.get("eps_rev_down_90d") or 0),
+                    round(float(s.get("rev_breadth_pct") or 0.0), 1),
+                    round(float(s.get("inst_held_pct") or 0.0), 2),
+                    actions_json,
+                    holders_json,
+                    str(s.get("updated_at") or now_iso),
+                )
+            )
+
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO company_street_signals (
+                    ticker, signals_as_of_date, analyst_count, strong_buy_count, buy_count,
+                    hold_count, sell_count, strong_sell_count, consensus_buy_pct, recommendation_key,
+                    target_mean_price, target_high_price, target_low_price, forward_pe,
+                    fwd_eps_growth_fy1_pct, fwd_eps_growth_fy2_pct,
+                    eps_rev_up_30d, eps_rev_down_30d, eps_rev_up_90d, eps_rev_down_90d,
+                    rev_breadth_pct, inst_held_pct, recent_bank_actions_json, top_holders_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker) DO UPDATE SET
+                    signals_as_of_date = excluded.signals_as_of_date,
+                    analyst_count = excluded.analyst_count,
+                    strong_buy_count = excluded.strong_buy_count,
+                    buy_count = excluded.buy_count,
+                    hold_count = excluded.hold_count,
+                    sell_count = excluded.sell_count,
+                    strong_sell_count = excluded.strong_sell_count,
+                    consensus_buy_pct = excluded.consensus_buy_pct,
+                    recommendation_key = excluded.recommendation_key,
+                    target_mean_price = excluded.target_mean_price,
+                    target_high_price = excluded.target_high_price,
+                    target_low_price = excluded.target_low_price,
+                    forward_pe = excluded.forward_pe,
+                    fwd_eps_growth_fy1_pct = excluded.fwd_eps_growth_fy1_pct,
+                    fwd_eps_growth_fy2_pct = excluded.fwd_eps_growth_fy2_pct,
+                    eps_rev_up_30d = excluded.eps_rev_up_30d,
+                    eps_rev_down_30d = excluded.eps_rev_down_30d,
+                    eps_rev_up_90d = excluded.eps_rev_up_90d,
+                    eps_rev_down_90d = excluded.eps_rev_down_90d,
+                    rev_breadth_pct = excluded.rev_breadth_pct,
+                    inst_held_pct = excluded.inst_held_pct,
+                    recent_bank_actions_json = excluded.recent_bank_actions_json,
+                    top_holders_json = excluded.top_holders_json,
+                    updated_at = excluded.updated_at
+                """,
+                rows_to_write,
+            )
+
+    def get_all_street_signals(self) -> Dict[str, Dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM company_street_signals").fetchall()
+            out: Dict[str, Dict[str, Any]] = {}
+            for r in rows:
+                d = dict(r)
+                raw_act = d.pop("recent_bank_actions_json", "[]")
+                raw_hld = d.pop("top_holders_json", "[]")
+                try:
+                    d["recent_bank_actions"] = json.loads(raw_act) if raw_act else []
+                except Exception:
+                    d["recent_bank_actions"] = []
+                try:
+                    d["top_holders"] = json.loads(raw_hld) if raw_hld else []
+                except Exception:
+                    d["top_holders"] = []
+                out[d["ticker"]] = d
+            return out
 
     def get_all_prices(self, min_date: Optional[str] = None) -> List[Dict[str, Any]]:
         with self.connect() as conn:
