@@ -1,4 +1,5 @@
-// ArthaQuant V2.5 Frontend Controller
+// ArthaQuant V3.0 Frontend Controller — Everyday-Investor Plain-English UI,
+// Simple / Pro Ratios Toggle & On-Demand AI Analyst Memo
 // Built exclusively with safe DOM creation (createElement, createElementNS, textContent)
 // and CSS class toggling.
 
@@ -44,6 +45,7 @@ const state = {
   csrfToken: null,
   needsSetup: false,
   username: null,
+  proMode: false,
   funnelView: "stage2",
   screenerMarket: "ALL",
   plannerMarket: "ALL",
@@ -55,9 +57,12 @@ const state = {
   marketCounts: { ALL: 0, IN: 0, US: 0, NASDAQ100: 0, SP500: 0 },
   presetWeightsMap: DEFAULT_PRESET_WEIGHTS,
   selectedTicker: null,
+  currentDetail: null,
   drawerOpen: false,
   backtestLoaded: false,
   plannerLoaded: false,
+  aiMemoCache: new Map(),
+  aiMemoInFlight: new Set(),
 };
 
 function el(tag, className, text) {
@@ -167,8 +172,8 @@ function fmtSigned(val, decimals = 1) {
 function formatPeVsFair(metrics) {
   if (!metrics) return "—";
   const pe = Number(metrics.pe_ratio || 0);
-  const fair = Number(metrics.fair_pe || 0);
-  if (pe >= 99 || pe <= 0) return `N/M (Fair ~${fair}x)`;
+  const fair = Math.round(Number(metrics.fair_pe || 0));
+  if (pe >= 99 || pe <= 0) return fair > 0 ? `N/M (Fair ~${fair}x)` : "N/M (Unprofitable)";
   return `${pe.toFixed(1)}x (Fair ~${fair}x)`;
 }
 
@@ -183,9 +188,585 @@ function createValZonePill(zone) {
   const z = String(zone || "Fair GARP Price");
   let cls = "val-zone-pill zone-fair";
   if (z.includes("Undervalued")) cls = "val-zone-pill zone-good";
-  else if (z.includes("Overvalued")) cls = "val-zone-pill zone-over";
-  else if (z.includes("Rich")) cls = "val-zone-pill zone-rich";
+  else if (z.includes("Overvalued") || z.includes("Unprofitable") || z.includes("Loss")) {
+    cls = "val-zone-pill zone-over";
+  } else if (z.includes("Rich")) {
+    cls = "val-zone-pill zone-rich";
+  }
   return el("span", cls, z);
+}
+
+function createFriendlyValZonePill(stock, proMode = false) {
+  const rawZone = String((stock && stock.valuation_zone) || "Fair GARP Price");
+  if (proMode) {
+    return createValZonePill(rawZone);
+  }
+  const m = (stock && stock.metrics) || {};
+  const pe = Number(m.pe_ratio || 0);
+  const archCode = stock && stock.plain_english ? stock.plain_english.archetype_code : "";
+  if (archCode === "loss_turnaround" || pe >= 99 || pe <= 0) {
+    return el("span", "val-zone-pill zone-over", "Currently Unprofitable");
+  }
+  if (rawZone.includes("Undervalued")) {
+    return el("span", "val-zone-pill zone-good", "Attractive Bargain Price");
+  }
+  if (rawZone.includes("Overvalued")) {
+    return el("span", "val-zone-pill zone-over", "Expensive Today");
+  }
+  if (rawZone.includes("Rich")) {
+    return el("span", "val-zone-pill zone-rich", "Slightly Expensive");
+  }
+  return el("span", "val-zone-pill zone-fair", "Fairly Priced Today");
+}
+
+function archetypeClass(code) {
+  const c = String(code || "");
+  if (c === "loss_turnaround") return "archetype-pill arch-turnaround";
+  if (c === "financial_lender") return "archetype-pill arch-financial";
+  if (c === "buyback_compounder") return "archetype-pill arch-buyback";
+  if (c === "regulated_infra") return "archetype-pill arch-infra";
+  if (c === "cyclical_commodity") return "archetype-pill arch-cyclical";
+  return "archetype-pill arch-secular";
+}
+
+function createArchetypePill(pe) {
+  const label = (pe && pe.archetype_label) || "Steady Operating Business";
+  return el("span", archetypeClass(pe && pe.archetype_code), label);
+}
+
+function verdictTagClass(tag) {
+  const t = String(tag || "").toLowerCase();
+  if (t.includes("standout")) return "verdict-tag-pill vtag-standout";
+  if (t.includes("solid")) return "verdict-tag-pill vtag-solid";
+  if (t.includes("mixed") || t.includes("fair")) return "verdict-tag-pill vtag-mixed";
+  return "verdict-tag-pill vtag-weak";
+}
+
+function toneClass(tone) {
+  const t = String(tone || "neutral");
+  if (t === "good") return "tone-good";
+  if (t === "warn") return "tone-warn";
+  if (t === "bad") return "tone-bad";
+  return "tone-neutral";
+}
+
+function formatPlainPenaltyReason(rawReason) {
+  const r = String(rawReason || "").trim();
+  if (!r) return "Safety caution triggered on recent financial check";
+
+  if (r.includes("Loss-making") || r.includes("PAT <= 0")) {
+    return "Unprofitable in the latest year (company reported a net loss)";
+  }
+  if (r.includes("Inconsistent profitability")) {
+    const m = r.match(/\((\d+\/\d+)\s+profitable/);
+    return m
+      ? `Inconsistent profits — made money in only ${m[1]} recent years`
+      : "Inconsistent year-to-year profit track record";
+  }
+  if (r.includes("sell-side EPS cuts")) {
+    const m = r.match(/\((\d+)\s+down\s+vs\s+(\d+)\s+up/);
+    return m
+      ? `Covering bank analysts recently cut profit forecasts (${m[1]} cuts vs ${m[2]} upgrades)`
+      : "Covering bank analysts recently cut their profit forecasts";
+  }
+  if (r.includes("Negative net worth") || r.includes("eroded book equity")) {
+    return "Total liabilities exceed company assets on the balance sheet";
+  }
+  if (r.includes("High corporate debt load")) {
+    const m = r.match(/D\/E\s+([\d.]+)x/);
+    return m
+      ? `Heavy debt load — total borrowings are ${m[1]}x shareholder equity`
+      : "Heavy corporate debt load relative to shareholder equity";
+  }
+  if (r.includes("cash conversion") || r.includes("CFO/EBITDA")) {
+    const m = r.match(/\((\d+%)\s+CFO\/EBITDA\)/);
+    return m
+      ? `Weak cash collection — only ${m[1]} of operating profit turned into real bank cash`
+      : "Weak conversion of reported profits into real bank cash";
+  }
+  if (r.includes("profit contraction") || r.includes("PAT CAGR")) {
+    const m = r.match(/\(([+-]?[\d.]+%)\s+3Y/);
+    return m
+      ? `Multi-year profit decline (${m[1]} per year over the last 3 years)`
+      : "Profits have declined over the past several years";
+  }
+  if (r.includes("2Q earnings slowdown")) {
+    const m = r.match(/\(([+-]?[\d.]+%)\s+YoY PAT,\s*([+-]?[\d.]+%)\s+YoY Sales/);
+    return m
+      ? `Recent quarterly slowdown (profits ${m[1]}, sales ${m[2]} vs last year)`
+      : "Recent quarterly profits slowed down compared to last year";
+  }
+  if (r.includes("Promoter/Institutional exit")) {
+    return "Founders or large institutional funds reduced their stake over the past year";
+  }
+  if (r.includes("Elevated banking NPAs")) {
+    const m = r.match(/Net NPA\s+([\d.]+%)/);
+    return m
+      ? `Higher unpaid bad loans in the lending book (${m[1]} net bad loans)`
+      : "Higher unpaid bad loans in the bank's lending portfolio";
+  }
+  if (r.includes("Commodity cyclicality risk")) {
+    const m = r.match(/swung\s+([^)]+)\)/);
+    return m
+      ? `Profits swing sharply with commodity prices (returns ranged ${m[1]})`
+      : "Profits move up and down sharply with commodity price cycles";
+  }
+  if (r.includes("Piotroski")) {
+    const m = r.match(/\((\d+\/\d+)\)/);
+    return m
+      ? `Low annual financial safety score (passed only ${m[1]} safety checks)`
+      : "Low score on the 9-point annual financial safety checklist";
+  }
+  if (r.includes("Valuation rich")) {
+    if (r.includes("99.9")) {
+      return "Currently unprofitable — stock cannot be valued on current profits yet";
+    }
+    const m = r.match(/at\s+([\d.]+x)\s+P\/E\s+\(Fair\s+~([\d.]+)x/);
+    return m
+      ? `Stock price looks expensive today at ${m[1]} profits (fair range ~${Math.round(
+          Number(m[2])
+        )}x) — consider waiting for a dip`
+      : "Stock price looks expensive today relative to company growth — consider waiting for a dip";
+  }
+
+  return r
+    .replace(/\bPAT\b/g, "Net Profit")
+    .replace(/\bTTM\b/g, "last 12 months")
+    .replace(/\bCFO\/EBITDA\b/g, "cash conversion")
+    .replace(/\bROCE\b/g, "return on capital")
+    .replace(/\bPiotroski\b/g, "financial safety")
+    .replace(/\bD\/E\b/g, "debt-to-equity");
+}
+
+function buildFallbackPlainEnglish(sc, comp = {}) {
+  const m = (sc && sc.metrics) || {};
+  const bd = resolveScoreBreakdown(sc);
+  const ccySym = stockCurrency(sc) === "USD" ? "$" : "₹";
+  const pe = Number(m.pe_ratio || 0);
+  const fairPe = Math.max(8, Math.round(Number(m.fair_pe || 20)));
+  const isLoss = pe >= 99 || pe <= 0;
+  const isFin = Boolean(sc && sc.is_financial);
+  const isBuyback = Boolean(m.buyback_equity);
+  const sec = String((sc && sc.sector) || comp.sector || "Operating");
+
+  let archetypeCode = "secular_compounder";
+  let archetypeLabel = "Cash-Rich Compounder";
+  if (isLoss) {
+    archetypeCode = "loss_turnaround";
+    archetypeLabel = "Unprofitable / Turnaround";
+  } else if (isFin) {
+    archetypeCode = "financial_lender";
+    archetypeLabel = "Banking & Financial Leader";
+  } else if (isBuyback) {
+    archetypeCode = "buyback_compounder";
+    archetypeLabel = "Share-Buyback Cash Cow";
+  } else if (sec === "Power & Energy") {
+    archetypeCode = "regulated_infra";
+    archetypeLabel = "Regulated Infrastructure";
+  } else if (sec.includes("Metals") || sec.includes("Commodit") || sec.includes("Oil")) {
+    archetypeCode = "cyclical_commodity";
+    archetypeLabel = "Cyclical / Commodity Business";
+  }
+
+  const medRet = Math.round(
+    Number(m.med_5y_roce_pct !== undefined ? m.med_5y_roce_pct : m.roce_pct || 0)
+  );
+  const scoreNum = Number((sc && sc.composite_score) || 0);
+  let oneLine = "Steady business trading near a reasonable price";
+  if (isLoss) {
+    oneLine = "Currently unprofitable — waiting for sustainable profit recovery";
+  } else if (sc && sc.rating === "Strong Buy") {
+    oneLine = isFin
+      ? "Consistent financial leader at an attractive valuation"
+      : "Strong, cash-generating business at an attractive price";
+  } else if (sc && sc.rating === "Buy") {
+    oneLine = "Solid business quality with steady growth at a reasonable price";
+  } else if (sc && sc.rating === "Hold" && (sc.pillars?.quality || 0) >= 70 && pe > fairPe * 1.25) {
+    oneLine = "High-quality business, but the stock price is expensive today";
+  } else if (sc && sc.rating === "Avoid") {
+    oneLine = "Caution advised — weak profit track record or elevated risk";
+  }
+
+  const whatItDoes =
+    (comp && comp.business_summary) ||
+    `${(sc && sc.name) || "This company"} operates in the ${sec} sector (${
+      isUSStock(sc) ? "US equity market" : "Indian NSE market"
+    }).`;
+
+  const s1 = isFin
+    ? `${sc.name} earns about ${ccySym}${medRet} in annual profit for every ${ccySym}100 of shareholder equity.`
+    : isBuyback
+    ? `${sc.name} earns ${ccySym}${medRet} per ${ccySym}100 invested; book equity looks small only because of years of share buybacks backed by strong cash flow.`
+    : `${sc.name} earns about ${ccySym}${medRet} per ${ccySym}100 invested in the business over a 5-year cycle.`;
+
+  const s2 = isLoss
+    ? `Its overall score of ${scoreNum.toFixed(1)} / 100 is held back because the business is currently unprofitable and cannot be valued on current earnings yet.`
+    : pe > fairPe * 1.3
+    ? `It scored ${scoreNum.toFixed(1)} / 100 mainly because the stock trades at ${pe.toFixed(
+        1
+      )}x profits versus a fair range near ~${fairPe}x, holding back the price score.`
+    : `It earned ${scoreNum.toFixed(1)} / 100 thanks to a balanced mix of business strength and a stock price trading at ${pe.toFixed(
+        1
+      )}x profits (fair range ~${fairPe}x).`;
+
+  const revCagr = Number(m.rev_cagr_5y_pct || 0).toFixed(1);
+  const patCagr = Number(m.pat_cagr_5y_pct || 0).toFixed(1);
+  const s3 = `Sales have compounded at ${revCagr}% per year and net profits at ${patCagr}% per year over the last 5 audited years.`;
+
+  const p = (sc && sc.pillars) || { quality: 50, growth: 50, value: 50, momentum: 50 };
+  const tagFor = (v) =>
+    v >= 75 ? "Standout" : v >= 58 ? "Solid" : v >= 42 ? "Mixed" : "Weak / Expensive";
+
+  const qualRows = isFin
+    ? [
+        {
+          simple_label: `Profit on shareholder equity`,
+          pro_label: "5Y Median ROE (Latest)",
+          simple_value: `Earns ${ccySym}${medRet} per ${ccySym}100 of equity`,
+          pro_value: `${m.med_5y_roce_pct ?? m.roce_pct ?? 0}% 5Y Med (${m.roce_pct ?? 0}% Latest)`,
+          target_hint: "15%+ signals strong banking returns",
+          tone: medRet >= 15 ? "good" : medRet >= 10 ? "neutral" : "warn",
+        },
+        {
+          simple_label: "Loan book & asset return",
+          pro_label: "ROA & Asset Quality",
+          simple_value:
+            Number(m.gnpa_pct || 0) > 0
+              ? `Net bad loans at ${m.nnpa_pct}%`
+              : `Earns ${m.roa_pct || 0}% on total banking assets`,
+          pro_value:
+            Number(m.gnpa_pct || 0) > 0
+              ? `GNPA ${m.gnpa_pct}% / NNPA ${m.nnpa_pct}%`
+              : `ROA ${m.roa_pct || 0}% (${m.profit_consistency || "5/5"} yrs PAT > 0)`,
+          target_hint: "Healthy lending cushion across cycles",
+          tone: Number(m.roa_pct || 0) >= 1.2 ? "good" : "neutral",
+        },
+      ]
+    : [
+        {
+          simple_label: `Profit per ${ccySym}100 invested`,
+          pro_label: "5Y Median ROCE (Latest)",
+          simple_value: `Earns ${ccySym}${medRet} per ${ccySym}100 invested`,
+          pro_value: `${m.med_5y_roce_pct ?? m.roce_pct ?? 0}% 5Y Med (${m.roce_pct ?? 0}% Latest)`,
+          target_hint: "18%+ signals a durable business moat",
+          tone: medRet >= 18 ? "good" : medRet >= 12 ? "neutral" : "warn",
+        },
+        {
+          simple_label: "Real cash collected from profits",
+          pro_label: "5Y Cumulative CFO / EBITDA",
+          simple_value: `${Math.round(Number(m.cfo_to_ebitda_pct || 0))}% converted into bank cash`,
+          pro_value: `${m.cfo_to_ebitda_pct || 0}% CFO/EBITDA`,
+          target_hint: "80%+ means profits turn into real cash",
+          tone: Number(m.cfo_to_ebitda_pct || 0) >= 80 ? "good" : "neutral",
+        },
+        {
+          simple_label: isBuyback ? "Cash coverage of debt (buybacks)" : "Debt safety & profit margin",
+          pro_label: isBuyback ? "CFO / Total Debt & OPM" : "Debt / Equity & Operating Margin",
+          simple_value: isBuyback
+            ? "Strong cash flow covers debt (buyback equity)"
+            : Number(m.debt_to_equity || 0) <= 0.5
+            ? `Low debt • ${m.op_margin_pct || 0}% operating margin`
+            : `Moderate/higher debt • ${m.op_margin_pct || 0}% margin`,
+          pro_value: isBuyback
+            ? `CFO/Debt ${m.cfo_to_debt_pct || 50}% • OPM ${m.op_margin_pct || 0}%`
+            : `D/E ${m.debt_to_equity || 0}x • OPM ${m.op_margin_pct || 0}%`,
+          target_hint: "Low debt keeps the business safe in downturns",
+          tone: isBuyback || Number(m.debt_to_equity || 0) <= 0.5 ? "good" : "warn",
+        },
+      ];
+
+  const valSimple = isLoss
+    ? "Currently unprofitable — cannot be valued on current profits yet"
+    : `Trades at ${pe.toFixed(1)}x annual profits (Fair ~${fairPe}x)`;
+
+  const steps = [
+    {
+      key: "quality",
+      simple_title: "1. Is it a strong, safe business?",
+      pro_title: "1. Business Quality & 8Y Moat",
+      score_100: Number(p.quality || 0),
+      weight_pct: Number(bd.weights_pct.quality || 45),
+      points_added: Number(bd.contributions.quality || 0),
+      verdict_tag: tagFor(Number(p.quality || 0)),
+      plain_why: s1,
+      rows: qualRows,
+    },
+    {
+      key: "growth",
+      simple_title: "2. Are sales & profits growing?",
+      pro_title: "2. Multi-Year & Quarterly Growth",
+      score_100: Number(p.growth || 0),
+      weight_pct: Number(bd.weights_pct.growth || 25),
+      points_added: Number(bd.contributions.growth || 0),
+      verdict_tag: tagFor(Number(p.growth || 0)),
+      plain_why: s3,
+      rows: [
+        {
+          simple_label: "5-Year yearly sales growth",
+          pro_label: "Sales CAGR (5Y / 3Y)",
+          simple_value: `${fmtSigned(m.rev_cagr_5y_pct || 0)}% per year`,
+          pro_value: `${m.rev_cagr_5y_pct || 0}% (5Y) • ${m.rev_cagr_3y_pct || 0}% (3Y)`,
+          target_hint: "12%+ yearly sales growth is strong",
+          tone: Number(m.rev_cagr_5y_pct || 0) >= 12 ? "good" : "neutral",
+        },
+        {
+          simple_label: "5-Year yearly profit growth",
+          pro_label: "Net Profit CAGR (5Y / 3Y)",
+          simple_value: `${fmtSigned(m.pat_cagr_5y_pct || 0)}% per year`,
+          pro_value: `${m.pat_cagr_5y_pct || 0}% (5Y) • ${m.pat_cagr_3y_pct || 0}% (3Y)`,
+          target_hint: "15%+ yearly profit compounding is ideal",
+          tone:
+            Number(m.pat_cagr_5y_pct || 0) >= 15
+              ? "good"
+              : Number(m.pat_cagr_3y_pct || 0) < 0
+              ? "bad"
+              : "neutral",
+        },
+        {
+          simple_label: "Recent quarterly profit trend",
+          pro_label: "Latest 2Q Sales & PAT YoY",
+          simple_value: `Sales ${fmtSigned(m.qtr_rev_yoy_pct || 0)}% • Profit ${fmtSigned(
+            m.qtr_pat_yoy_pct || 0
+          )}%`,
+          pro_value: `Sales ${fmtSigned(m.qtr_rev_yoy_pct || 0)}% • PAT ${fmtSigned(
+            m.qtr_pat_yoy_pct || 0
+          )}%`,
+          target_hint: "Recent quarters vs same period last year",
+          tone:
+            Number(m.qtr_pat_yoy_pct || 0) >= 10
+              ? "good"
+              : Number(m.qtr_pat_yoy_pct || 0) < 0
+              ? "bad"
+              : "neutral",
+        },
+      ],
+    },
+    {
+      key: "value",
+      simple_title: "3. Is the stock fairly priced today?",
+      pro_title: "3. GARP Valuation & Fair P/E",
+      score_100: Number(p.value || 0),
+      weight_pct: Number(bd.weights_pct.value || 20),
+      points_added: Number(bd.contributions.value || 0),
+      verdict_tag: tagFor(Number(p.value || 0)),
+      plain_why: valSimple,
+      rows: [
+        {
+          simple_label: "Stock price vs company profits",
+          pro_label: "Trailing P/E vs Fair GARP P/E",
+          simple_value: valSimple,
+          pro_value: formatPeVsFair(m),
+          target_hint: "Lower or near fair range offers better value",
+          tone: isLoss
+            ? "bad"
+            : pe <= fairPe * 1.1
+            ? "good"
+            : pe > fairPe * 1.45
+            ? "warn"
+            : "neutral",
+        },
+        {
+          simple_label: "Annual cash & profit yield on price",
+          pro_label: "Earnings Yield & FCF Yield",
+          simple_value: `${m.earnings_yield_pct || 0}% profit yield on share price`,
+          pro_value: `EY ${m.earnings_yield_pct || 0}% • FCF ${m.fcf_yield_pct || 0}%`,
+          target_hint: "4.5%+ annual profit yield is attractive",
+          tone: Number(m.earnings_yield_pct || 0) >= 4.5 ? "good" : "neutral",
+        },
+      ],
+    },
+    {
+      key: "momentum",
+      simple_title: "4. Financial health & expert view",
+      pro_title: "4. Piotroski Health, Revisions & Ownership",
+      score_100: Number(p.momentum || 0),
+      weight_pct: Number(bd.weights_pct.momentum || 10),
+      points_added: Number(bd.contributions.momentum || 0),
+      verdict_tag: tagFor(Number(p.momentum || 0)),
+      plain_why: `Passes ${m.piotroski_f_score || 0} out of 9 annual financial safety checks.`,
+      rows: [
+        {
+          simple_label: "9-Point financial safety checklist",
+          pro_label: "Piotroski F-Score",
+          simple_value: `Passed ${m.piotroski_f_score || 0} of 9 safety checks`,
+          pro_value: `${m.piotroski_f_score || 0} / 9 F-Score`,
+          target_hint: "7+ out of 9 indicates strong financial health",
+          tone:
+            Number(m.piotroski_f_score || 0) >= 7
+              ? "good"
+              : Number(m.piotroski_f_score || 0) <= 4
+              ? "bad"
+              : "neutral",
+        },
+        {
+          simple_label: "1-Year share price trend",
+          pro_label: "12M-1M Momentum & Volatility",
+          simple_value: `${fmtSigned(m.mom_12_1_pct || 0)}% price trend over past year`,
+          pro_value: `${fmtSigned(m.mom_12_1_pct || 0)}% Mom • ${m.volatility_pct || 0}% Vol`,
+          target_hint: "Steady upward trend with manageable swings",
+          tone: Number(m.mom_12_1_pct || 0) >= 0 ? "good" : "warn",
+        },
+      ],
+    },
+  ];
+
+  return {
+    archetype_code: archetypeCode,
+    archetype_label: archetypeLabel,
+    one_line_verdict: oneLine,
+    what_it_does: whatItDoes,
+    bottom_line_summary: [s1, s2, s3],
+    receipt_steps: steps,
+    safety_checks_plain: [
+      `Passed ${m.piotroski_f_score || 0} of 9 annual financial health checks`,
+      `Profitable in ${m.profit_consistency || "5/5"} recent audited years`,
+    ],
+  };
+}
+
+function resolvePlainEnglish(sc, comp = {}) {
+  const fb = buildFallbackPlainEnglish(sc, comp);
+  const raw = sc && sc.plain_english;
+  if (!raw || typeof raw !== "object") {
+    return fb;
+  }
+  return {
+    archetype_code: raw.archetype_code || fb.archetype_code,
+    archetype_label: raw.archetype_label || fb.archetype_label,
+    one_line_verdict: raw.one_line_verdict || fb.one_line_verdict,
+    what_it_does: raw.what_it_does || comp.business_summary || fb.what_it_does,
+    bottom_line_summary:
+      Array.isArray(raw.bottom_line_summary) && raw.bottom_line_summary.length > 0
+        ? raw.bottom_line_summary
+        : fb.bottom_line_summary,
+    receipt_steps:
+      Array.isArray(raw.receipt_steps) && raw.receipt_steps.length === 4
+        ? raw.receipt_steps
+        : fb.receipt_steps,
+    safety_checks_plain:
+      Array.isArray(raw.safety_checks_plain) && raw.safety_checks_plain.length > 0
+        ? raw.safety_checks_plain
+        : fb.safety_checks_plain,
+  };
+}
+
+function formatFriendlyPriceSub(stock, pe, proMode = false) {
+  const m = (stock && stock.metrics) || {};
+  const peVal = Number(m.pe_ratio || 0);
+  const fairVal = Math.round(Number(m.fair_pe || 0));
+  const isLoss = pe.archetype_code === "loss_turnaround" || peVal >= 99 || peVal <= 0;
+
+  if (proMode) {
+    if (isLoss) {
+      return fairVal > 0 ? `P/E N/M (Unprofitable • Fair ~${fairVal}x)` : "P/E N/M (Unprofitable)";
+    }
+    const peg = Number(m.peg_ratio || 0);
+    const pegPart = peg > 0 && peg < 50 ? ` • PEG ${peg}x` : "";
+    return `P/E ${formatPeVsFair(m)}${pegPart}`;
+  }
+
+  if (isLoss) {
+    return "Unprofitable today (cannot value on profits)";
+  }
+  return fairVal > 0
+    ? `Trades at ${peVal.toFixed(1)}x profits (Fair ~${fairVal}x)`
+    : `Trades at ${peVal.toFixed(1)}x annual profits`;
+}
+
+function syncModeButtons() {
+  const simpleIds = ["dd-mode-simple-btn", "screener-mode-simple-btn"];
+  const proIds = ["dd-mode-pro-btn", "screener-mode-pro-btn"];
+  for (const id of simpleIds) {
+    const node = document.getElementById(id);
+    if (node) node.classList.toggle("active", !state.proMode);
+  }
+  for (const id of proIds) {
+    const node = document.getElementById(id);
+    if (node) node.classList.toggle("active", state.proMode);
+  }
+}
+
+function setProMode(isPro) {
+  const next = Boolean(isPro);
+  if (state.proMode === next) return;
+  state.proMode = next;
+  syncModeButtons();
+  renderFormulaBar();
+  applyClientFiltersAndRender();
+
+  if (state.drawerOpen && state.currentDetail) {
+    const scrollEl = document.getElementById("company-detail-content");
+    const savedScroll = scrollEl ? scrollEl.scrollTop : 0;
+    renderCompanyDetail(state.currentDetail);
+    if (scrollEl) {
+      scrollEl.scrollTop = savedScroll;
+    }
+  }
+}
+
+async function fetchAiAnalystMemo(sc) {
+  const ticker = sc.ticker;
+  const rawPreset = document.getElementById("screener-preset").value;
+  const presetForMemo = rawPreset === "custom" ? "qglp_compounder" : rawPreset;
+  const headers = { "Content-Type": "application/json" };
+  if (!state.staticMode && state.csrfToken) {
+    headers["X-CSRF-Token"] = state.csrfToken;
+  }
+
+  const bodyPayload = {
+    ticker,
+    preset: presetForMemo,
+    score_summary: {
+      composite_score: Number(sc.composite_score || 0),
+      quality_score: Number((sc.pillars && sc.pillars.quality) || 0),
+      growth_score: Number((sc.pillars && sc.pillars.growth) || 0),
+      value_score: Number((sc.pillars && sc.pillars.value) || 0),
+      momentum_score: Number((sc.pillars && sc.pillars.momentum) || 0),
+      rank: Number(sc.rank || 0),
+    },
+  };
+
+  let resp;
+  try {
+    resp = await window.fetch("/api/ai-memo", {
+      method: "POST",
+      credentials: "same-origin",
+      headers,
+      body: JSON.stringify(bodyPayload),
+    });
+  } catch (_netErr) {
+    return {
+      available: false,
+      reason:
+        "Could not reach /api/ai-memo. Open the live Netlify deployment or run the local FastAPI server to generate AI memos.",
+    };
+  }
+
+  const contentType = resp.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    return {
+      available: false,
+      reason:
+        "On-demand AI Analyst Memos run on our live Netlify AI Gateway deployment or local FastAPI server (not available on a plain static file server).",
+    };
+  }
+
+  const data = await resp.json().catch(() => ({}));
+  if (resp.status === 429) {
+    return {
+      available: false,
+      reason:
+        data.reason ||
+        "AI Analyst rate limit reached (max 8 memos per minute). Please wait a moment and try again.",
+    };
+  }
+  if (!resp.ok) {
+    return {
+      available: false,
+      reason: data.reason || data.detail || `AI Memo request returned status ${resp.status}.`,
+    };
+  }
+  return data;
 }
 
 function buildKpiCard(label, value, sub, valueColorClass = "") {
@@ -642,15 +1223,28 @@ function renderFormulaBar() {
   const w = getNormalizedActiveWeightsPct();
 
   bar.appendChild(
-    el("span", "muted-note", `${PRESET_NAMES[preset] || "Model"} Formula:`)
+    el(
+      "span",
+      "muted-note",
+      state.proMode
+        ? `${PRESET_NAMES[preset] || "Model"} Formula:`
+        : "How Every Stock Score Is Built:"
+    )
   );
 
-  const items = [
-    ["dot-emerald", `Quality & 8Y Moat ${w.quality.toFixed(0)}%`],
-    ["dot-indigo", `5Y + 2Q + Street Growth ${w.growth.toFixed(0)}%`],
-    ["dot-cyan", `GARP Valuation ${w.value.toFixed(0)}%`],
-    ["dot-amber", `Piotroski, Revisions & Smart Money ${w.momentum.toFixed(0)}%`],
-  ];
+  const items = state.proMode
+    ? [
+        ["dot-emerald", `Quality & 8Y Moat ${w.quality.toFixed(0)}%`],
+        ["dot-indigo", `5Y + 2Q + Street Growth ${w.growth.toFixed(0)}%`],
+        ["dot-cyan", `GARP Valuation ${w.value.toFixed(0)}%`],
+        ["dot-amber", `Piotroski, Revisions & Smart Money ${w.momentum.toFixed(0)}%`],
+      ]
+    : [
+        ["dot-emerald", `Strong & Safe Business ${w.quality.toFixed(0)}%`],
+        ["dot-indigo", `Sales & Profit Growth ${w.growth.toFixed(0)}%`],
+        ["dot-cyan", `Fair Stock Price ${w.value.toFixed(0)}%`],
+        ["dot-amber", `Financial Health & Analyst View ${w.momentum.toFixed(0)}%`],
+      ];
 
   items.forEach(([dotCls, label], idx) => {
     if (idx > 0) bar.appendChild(el("span", "muted-note", "+"));
@@ -663,7 +1257,9 @@ function renderFormulaBar() {
   bar.appendChild(el("span", "muted-note", "−"));
   const penChip = el("span", "formula-chip text-neg");
   penChip.appendChild(el("span", "legend-dot dot-rose"));
-  penChip.appendChild(el("span", "", "Guardrail Penalties"));
+  penChip.appendChild(
+    el("span", "", state.proMode ? "Guardrail Penalties" : "Red-Flag Deductions")
+  );
   bar.appendChild(penChip);
 }
 
@@ -685,12 +1281,16 @@ function matchesSearch(item, q) {
       : tag === "SP500"
       ? "US Stock S&P 500 SP500"
       : "Indian Stock NIFTY 200 NSE";
+  const pe = item && item.plain_english ? item.plain_english : {};
   const hay = [
     item.name || "",
     item.ticker || "",
     item.sector || "",
     item.index_tag || "",
     item.market_label || "",
+    pe.archetype_label || "",
+    pe.one_line_verdict || "",
+    pe.what_it_does || "",
     canonicalBadge,
   ]
     .join(" ")
@@ -739,35 +1339,43 @@ function renderRatingFilterStrip(searchFilteredStocks) {
       key: "ALL",
       title: "All Ranked",
       count: counts.ALL,
-      sub: "Complete filtered universe",
+      sub: state.proMode ? "Complete filtered universe" : "Every company in current view",
       colorCls: "",
     },
     {
       key: "Strong Buy",
       title: "Strong Buy",
       count: counts["Strong Buy"],
-      sub: "Score ≥ 68 • Zero Red Flags",
+      sub: state.proMode
+        ? "Score ≥ 68 • Zero Red Flags"
+        : "Score 68+ • Strong business & fair price",
       colorCls: "text-pos",
     },
     {
       key: "Buy",
       title: "Buy",
       count: counts.Buy,
-      sub: "Score ≥ 57 • Accumulate 3-5Y+",
+      sub: state.proMode
+        ? "Score ≥ 57 • Accumulate 3-5Y+"
+        : "Score 57+ • Good long-term candidate",
       colorCls: "text-cyan",
     },
     {
       key: "Hold",
       title: "Hold / Buy on Dip",
       count: counts.Hold,
-      sub: "Watchlist or Valuation Cap",
+      sub: state.proMode
+        ? "Watchlist or Valuation Cap"
+        : "Wait for a better price or watch closely",
       colorCls: "text-warn",
     },
     {
       key: "Avoid",
       title: "Avoid",
       count: counts.Avoid,
-      sub: "Forensic or Balance-Sheet Caution",
+      sub: state.proMode
+        ? "Forensic or Balance-Sheet Caution"
+        : "Unprofitable, high risk, or overpriced",
       colorCls: "text-neg",
     },
   ];
@@ -816,6 +1424,7 @@ function renderTopPodium(visibleStocks) {
 
   const top3 = visibleStocks.slice(0, 3);
   top3.forEach((s, idx) => {
+    const pe = resolvePlainEnglish(s);
     const card = el("div", `podium-card ${idx === 0 ? "rank-1" : ""}`.trim());
 
     const top = el("div", "podium-top");
@@ -831,7 +1440,7 @@ function renderTopPodium(visibleStocks) {
       el(
         "div",
         "podium-meta",
-        `${displaySymbol(s.ticker)} • ${s.sector} • MCap ${formatMarketCap(
+        `${displaySymbol(s.ticker)} • ${s.sector} • ${formatMarketCap(
           s.market_cap_cr,
           s.market,
           s.currency
@@ -843,32 +1452,61 @@ function renderTopPodium(visibleStocks) {
     top.appendChild(createScoreRingSvg(s.composite_score, s.rating, 60));
     card.appendChild(top);
 
+    if (pe.what_it_does) {
+      card.appendChild(el("div", "podium-what-sub", pe.what_it_does));
+    }
+
     const metricsRow = el("div", "podium-metrics-row");
     metricsRow.appendChild(el("span", ratingBadgeClass(s.rating), s.rating));
-    metricsRow.appendChild(
-      el("span", "mini-stat-pill", `CMP ${formatStockPrice(s.price, stockCurrency(s))}`)
-    );
-    metricsRow.appendChild(
-      el("span", "mini-stat-pill", `P/E ${formatPeVsFair(s.metrics)}`)
-    );
-    const medRet =
-      s.metrics.med_5y_roce_pct !== undefined ? s.metrics.med_5y_roce_pct : s.metrics.roce_pct;
+    metricsRow.appendChild(createArchetypePill(pe));
     metricsRow.appendChild(
       el(
         "span",
         "mini-stat-pill",
-        `${s.is_financial ? "5Y ROE" : "5Y ROCE"} ${medRet}%`
+        `${state.proMode ? "CMP" : "Price"} ${formatStockPrice(s.price, stockCurrency(s))}`
       )
     );
+    if (state.proMode) {
+      metricsRow.appendChild(
+        el("span", "mini-stat-pill", `P/E ${formatPeVsFair(s.metrics)}`)
+      );
+      const medRet =
+        s.metrics.med_5y_roce_pct !== undefined ? s.metrics.med_5y_roce_pct : s.metrics.roce_pct;
+      metricsRow.appendChild(
+        el(
+          "span",
+          "mini-stat-pill",
+          `${s.is_financial ? "5Y ROE" : "5Y ROCE"} ${medRet}%`
+        )
+      );
+    } else {
+      const qualStep = pe.receipt_steps && pe.receipt_steps[0];
+      const qualRow0 = qualStep && qualStep.rows && qualStep.rows[0];
+      if (qualRow0 && qualRow0.simple_value) {
+        metricsRow.appendChild(el("span", "mini-stat-pill", qualRow0.simple_value));
+      }
+    }
     card.appendChild(metricsRow);
 
-    const thesisLine =
-      (s.strengths && s.strengths.length > 0 ? s.strengths[0] : s.conviction) || "";
-    card.appendChild(el("div", "podium-thesis", thesisLine));
+    const verdictToneCls =
+      s.rating === "Buy"
+        ? "verdict-buy"
+        : s.rating === "Hold"
+        ? "verdict-hold"
+        : s.rating === "Avoid"
+        ? "verdict-avoid"
+        : "";
+    card.appendChild(
+      el("div", `podium-verdict-box ${verdictToneCls}`.trim(), pe.one_line_verdict)
+    );
 
     const footer = el("div", "podium-footer");
-    footer.appendChild(createValZonePill(s.valuation_zone));
-    const btn = el("button", "btn-deep-dive", "View Score Reasoning →");
+    footer.appendChild(createFriendlyValZonePill(s, state.proMode));
+    const btn = el(
+      "button",
+      "btn-deep-dive",
+      state.proMode ? "View Score Reasoning →" : "Plain-English Breakdown →"
+    );
     btn.type = "button";
     btn.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -920,29 +1558,42 @@ function applyClientFiltersAndRender() {
 function renderStage2Table(stocks) {
   const marketHeadline =
     state.screenerMarket === "IN"
-      ? "India · Nifty 200 — Audited Fundamental Rankings"
+      ? "India · Nifty 200 — Plain-English Stock Rankings"
       : state.screenerMarket === "NASDAQ100"
-      ? "US · Nasdaq 100 — Audited Fundamental Rankings"
+      ? "US · Nasdaq 100 — Plain-English Stock Rankings"
       : state.screenerMarket === "SP500"
-      ? "US · S&P 500 (Non-Nasdaq) — Audited Rankings (Overlap Names Carry NASDAQ 100 Tag)"
+      ? "US · S&P 500 (Non-Nasdaq) — Stock Rankings (Overlap Names Carry NASDAQ 100 Tag)"
       : state.screenerMarket === "US"
-      ? "All US Stocks (Nasdaq 100 + S&P 500) — Audited Fundamental Rankings"
-      : "Global Multi-Market Fundamental Rankings (Nifty 200 + Nasdaq 100 + S&P 500)";
+      ? "All US Stocks (Nasdaq 100 + S&P 500) — Plain-English Stock Rankings"
+      : "Global Multi-Market Stock Rankings (Nifty 200 + Nasdaq 100 + S&P 500)";
   document.getElementById("table-panel-title").textContent = marketHeadline;
-  document.getElementById("table-panel-sub").textContent =
-    "Scored on 8Y Anti-Cyclical Moat, 2Q + Street EPS Revisions, GARP Fair P/E & Piotroski Health — click any row for exact score math";
+  document.getElementById("table-panel-sub").textContent = state.proMode
+    ? "Pro Mode: Showing ROCE, CFO/EBITDA, Fair P/E, PEG & Piotroski F-Score — click any row for full score math & AI Analyst Memo"
+    : "Everyday English Mode: Showing 1-line verdicts, price fairness & business snapshots — click any stock for its 30-second breakdown & AI Analyst Memo";
   document.getElementById("visible-count-badge").textContent =
     `Showing ${stocks.length} of ${state.stocks.length} Ranked`;
 
-  setTableHeaders([
-    "Rank",
-    "Company & Market Tag",
-    "Verdict & Conviction",
-    "Composite Score & Pillar Contribution",
-    "Price vs Fair P/E",
-    "Core Fundamentals",
-    "Score Reasoning",
-  ]);
+  if (state.proMode) {
+    setTableHeaders([
+      "Rank",
+      "Company & Market Tag",
+      "Verdict & Plain Takeaway",
+      "Composite Score & Pillar Contribution",
+      "Price vs Fair P/E",
+      "Business Snapshot & Pro Ratios",
+      "Score Reasoning",
+    ]);
+  } else {
+    setTableHeaders([
+      "Rank",
+      "Company & Market",
+      "Verdict & Plain Takeaway",
+      "Score (Out of 100)",
+      "Price vs Fair Value",
+      "Business Snapshot",
+      "Why This Rank?",
+    ]);
+  }
 
   const tbody = document.getElementById("screener-tbody");
   tbody.replaceChildren();
@@ -961,6 +1612,7 @@ function renderStage2Table(stocks) {
   }
 
   for (const s of stocks) {
+    const pe = resolvePlainEnglish(s);
     const tr = document.createElement("tr");
     tr.dataset.ticker = s.ticker;
     if (s.ticker === state.selectedTicker && state.drawerOpen) {
@@ -974,7 +1626,7 @@ function renderStage2Table(stocks) {
     );
     tr.appendChild(rankTd);
 
-    // 2. Company & Market Tag
+    // 2. Company & Market
     const compTd = document.createElement("td");
     const primaryLine = el("div", "company-primary");
     primaryLine.appendChild(el("span", "", s.name));
@@ -985,18 +1637,27 @@ function renderStage2Table(stocks) {
       el(
         "span",
         "sector-sub",
-        `${s.sector} • MCap ${formatMarketCap(s.market_cap_cr, s.market, s.currency)}`
+        `${s.sector} • ${state.proMode ? "MCap" : "Market Size"} ${formatMarketCap(
+          s.market_cap_cr,
+          s.market,
+          s.currency
+        )}`
       )
     );
     tr.appendChild(compTd);
 
-    // 3. Verdict & Conviction
+    // 3. Verdict & Plain-English One-Line Takeaway
     const rateTd = document.createElement("td");
-    rateTd.appendChild(el("span", ratingBadgeClass(s.rating), s.rating));
-    rateTd.appendChild(el("span", "conviction-sub", s.conviction || ""));
+    const verdictWrap = el("div", "verdict-cell-wrap");
+    verdictWrap.appendChild(el("span", ratingBadgeClass(s.rating), s.rating));
+    verdictWrap.appendChild(el("span", "verdict-plain-line", pe.one_line_verdict));
+    if (state.proMode && s.conviction) {
+      verdictWrap.appendChild(el("span", "verdict-pro-sub", s.conviction));
+    }
+    rateTd.appendChild(verdictWrap);
     tr.appendChild(rateTd);
 
-    // 4. Composite Score & Pillar Contribution Bar
+    // 4. Score & Pillar Contribution Bar
     const bd = resolveScoreBreakdown(s);
     const scoreTd = document.createElement("td");
     const scoreWrap = el("div", "score-cell-wrap");
@@ -1005,7 +1666,13 @@ function renderStage2Table(stocks) {
     topLine.appendChild(bigSpan);
     if (Number(bd.total_penalty || 0) > 0) {
       topLine.appendChild(
-        el("span", "penalty-tag", `−${Number(bd.total_penalty).toFixed(1)} Guardrail`)
+        el(
+          "span",
+          "penalty-tag",
+          state.proMode
+            ? `−${Number(bd.total_penalty).toFixed(1)} Guardrail`
+            : `−${Number(bd.total_penalty).toFixed(1)} Red-Flag`
+        )
       );
     } else {
       topLine.appendChild(el("span", "muted-note", "/ 100"));
@@ -1015,77 +1682,116 @@ function renderStage2Table(stocks) {
 
     const miniBreak = el("div", "score-mini-breakdown");
     miniBreak.appendChild(
-      el("span", "text-pos", `Q +${Number(bd.contributions.quality).toFixed(1)}`)
+      el(
+        "span",
+        "text-pos",
+        `${state.proMode ? "Q" : "Biz"} +${Number(bd.contributions.quality).toFixed(1)}`
+      )
     );
     miniBreak.appendChild(
-      el("span", "text-indigo", `G +${Number(bd.contributions.growth).toFixed(1)}`)
+      el(
+        "span",
+        "text-indigo",
+        `${state.proMode ? "G" : "Grow"} +${Number(bd.contributions.growth).toFixed(1)}`
+      )
     );
     miniBreak.appendChild(
-      el("span", "text-cyan", `V +${Number(bd.contributions.value).toFixed(1)}`)
+      el(
+        "span",
+        "text-cyan",
+        `${state.proMode ? "V" : "Price"} +${Number(bd.contributions.value).toFixed(1)}`
+      )
     );
     miniBreak.appendChild(
-      el("span", "text-warn", `H +${Number(bd.contributions.momentum).toFixed(1)}`)
+      el(
+        "span",
+        "text-warn",
+        `${state.proMode ? "H" : "Health"} +${Number(bd.contributions.momentum).toFixed(1)}`
+      )
     );
     scoreWrap.appendChild(miniBreak);
     scoreTd.appendChild(scoreWrap);
     tr.appendChild(scoreTd);
 
-    // 5. Price vs Fair P/E
+    // 5. Price vs Fair Value
     const valTd = document.createElement("td");
     valTd.appendChild(
       el("div", "company-primary", formatStockPrice(s.price, stockCurrency(s)))
     );
     valTd.appendChild(
-      el(
-        "span",
-        "sector-sub",
-        `P/E ${formatPeVsFair(s.metrics)} • PEG ${s.metrics.peg_ratio}x`
-      )
+      el("span", "sector-sub", formatFriendlyPriceSub(s, pe, state.proMode))
     );
-    valTd.appendChild(createValZonePill(s.valuation_zone));
+    valTd.appendChild(createFriendlyValZonePill(s, state.proMode));
     tr.appendChild(valTd);
 
-    // 6. Core Fundamentals
+    // 6. Business Snapshot (Simple View: Archetype + Plain English; Pro View: Archetype + Pro Ratios)
     const fundTd = document.createElement("td");
-    const fundList = el("div", "fund-snapshot-list");
-    const medRoce =
-      s.metrics.med_5y_roce_pct !== undefined
-        ? s.metrics.med_5y_roce_pct
-        : s.metrics.roce_pct;
-    const stab =
-      s.metrics.moat_stability_score !== undefined ? s.metrics.moat_stability_score : 70;
-    const qPat =
-      s.metrics.qtr_pat_yoy_pct !== undefined
-        ? s.metrics.qtr_pat_yoy_pct
-        : s.metrics.pat_cagr_3y_pct;
+    const snapWrap = el("div", "snapshot-cell-wrap");
+    snapWrap.appendChild(createArchetypePill(pe));
 
-    fundList.appendChild(
-      el(
-        "span",
-        medRoce >= (s.is_financial ? 15 : 18) ? "text-pos" : "",
-        `5Y Med ${s.is_financial ? "ROE" : "ROCE"}: ${medRoce}%`
-      )
-    );
-    fundList.appendChild(
-      el(
-        "span",
-        stab >= 68 ? "text-cyan" : stab < 45 ? "text-warn" : "",
-        `8Y Moat Stability: ${stab}/100`
-      )
-    );
-    fundList.appendChild(
-      el(
-        "span",
-        qPat >= 12 ? "text-pos" : qPat < 0 ? "text-neg" : "",
-        `2Q PAT YoY: ${fmtSigned(qPat)}% • F-Score ${s.metrics.piotroski_f_score}/9`
-      )
-    );
-    fundTd.appendChild(fundList);
+    if (state.proMode) {
+      const fundList = el("div", "fund-snapshot-list");
+      const medRoce =
+        s.metrics.med_5y_roce_pct !== undefined
+          ? s.metrics.med_5y_roce_pct
+          : s.metrics.roce_pct;
+      const stab =
+        s.metrics.moat_stability_score !== undefined ? s.metrics.moat_stability_score : 70;
+      const qPat =
+        s.metrics.qtr_pat_yoy_pct !== undefined
+          ? s.metrics.qtr_pat_yoy_pct
+          : s.metrics.pat_cagr_3y_pct;
+
+      fundList.appendChild(
+        el(
+          "span",
+          medRoce >= (s.is_financial ? 15 : 18) ? "text-pos" : "",
+          `5Y Med ${s.is_financial ? "ROE" : "ROCE"}: ${medRoce}%`
+        )
+      );
+      fundList.appendChild(
+        el(
+          "span",
+          stab >= 68 ? "text-cyan" : stab < 45 ? "text-warn" : "",
+          s.metrics.buyback_equity
+            ? `CFO/Debt: ${s.metrics.cfo_to_debt_pct}% (Buyback Eq)`
+            : `8Y Moat Stability: ${stab}/100`
+        )
+      );
+      fundList.appendChild(
+        el(
+          "span",
+          qPat >= 12 ? "text-pos" : qPat < 0 ? "text-neg" : "",
+          `2Q PAT YoY: ${fmtSigned(qPat)}% • F-Score ${s.metrics.piotroski_f_score}/9`
+        )
+      );
+      snapWrap.appendChild(fundList);
+    } else {
+      const qStep = pe.receipt_steps && pe.receipt_steps[0];
+      const gStep = pe.receipt_steps && pe.receipt_steps[1];
+      const qRow0 = qStep && qStep.rows && qStep.rows[0];
+      const gRow0 = gStep && gStep.rows && gStep.rows[0];
+      if (qRow0 && qRow0.simple_value) {
+        snapWrap.appendChild(
+          el("span", `snapshot-plain-line ${toneClass(qRow0.tone)}`.trim(), qRow0.simple_value)
+        );
+      }
+      if (gRow0 && gRow0.simple_value) {
+        snapWrap.appendChild(
+          el("span", "snapshot-plain-line", `5Y Sales: ${gRow0.simple_value}`)
+        );
+      }
+    }
+    fundTd.appendChild(snapWrap);
     tr.appendChild(fundTd);
 
-    // 7. Deep Dive Button
+    // 7. Breakdown / Deep Dive Button
     const actionTd = document.createElement("td");
-    const ddBtn = el("button", "btn-deep-dive", "Deep Dive →");
+    const ddBtn = el(
+      "button",
+      "btn-deep-dive",
+      state.proMode ? "Deep Dive →" : "See Why →"
+    );
     ddBtn.type = "button";
     ddBtn.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -1228,8 +1934,14 @@ function closeDeepDive() {
 }
 
 async function openDeepDive(ticker) {
+  const isSameTicker =
+    state.currentDetail &&
+    state.currentDetail.scorecard &&
+    state.currentDetail.scorecard.ticker === ticker;
+
   state.selectedTicker = ticker;
   state.drawerOpen = true;
+  syncModeButtons();
 
   document.getElementById("deep-dive-backdrop").classList.remove("hidden");
   document.getElementById("deep-dive-drawer").classList.remove("hidden");
@@ -1258,20 +1970,15 @@ async function openDeepDive(ticker) {
       }
       detail = await apiRequest(url);
     }
+    state.currentDetail = detail;
     renderCompanyDetail(detail);
+    if (!isSameTicker) {
+      const scrollBody = document.getElementById("company-detail-content");
+      if (scrollBody) scrollBody.scrollTop = 0;
+    }
   } catch (err) {
     showToast(err.message, true);
   }
-}
-
-function buildEvidenceMetricRow(name, target, valueText, valueColorClass = "") {
-  const row = el("div", "ev-metric-row");
-  const left = el("div", "ev-m-name");
-  left.appendChild(el("span", "", name));
-  if (target) left.appendChild(el("span", "ev-target", target));
-  row.appendChild(left);
-  row.appendChild(el("div", `ev-m-val ${valueColorClass}`.trim(), valueText));
-  return row;
 }
 
 function normalizeBankAction(rawAction) {
@@ -1306,7 +2013,7 @@ function buildStreetMetricBox(label, primaryText, subtitleText, colorCls = "") {
   return box;
 }
 
-function buildStreetConsensusCard(sc, mergedMarketObj, ccy) {
+function buildStreetConsensusCard(sc, mergedMarketObj, ccy, proMode = false) {
   const st = sc.street || {};
   const m = sc.metrics || {};
   const us = isUSStock(mergedMarketObj);
@@ -1317,13 +2024,21 @@ function buildStreetConsensusCard(sc, mergedMarketObj, ccy) {
   const header = el("div", "street-header");
   const headLeft = document.createElement("div");
   headLeft.appendChild(
-    el("div", "dd-section-title", "Wall Street & Dalal Street Institutional Consensus")
+    el(
+      "div",
+      "dd-section-title",
+      proMode
+        ? "Wall Street & Dalal Street Institutional Consensus"
+        : "What Professional Bank Analysts Think"
+    )
   );
   headLeft.appendChild(
     el(
       "div",
       "muted-note",
-      "Sell-side analyst targets, 30d/90d EPS revision breadth & verified long-only institutional holdings"
+      proMode
+        ? "Sell-side analyst targets, 30d/90d EPS revision breadth & verified long-only institutional holdings"
+        : "Ratings, 12-month price targets & profit forecast changes from covering bank analysts"
     )
   );
   header.appendChild(headLeft);
@@ -1335,7 +2050,7 @@ function buildStreetConsensusCard(sc, mergedMarketObj, ccy) {
     el(
       "span",
       `street-coverage-badge ${buyPct < 50 ? "street-neutral" : ""}`.trim(),
-      `${analystCount} Covering Analysts • ${Math.round(buyPct)}% Buy`
+      `${analystCount} Covering Analysts • ${Math.round(buyPct)}% Recommend Buy`
     )
   );
   header.appendChild(covRow);
@@ -1365,11 +2080,11 @@ function buildStreetConsensusCard(sc, mergedMarketObj, ccy) {
     const tgtCls = upsidePct >= 10 ? "text-pos" : upsidePct <= -5 ? "text-neg" : "text-cyan";
     const rangeSub =
       targetLow > 0 && targetHigh > 0
-        ? `${formatStockPrice(targetLow, ccy)} — ${formatStockPrice(targetHigh, ccy)} range`
-        : "Consensus 12-month target";
+        ? `${formatStockPrice(targetLow, ccy)} — ${formatStockPrice(targetHigh, ccy)} analyst range`
+        : "Average 12-month analyst price target";
     strip.appendChild(
       buildStreetMetricBox(
-        "12M Mean Target & Upside",
+        proMode ? "12M Mean Target & Upside" : "Average 12-Month Target",
         `${formatStockPrice(targetMean, ccy)} (${fmtSigned(upsidePct, 1)}%)`,
         rangeSub,
         tgtCls
@@ -1378,9 +2093,9 @@ function buildStreetConsensusCard(sc, mergedMarketObj, ccy) {
   } else {
     strip.appendChild(
       buildStreetMetricBox(
-        "12M Mean Target & Upside",
-        "Target N/A",
-        "Consensus ratings active; price objective undisclosed"
+        proMode ? "12M Mean Target & Upside" : "Average 12-Month Target",
+        "Target Not Published",
+        "Analyst ratings active; price target undisclosed"
       )
     );
   }
@@ -1398,24 +2113,37 @@ function buildStreetConsensusCard(sc, mergedMarketObj, ccy) {
 
   if (upShow + dnShow > 0) {
     const revCls = revBreadth >= 15 ? "text-pos" : revBreadth <= -15 ? "text-neg" : "text-warn";
-    const revSub =
-      use30d && up90 + dn90 > 0
-        ? `${winTag} window • 90d: ${up90} Up vs ${dn90} Down`
-        : `${winTag} consensus EPS revision window`;
-    strip.appendChild(
-      buildStreetMetricBox(
-        "EPS Revision Momentum",
-        `${upShow} Up vs ${dnShow} Down (${fmtSigned(revBreadth, 0)}% Breadth)`,
-        revSub,
-        revCls
-      )
-    );
+    if (proMode) {
+      const revSub =
+        use30d && up90 + dn90 > 0
+          ? `${winTag} window • 90d: ${up90} Up vs ${dn90} Down`
+          : `${winTag} consensus EPS revision window`;
+      strip.appendChild(
+        buildStreetMetricBox(
+          "EPS Revision Momentum",
+          `${upShow} Up vs ${dnShow} Down (${fmtSigned(revBreadth, 0)}% Breadth)`,
+          revSub,
+          revCls
+        )
+      );
+    } else {
+      strip.appendChild(
+        buildStreetMetricBox(
+          "Profit Forecast Changes",
+          `${upShow} Raised vs ${dnShow} Cut`,
+          `Analysts updating profit forecasts over the past ${use30d ? "30 days" : "90 days"}`,
+          revCls
+        )
+      );
+    }
   } else {
     strip.appendChild(
       buildStreetMetricBox(
-        "EPS Revision Momentum",
-        "0 Up vs 0 Down (Steady)",
-        "Unchanged FY1 consensus EPS over 30d/90d",
+        proMode ? "EPS Revision Momentum" : "Profit Forecast Changes",
+        proMode ? "0 Up vs 0 Down (Steady)" : "Forecasts Steady",
+        proMode
+          ? "Unchanged FY1 consensus EPS over 30d/90d"
+          : "Analysts kept profit estimates unchanged recently",
         "text-cyan"
       )
     );
@@ -1427,17 +2155,30 @@ function buildStreetConsensusCard(sc, mergedMarketObj, ccy) {
   const fwdPe = Number(st.forward_pe || 0);
   const fwdGrowthText =
     fy1 !== 0 || fy2 !== 0
-      ? `FY1 ${fmtSigned(fy1, 1)}% • FY2 ${fmtSigned(fy2, 1)}%`
-      : "Consensus Est. Pending";
+      ? proMode
+        ? `FY1 ${fmtSigned(fy1, 1)}% • FY2 ${fmtSigned(fy2, 1)}%`
+        : `Next Yr ${fmtSigned(fy1, 1)}% • Yr 2 ${fmtSigned(fy2, 1)}%`
+      : "Forecast Pending";
   const fwdCls = fy1 >= 12 ? "text-pos" : fy1 < 0 ? "text-neg" : "text-indigo";
-  const fwdPeSub =
-    fwdPe > 0
+  const trailingValid = m.pe_ratio > 0 && m.pe_ratio < 99;
+  const fwdPeSub = proMode
+    ? fwdPe > 0 && fwdPe < 99
       ? `Forward P/E: ${fwdPe.toFixed(1)}x${
-          m.pe_ratio > 0 && m.pe_ratio < 99 ? ` (Trailing ${Number(m.pe_ratio).toFixed(1)}x)` : ""
+          trailingValid ? ` (Trailing ${Number(m.pe_ratio).toFixed(1)}x)` : ""
         }`
-      : `Trailing P/E: ${m.pe_ratio > 0 && m.pe_ratio < 99 ? `${Number(m.pe_ratio).toFixed(1)}x` : "N/M"}`;
+      : `Trailing P/E: ${trailingValid ? `${Number(m.pe_ratio).toFixed(1)}x` : "N/M"}`
+    : fwdPe > 0 && fwdPe < 99
+    ? `Trades at ${fwdPe.toFixed(1)}x expected next-year profits`
+    : trailingValid
+    ? `Trades at ${Number(m.pe_ratio).toFixed(1)}x current profits`
+    : "Profit recovery watched by analysts";
   strip.appendChild(
-    buildStreetMetricBox("Forward Consensus Growth", fwdGrowthText, fwdPeSub, fwdCls)
+    buildStreetMetricBox(
+      proMode ? "Forward Consensus Growth" : "Expected Profit Growth",
+      fwdGrowthText,
+      fwdPeSub,
+      fwdCls
+    )
   );
 
   // Metric 4: Long-Only Institutional Ownership
@@ -1449,28 +2190,36 @@ function buildStreetConsensusCard(sc, mergedMarketObj, ccy) {
         .filter(Boolean)
     : [];
   const ownPrimary = us
-    ? `${instHeld.toFixed(1)}% Institutional Held`
+    ? `${instHeld.toFixed(1)}% Held by Big Funds`
     : promPct > 0
-    ? `${instHeld.toFixed(1)}% FII/DII • ${promPct.toFixed(1)}% Promoter`
-    : `${instHeld.toFixed(1)}% Institutional Held`;
+    ? proMode
+      ? `${instHeld.toFixed(1)}% FII/DII • ${promPct.toFixed(1)}% Promoter`
+      : `${instHeld.toFixed(1)}% Mutual/Global Funds • ${promPct.toFixed(1)}% Founders`
+    : `${instHeld.toFixed(1)}% Held by Big Funds`;
   const ownSub =
     holders.length > 0
       ? holders.slice(0, 3).join(", ")
       : us
-      ? "Verified long-only 13F asset managers"
-      : "Promoter + FII/DII long-term core";
+      ? "Verified long-term institutional investors"
+      : "Founders + long-term mutual & pension funds";
   strip.appendChild(
-    buildStreetMetricBox("Long-Only Institutional Ownership", ownPrimary, ownSub, "text-cyan")
+    buildStreetMetricBox(
+      proMode ? "Long-Only Institutional Ownership" : "Long-Term Fund & Founder Backing",
+      ownPrimary,
+      ownSub,
+      "text-cyan"
+    )
   );
 
   card.appendChild(strip);
 
-  // Subtle Market-Maker Exclusion Footnote
   card.appendChild(
     el(
       "div",
       "street-footnote",
-      "Options market-maker 13F noise (e.g. Jane Street/Citadel hedges) excluded."
+      proMode
+        ? "Options market-maker 13F noise (e.g. Jane Street/Citadel hedges) excluded."
+        : "Short-term options trading firms are filtered out so only real long-term investors are shown."
     )
   );
 
@@ -1479,12 +2228,18 @@ function buildStreetConsensusCard(sc, mergedMarketObj, ccy) {
   if (actions.length > 0) {
     const actWrap = el("div", "street-actions-wrap");
     actWrap.appendChild(
-      el("div", "street-actions-title", "Recent Tier-1 Bank & Institutional Rating Actions")
+      el(
+        "div",
+        "street-actions-title",
+        proMode
+          ? "Recent Tier-1 Bank & Institutional Rating Actions"
+          : "Recent Bank Analyst Upgrades & Rating Calls"
+      )
     );
     const actList = el("div", "bank-actions-list");
     for (const item of actions.slice(0, 5)) {
       const pill = el("div", "bank-action-pill");
-      pill.appendChild(el("span", "bank-firm", item.firm || "Institutional Desk"));
+      pill.appendChild(el("span", "bank-firm", item.firm || "Research Desk"));
 
       const toG = String(item.to_grade || "").trim();
       const fromG = String(item.from_grade || "").trim();
@@ -1507,10 +2262,102 @@ function buildStreetConsensusCard(sc, mergedMarketObj, ccy) {
   return card;
 }
 
+function renderAiMemoResultIntoMount(mountEl, aiBtn, memoData) {
+  mountEl.replaceChildren();
+  if (!memoData) return;
+
+  if (memoData.available === false) {
+    const note = el(
+      "div",
+      "ai-memo-unavailable",
+      memoData.reason ||
+        "AI Analyst Memo is unavailable right now. Open the live Netlify deployment where Netlify AI Gateway is active out-of-the-box."
+    );
+    mountEl.appendChild(note);
+    if (aiBtn) {
+      aiBtn.textContent = "✨ Ask AI Analyst (Custom Deep-Dive Memo)";
+      aiBtn.disabled = false;
+    }
+    return;
+  }
+
+  const card = el("div", "ai-memo-card");
+  const top = el("div", "ai-memo-top");
+  const topLeft = el("div", "inline-group wrap-group");
+  topLeft.appendChild(el("span", "ai-memo-badge", "✨ AI Investment Educator Memo"));
+  if (memoData.as_of_date) {
+    topLeft.appendChild(el("span", "muted-note", `Data as of ${memoData.as_of_date}`));
+  }
+  top.appendChild(topLeft);
+
+  const topRight = el("div", "inline-group wrap-group");
+  if (memoData.model_used) {
+    topRight.appendChild(el("span", "ai-memo-badge", String(memoData.model_used)));
+  }
+  topRight.appendChild(
+    el(
+      "span",
+      memoData.cached
+        ? "ai-memo-badge ai-memo-badge-cached"
+        : "ai-memo-badge ai-memo-badge-live",
+      memoData.cached ? "Cached" : "Live AI"
+    )
+  );
+  top.appendChild(topRight);
+  card.appendChild(top);
+
+  if (memoData.headline) {
+    card.appendChild(el("div", "ai-memo-headline", memoData.headline));
+  }
+
+  const grid = el("div", "ai-memo-grid");
+
+  if (memoData.business_overview) {
+    const b1 = el("div", "ai-memo-block");
+    b1.appendChild(el("div", "ai-memo-block-title", "What the Business Does"));
+    b1.appendChild(el("div", "ai-memo-block-body", memoData.business_overview));
+    grid.appendChild(b1);
+  }
+
+  if (memoData.why_score_lands_here) {
+    const b2 = el("div", "ai-memo-block");
+    b2.appendChild(el("div", "ai-memo-block-title", "Why the Score Lands Here"));
+    b2.appendChild(el("div", "ai-memo-block-body", memoData.why_score_lands_here));
+    grid.appendChild(b2);
+  }
+
+  if (memoData.key_risks_to_watch) {
+    const riskText = Array.isArray(memoData.key_risks_to_watch)
+      ? memoData.key_risks_to_watch.join(" ")
+      : String(memoData.key_risks_to_watch);
+    const b3 = el("div", "ai-memo-block block-risk block-full");
+    b3.appendChild(el("div", "ai-memo-block-title text-warn", "Key Risks to Watch"));
+    b3.appendChild(el("div", "ai-memo-block-body", riskText));
+    grid.appendChild(b3);
+  }
+
+  if (memoData.bottom_line_for_investor) {
+    const b4 = el("div", "ai-memo-block block-bottom block-full");
+    b4.appendChild(
+      el("div", "ai-memo-block-title text-pos", "Bottom Line for an Everyday Investor")
+    );
+    b4.appendChild(el("div", "ai-memo-block-body", memoData.bottom_line_for_investor));
+    grid.appendChild(b4);
+  }
+
+  card.appendChild(grid);
+  mountEl.appendChild(card);
+
+  if (aiBtn) {
+    aiBtn.textContent = "✓ AI Analyst Memo Ready";
+    aiBtn.disabled = false;
+  }
+}
+
 function renderCompanyDetail(detail) {
   const container = document.getElementById("company-detail-content");
   container.replaceChildren();
-  const sc = detail.scorecard;
+  const sc = detail && detail.scorecard;
   if (!sc) {
     container.appendChild(
       el("div", "empty-state-box", "Scorecard unavailable for this company.")
@@ -1518,7 +2365,7 @@ function renderCompanyDetail(detail) {
     return;
   }
 
-  const comp = detail.company || {};
+  const comp = (detail && detail.company) || {};
   const mergedMarketObj = {
     market: sc.market || comp.market || "IN",
     currency: sc.currency || comp.currency || "INR",
@@ -1530,26 +2377,36 @@ function renderCompanyDetail(detail) {
   const ccy = stockCurrency(mergedMarketObj);
   const m = sc.metrics || {};
   const bd = resolveScoreBreakdown(sc);
+  const pe = resolvePlainEnglish(sc, comp);
+  const pro = Boolean(state.proMode);
 
-  // a) Hero Summary Card
+  // =========================================================================
+  // SECTION 1 — Hero + "What This Company Does"
+  // =========================================================================
   const hero = el("div", "dd-hero-card");
+  const heroTop = el("div", "dd-hero-top");
+
   const heroLeft = el("div", "dd-hero-left");
-  heroLeft.appendChild(createScoreRingSvg(sc.composite_score, sc.rating, 72));
+  heroLeft.appendChild(createScoreRingSvg(sc.composite_score, sc.rating, 74));
 
   const heroMetaWrap = document.createElement("div");
   const heroBadges = el("div", "dd-hero-badges");
   heroBadges.appendChild(el("span", "ticker-tag", sc.ticker));
   heroBadges.appendChild(createMarketTag(mergedMarketObj));
+  heroBadges.appendChild(createArchetypePill(pe));
   heroBadges.appendChild(el("span", "pill", sc.sector));
   heroMetaWrap.appendChild(heroBadges);
+
   heroMetaWrap.appendChild(el("div", "dd-hero-title", sc.name));
   heroMetaWrap.appendChild(
     el(
       "div",
       "muted-note",
-      `Market Cap: ${formatMarketCap(sc.market_cap_cr, mergedMarketObj.market, ccy)} • ${
-        sc.cap_tier || "Large Cap"
-      }${sc.rank ? ` • Rank #${sc.rank}` : ""}`
+      `${pro ? "Market Cap" : "Company Size"}: ${formatMarketCap(
+        sc.market_cap_cr,
+        mergedMarketObj.market,
+        ccy
+      )} • ${sc.cap_tier || "Large Cap"}${sc.rank ? ` • Rank #${sc.rank}` : ""}`
     )
   );
   heroLeft.appendChild(heroMetaWrap);
@@ -1559,380 +2416,431 @@ function renderCompanyDetail(detail) {
   const ratingWrap = el("div", "top-gap");
   ratingWrap.appendChild(el("span", ratingBadgeClass(sc.rating), sc.rating));
   heroRight.appendChild(ratingWrap);
-  if (sc.conviction) {
-    heroRight.appendChild(el("span", "conviction-sub", sc.conviction));
-  }
-  heroRight.appendChild(createValZonePill(sc.valuation_zone));
+  heroRight.appendChild(createFriendlyValZonePill(sc, pro));
 
-  hero.appendChild(heroLeft);
-  hero.appendChild(heroRight);
+  heroTop.appendChild(heroLeft);
+  heroTop.appendChild(heroRight);
+  hero.appendChild(heroTop);
+
+  // Crisp "What This Company Does" inner panel
+  const whatBox = el("div", "dd-what-box");
+  const whatHeader = el("div", "dd-what-header");
+  whatHeader.appendChild(el("span", "dd-what-label", "What This Company Does"));
+  if (comp.industry) {
+    whatHeader.appendChild(el("span", "dd-industry-pill", comp.industry));
+  }
+  whatBox.appendChild(whatHeader);
+  whatBox.appendChild(el("div", "dd-what-text", pe.what_it_does));
+
+  const bannerCls =
+    sc.rating === "Buy"
+      ? "banner-buy"
+      : sc.rating === "Hold"
+      ? "banner-hold"
+      : sc.rating === "Avoid"
+      ? "banner-avoid"
+      : "";
+  whatBox.appendChild(
+    el("div", `dd-verdict-banner ${bannerCls}`.trim(), `Plain Verdict: ${pe.one_line_verdict}`)
+  );
+  hero.appendChild(whatBox);
   container.appendChild(hero);
 
-  // b) Step-by-Step Score Waterfall
-  const wfCard = el("div", "dd-section-card");
-  wfCard.appendChild(
-    el("div", "dd-section-title", `Why This Stock Scored ${sc.composite_score.toFixed(1)} / 100`)
+  // =========================================================================
+  // SECTION 2 — "The Bottom Line (30-Second Plain-English Summary)" + Ask AI Analyst
+  // =========================================================================
+  const blCard = el("div", "bottom-line-card");
+  const blHeader = el("div", "bottom-line-header");
+  const blTitleWrap = document.createElement("div");
+  blTitleWrap.appendChild(
+    el("div", "dd-section-title", "The Bottom Line (30-Second Plain-English Summary)")
   );
-  wfCard.appendChild(
+  blTitleWrap.appendChild(
+    el(
+      "div",
+      "muted-note",
+      "Why it earned this rank in plain money terms — business quality, stock price fairness & track record"
+    )
+  );
+  blHeader.appendChild(blTitleWrap);
+
+  const aiBtn = el("button", "btn-ai-memo", "✨ Ask AI Analyst (Custom Deep-Dive Memo)");
+  aiBtn.type = "button";
+  aiBtn.id = "dd-ai-memo-btn";
+  blHeader.appendChild(aiBtn);
+  blCard.appendChild(blHeader);
+
+  const blList = el("div", "bottom-line-list");
+  const summaryLines = Array.isArray(pe.bottom_line_summary) ? pe.bottom_line_summary : [];
+  summaryLines.slice(0, 3).forEach((sentence, idx) => {
+    const item = el("div", "bottom-line-item");
+    const stepCls = idx === 1 ? "bl-step-2" : idx === 2 ? "bl-step-3" : "";
+    item.appendChild(el("span", `bl-step-badge ${stepCls}`.trim(), String(idx + 1)));
+    item.appendChild(el("div", "bl-text", sentence));
+    blList.appendChild(item);
+  });
+  blCard.appendChild(blList);
+
+  const aiMemoMount = el("div", "ai-memo-mount");
+  blCard.appendChild(aiMemoMount);
+
+  if (state.aiMemoCache.has(sc.ticker)) {
+    renderAiMemoResultIntoMount(aiMemoMount, aiBtn, state.aiMemoCache.get(sc.ticker));
+  } else if (state.aiMemoInFlight.has(sc.ticker)) {
+    aiBtn.disabled = true;
+    aiBtn.textContent = "Generating AI Memo...";
+    const loadingBox = el("div", "ai-memo-loading");
+    loadingBox.appendChild(el("span", "ai-pulse-dot"));
+    loadingBox.appendChild(
+      el(
+        "span",
+        "",
+        "Generating plain-English analyst memo from 8Y financials & Street consensus..."
+      )
+    );
+    aiMemoMount.appendChild(loadingBox);
+  }
+
+  aiBtn.addEventListener("click", async () => {
+    const targetTicker = sc.ticker;
+    if (state.aiMemoCache.has(targetTicker)) {
+      renderAiMemoResultIntoMount(aiMemoMount, aiBtn, state.aiMemoCache.get(targetTicker));
+      return;
+    }
+    if (state.aiMemoInFlight.has(targetTicker)) {
+      return;
+    }
+
+    state.aiMemoInFlight.add(targetTicker);
+    aiBtn.disabled = true;
+    aiBtn.textContent = "Generating AI Memo...";
+    aiMemoMount.replaceChildren();
+    const loadingBox = el("div", "ai-memo-loading");
+    loadingBox.appendChild(el("span", "ai-pulse-dot"));
+    loadingBox.appendChild(
+      el(
+        "span",
+        "",
+        "Generating plain-English analyst memo from 8Y financials & Street consensus..."
+      )
+    );
+    aiMemoMount.appendChild(loadingBox);
+
+    try {
+      const memoRes = await fetchAiAnalystMemo(sc);
+      if (memoRes && memoRes.available !== false) {
+        state.aiMemoCache.set(targetTicker, memoRes);
+      }
+      if (state.selectedTicker === targetTicker && state.drawerOpen) {
+        renderAiMemoResultIntoMount(aiMemoMount, aiBtn, memoRes);
+      }
+    } finally {
+      state.aiMemoInFlight.delete(targetTicker);
+    }
+  });
+
+  container.appendChild(blCard);
+
+  // =========================================================================
+  // SECTION 3 — "How It Earned X / 100 (Simple Score Receipt)"
+  // =========================================================================
+  const receiptCard = el("div", "dd-section-card");
+  receiptCard.appendChild(
+    el(
+      "div",
+      "dd-section-title",
+      pro
+        ? `How It Earned ${sc.composite_score.toFixed(1)} / 100 — Weighted Pillar Waterfall`
+        : `How It Earned ${sc.composite_score.toFixed(1)} / 100 (Simple Score Receipt)`
+    )
+  );
+  receiptCard.appendChild(
     el(
       "div",
       "dd-section-sub",
-      `Exact weighted pillar contribution & guardrail waterfall under ${
-        PRESET_NAMES[bd.preset_used] || "Active Philosophy"
-      }`
+      pro
+        ? `Exact weighted pillar contributions & guardrail deductions under ${
+            PRESET_NAMES[bd.preset_used] || "Active Philosophy"
+          }`
+        : "Four everyday questions add up to 100 points — minus any red-flag deductions"
     )
   );
-  wfCard.appendChild(createContributionBarSvg(bd.contributions, 10));
+  receiptCard.appendChild(createContributionBarSvg(bd.contributions, 10));
 
-  const wfList = el("div", "waterfall-list");
-  const pillarRows = [
-    [
-      "1. Quality & 8Y Anti-Cyclical Moat",
-      sc.pillars.quality,
-      bd.weights_pct.quality,
-      bd.contributions.quality,
-      "text-pos",
-    ],
-    [
-      "2. 5Y Compounding + 2Q + Street Growth",
-      sc.pillars.growth,
-      bd.weights_pct.growth,
-      bd.contributions.growth,
-      "text-indigo",
-    ],
-    [
-      "3. GARP & Cyclical Fair P/E Valuation",
-      sc.pillars.value,
-      bd.weights_pct.value,
-      bd.contributions.value,
-      "text-cyan",
-    ],
-    [
-      "4. Piotroski, EPS Revisions & Smart Money",
-      sc.pillars.momentum,
-      bd.weights_pct.momentum,
-      bd.contributions.momentum,
-      "text-warn",
-    ],
-  ];
+  const receiptList = el("div", "receipt-list");
+  const stepPtsClasses = {
+    quality: "text-pos",
+    growth: "text-indigo",
+    value: "text-cyan",
+    momentum: "text-warn",
+  };
 
-  for (const [label, pScore, wPct, contrib, cls] of pillarRows) {
-    const row = el("div", "waterfall-row");
-    row.appendChild(el("div", "wf-label", label));
-    row.appendChild(
+  for (const step of pe.receipt_steps) {
+    const sRow = el("div", "receipt-step-row");
+    const mainCol = el("div", "receipt-step-main");
+    const titleLine = el("div", "receipt-title-line");
+    titleLine.appendChild(
+      el("span", "receipt-step-title", pro ? step.pro_title || step.simple_title : step.simple_title)
+    );
+    if (step.verdict_tag) {
+      titleLine.appendChild(el("span", verdictTagClass(step.verdict_tag), step.verdict_tag));
+    }
+    mainCol.appendChild(titleLine);
+    if (step.plain_why) {
+      mainCol.appendChild(el("div", "receipt-plain-why", step.plain_why));
+    }
+    sRow.appendChild(mainCol);
+
+    const rightCol = el("div", "receipt-step-right");
+    const ptsColor = stepPtsClasses[step.key] || "text-cyan";
+    const ptsAdded =
+      step.points_added !== undefined
+        ? Number(step.points_added)
+        : Number((bd.contributions && bd.contributions[step.key]) || 0);
+    const sc100 = Number(step.score_100 || 0);
+    const wtPct =
+      step.weight_pct !== undefined
+        ? Number(step.weight_pct)
+        : Number((bd.weights_pct && bd.weights_pct[step.key]) || 25);
+
+    rightCol.appendChild(el("div", `receipt-pts ${ptsColor}`, `+${ptsAdded.toFixed(1)} pts`));
+    rightCol.appendChild(
       el(
         "div",
-        "wf-math",
-        `${Number(pScore).toFixed(1)} / 100 × ${Number(wPct).toFixed(1)}% weight`
+        "receipt-sub-score",
+        pro
+          ? `${sc100.toFixed(1)} / 100 × ${wtPct.toFixed(1)}% wt`
+          : `${Math.round(sc100)} / 100 (${Math.round(wtPct)}% weight)`
       )
     );
-    row.appendChild(el("div", `wf-pts ${cls}`, `+${Number(contrib).toFixed(1)} pts`));
-    wfList.appendChild(row);
+    sRow.appendChild(rightCol);
+    receiptList.appendChild(sRow);
   }
 
-  const rawRow = el("div", "waterfall-row");
-  rawRow.appendChild(el("div", "wf-label", "Raw Weighted Score (Pre-Guardrails)"));
-  rawRow.appendChild(el("div", "wf-math", "Sum of 4 weighted institutional pillars"));
-  rawRow.appendChild(el("div", "wf-pts", `${Number(bd.raw_composite).toFixed(1)} pts`));
-  wfList.appendChild(rawRow);
-
+  // Red-flag deductions / clean safety check row
   const penItems = bd.penalty_items || [];
   if (penItems.length > 0) {
     for (const item of penItems) {
-      const pRow = el("div", "waterfall-row penalty-row");
-      pRow.appendChild(el("div", "wf-label text-neg", "Guardrail Penalty"));
-      pRow.appendChild(el("div", "wf-math", item.reason));
+      const pRow = el("div", "receipt-step-row penalty-row");
+      const pMain = el("div", "receipt-step-main");
+      const pTitleLine = el("div", "receipt-title-line");
+      pTitleLine.appendChild(
+        el(
+          "span",
+          "receipt-step-title text-neg",
+          pro ? "Guardrail Penalty" : "Red-Flag Deduction"
+        )
+      );
+      pMain.appendChild(pTitleLine);
+      pMain.appendChild(
+        el("div", "receipt-plain-why", pro ? item.reason : formatPlainPenaltyReason(item.reason))
+      );
+      pRow.appendChild(pMain);
+
+      const pRight = el("div", "receipt-step-right");
       const ptsNum = Number(item.points || 0);
       const ptsStr = ptsNum < 0 ? `${ptsNum.toFixed(1)} pts` : `-${ptsNum.toFixed(1)} pts`;
-      pRow.appendChild(el("div", "wf-pts text-neg", ptsStr));
-      wfList.appendChild(pRow);
+      pRight.appendChild(el("div", "receipt-pts text-neg", ptsStr));
+      pRight.appendChild(el("div", "receipt-sub-score", "Safety deduction"));
+      pRow.appendChild(pRight);
+      receiptList.appendChild(pRow);
     }
   } else {
-    const cleanRow = el("div", "waterfall-row");
-    cleanRow.appendChild(el("div", "wf-label text-pos", "Forensic & Valuation Guardrails"));
-    cleanRow.appendChild(
-      el("div", "wf-math", "Zero balance-sheet, cash-flow, or valuation penalties triggered")
+    const cleanRow = el("div", "receipt-step-row clean-row");
+    const cMain = el("div", "receipt-step-main");
+    cMain.appendChild(
+      el(
+        "div",
+        "receipt-step-title text-pos",
+        pro ? "Forensic & Valuation Guardrails" : "Red-Flag & Safety Check"
+      )
     );
-    cleanRow.appendChild(el("div", "wf-pts text-pos", "0.0 pts"));
-    wfList.appendChild(cleanRow);
+    cMain.appendChild(
+      el(
+        "div",
+        "receipt-plain-why",
+        "Zero accounting, debt, or sudden profit-drop red flags triggered"
+      )
+    );
+    cleanRow.appendChild(cMain);
+    const cRight = el("div", "receipt-step-right");
+    cRight.appendChild(el("div", "receipt-pts text-pos", "0.0 pts"));
+    cRight.appendChild(el("div", "receipt-sub-score", "No deductions"));
+    cleanRow.appendChild(cRight);
+    receiptList.appendChild(cleanRow);
   }
 
-  const totalRow = el("div", "waterfall-row total-row");
-  totalRow.appendChild(el("div", "wf-label", "Final Composite Score"));
-  totalRow.appendChild(
+  const totalRow = el("div", "receipt-step-row total-row");
+  const tMain = el("div", "receipt-step-main");
+  tMain.appendChild(
+    el("div", "receipt-step-title", pro ? "Final Composite Score" : "Final Overall Score")
+  );
+  tMain.appendChild(
     el(
       "div",
-      "wf-math",
-      `${Number(bd.raw_composite).toFixed(1)} raw − ${Number(bd.total_penalty || 0).toFixed(
-        1
-      )} penalties`
+      "receipt-plain-why",
+      `${Number(bd.raw_composite).toFixed(1)} points from 4 steps − ${Number(
+        bd.total_penalty || 0
+      ).toFixed(1)} red-flag deductions`
     )
   );
-  totalRow.appendChild(
-    el("div", "wf-pts text-pos", `${sc.composite_score.toFixed(1)} / 100`)
+  totalRow.appendChild(tMain);
+
+  const tRight = el("div", "receipt-step-right");
+  tRight.appendChild(
+    el("div", "receipt-pts text-pos", `${sc.composite_score.toFixed(1)} / 100`)
   );
-  wfList.appendChild(totalRow);
-  wfCard.appendChild(wfList);
+  tRight.appendChild(el("div", "receipt-sub-score", sc.rating));
+  totalRow.appendChild(tRight);
+  receiptList.appendChild(totalRow);
 
-  if (bd.rating_rule) {
-    wfCard.appendChild(el("div", "rule-verdict-box", `Verdict Rule: ${bd.rating_rule}`));
+  receiptCard.appendChild(receiptList);
+  if (pro && bd.rating_rule) {
+    receiptCard.appendChild(el("div", "rule-verdict-box", `Verdict Rule: ${bd.rating_rule}`));
   }
-  container.appendChild(wfCard);
+  container.appendChild(receiptCard);
 
-  // c) Bull Thesis vs Forensic/Valuation Guardrails (2-column cards)
-  const thesisGrid = el("div", "dd-two-col");
-
-  const bullBox = el("div", "thesis-box");
-  bullBox.appendChild(el("div", "thesis-title text-pos", "Institutional Bull Thesis & Moats"));
-  const bullList = el("ul", "thesis-list");
-  for (const sItem of sc.strengths || []) {
-    bullList.appendChild(el("li", "", `✓ ${sItem}`));
-  }
-  bullBox.appendChild(bullList);
-  thesisGrid.appendChild(bullBox);
-
-  const flagBox = el("div", "thesis-box");
-  const hasFlags = sc.red_flags && sc.red_flags.length > 0;
-  flagBox.appendChild(
-    el(
-      "div",
-      hasFlags ? "thesis-title text-neg" : "thesis-title text-cyan",
-      "Forensic & Valuation Guardrails"
-    )
-  );
-  const flagList = el("ul", "thesis-list");
-  if (hasFlags) {
-    for (const fItem of sc.red_flags) {
-      flagList.appendChild(el("li", "text-neg", `⚠ ${fItem}`));
+  // In Pro View, also show Institutional Bull Thesis vs Forensic Guardrail bullets
+  if (pro) {
+    const thesisGrid = el("div", "dd-two-col");
+    const bullBox = el("div", "thesis-box");
+    bullBox.appendChild(el("div", "thesis-title text-pos", "Institutional Bull Thesis & Moats"));
+    const bullList = el("ul", "thesis-list");
+    for (const sItem of sc.strengths || []) {
+      bullList.appendChild(el("li", "", `✓ ${sItem}`));
     }
-  } else {
-    flagList.appendChild(
-      el("li", "text-pos", "✓ Zero forensic accounting, leverage, or earnings contraction flags")
-    );
-    flagList.appendChild(
-      el("li", "", `✓ Profitable in ${m.profit_consistency || "5/5"} recent audited fiscal years`)
-    );
-    flagList.appendChild(
-      el("li", "", `✓ Valuation check: ${sc.valuation_zone || "Fair GARP Price"}`)
-    );
-  }
-  flagBox.appendChild(flagList);
-  thesisGrid.appendChild(flagBox);
-  container.appendChild(thesisGrid);
+    bullBox.appendChild(bullList);
+    thesisGrid.appendChild(bullBox);
 
-  // c2) Street & Institutional Consensus Panel (rendered whenever analyst coverage exists)
+    const flagBox = el("div", "thesis-box");
+    const hasFlags = sc.red_flags && sc.red_flags.length > 0;
+    flagBox.appendChild(
+      el(
+        "div",
+        hasFlags ? "thesis-title text-neg" : "thesis-title text-cyan",
+        "Forensic & Valuation Guardrails"
+      )
+    );
+    const flagList = el("ul", "thesis-list");
+    if (hasFlags) {
+      for (const fItem of sc.red_flags) {
+        flagList.appendChild(el("li", "text-neg", `⚠ ${fItem}`));
+      }
+    } else {
+      flagList.appendChild(
+        el("li", "text-pos", "✓ Zero forensic accounting, leverage, or earnings contraction flags")
+      );
+      flagList.appendChild(
+        el(
+          "li",
+          "",
+          `✓ Profitable in ${m.profit_consistency || "5/5"} recent audited fiscal years`
+        )
+      );
+      flagList.appendChild(
+        el("li", "", `✓ Valuation check: ${sc.valuation_zone || "Fair GARP Price"}`)
+      );
+    }
+    flagBox.appendChild(flagList);
+    thesisGrid.appendChild(flagBox);
+    container.appendChild(thesisGrid);
+  }
+
+  // =========================================================================
+  // SECTION 4 — 4 Plain-English Question Cards (2x2 Grid)
+  // =========================================================================
+  const stepBarHex = {
+    quality: "#10b981",
+    growth: "#818cf8",
+    value: "#38bdf8",
+    momentum: "#f59e0b",
+  };
+  const qGrid = el("div", "dd-two-col");
+
+  pe.receipt_steps.forEach((step, idx) => {
+    const qCard = el("div", "question-card");
+    const qHead = el("div", "q-card-header");
+    const qTitleWrap = el("div", "q-card-title-wrap");
+    qTitleWrap.appendChild(
+      el("span", "ev-title", pro ? step.pro_title || step.simple_title : step.simple_title)
+    );
+    if (step.verdict_tag) {
+      qTitleWrap.appendChild(el("span", verdictTagClass(step.verdict_tag), step.verdict_tag));
+    }
+    qHead.appendChild(qTitleWrap);
+
+    const scColor = stepPtsClasses[step.key] || "text-cyan";
+    const scVal = Number(step.score_100 || 0);
+    qHead.appendChild(
+      el("span", `q-card-score ${scColor}`, `${scVal.toFixed(pro ? 1 : 0)} / 100`)
+    );
+    qCard.appendChild(qHead);
+    qCard.appendChild(createProgressSvg(scVal, stepBarHex[step.key] || "#38bdf8"));
+
+    const rowsWrap = el("div", "q-metrics-list");
+    for (const row of step.rows || []) {
+      const mRow = el("div", "q-metric-row");
+      const left = el("div", "q-m-left");
+      const right = el("div", "q-m-right");
+      const tCls = toneClass(row.tone);
+
+      if (pro) {
+        left.appendChild(el("span", "q-m-label", row.pro_label || row.simple_label));
+        const subParts = [row.simple_label, row.target_hint].filter(Boolean);
+        if (subParts.length > 0) {
+          left.appendChild(el("span", "q-m-sub", subParts.join(" • ")));
+        }
+        right.appendChild(
+          el("span", `q-m-val ${tCls}`.trim(), row.pro_value || row.simple_value)
+        );
+        if (row.simple_value && row.simple_value !== row.pro_value) {
+          right.appendChild(el("span", "q-m-val-sub", row.simple_value));
+        }
+      } else {
+        left.appendChild(el("span", "q-m-label", row.simple_label));
+        if (row.target_hint) {
+          left.appendChild(el("span", "q-m-sub", row.target_hint));
+        }
+        right.appendChild(el("span", `q-m-val ${tCls}`.trim(), row.simple_value));
+      }
+
+      mRow.appendChild(left);
+      mRow.appendChild(right);
+      rowsWrap.appendChild(mRow);
+    }
+    qCard.appendChild(rowsWrap);
+
+    // Card 4: Plain-English Safety Checks in Simple View, Piotroski Checks in Pro View
+    if (step.key === "momentum" || idx === 3) {
+      const checksToShow = pro
+        ? sc.piotroski_checks && sc.piotroski_checks.length > 0
+          ? sc.piotroski_checks
+          : pe.safety_checks_plain || []
+        : pe.safety_checks_plain && pe.safety_checks_plain.length > 0
+        ? pe.safety_checks_plain
+        : [];
+      if (checksToShow.length > 0) {
+        const checksWrap = el("div", "fscore-checks-wrap");
+        for (const chk of checksToShow) {
+          checksWrap.appendChild(el("span", "check-pill", `✓ ${chk}`));
+        }
+        qCard.appendChild(checksWrap);
+      }
+    }
+
+    qGrid.appendChild(qCard);
+  });
+
+  container.appendChild(qGrid);
+
+  // =========================================================================
+  // SECTION 5 — Expert / Analyst Consensus Card + 5Y Price Chart + 6Y Financials
+  // =========================================================================
   if (sc.street && sc.street.has_coverage && Number(sc.street.analyst_count || 0) > 0) {
-    container.appendChild(buildStreetConsensusCard(sc, mergedMarketObj, ccy));
+    container.appendChild(buildStreetConsensusCard(sc, mergedMarketObj, ccy, pro));
   }
 
-  // d) 4-Pillar Evidence Breakdown (2x2 Grid)
-  const evGrid = el("div", "dd-two-col");
-
-  // Card 1: Quality & 8Y Moat
-  const qCard = el("div", "evidence-card");
-  const qHead = el("div", "ev-header");
-  qHead.appendChild(el("span", "ev-title", "Quality & 8Y Anti-Cyclical Moat"));
-  qHead.appendChild(el("span", "ev-score text-pos", `${sc.pillars.quality.toFixed(1)} / 100`));
-  qCard.appendChild(qHead);
-  qCard.appendChild(createProgressSvg(sc.pillars.quality, "#10b981"));
-  const qMetrics = el("div", "ev-metrics");
-  qMetrics.appendChild(
-    buildEvidenceMetricRow(
-      `5Y Median ${sc.is_financial ? "ROE" : "ROCE"}`,
-      `Target: ≥ ${sc.is_financial ? "15%" : "18%"} across cycle`,
-      `${m.med_5y_roce_pct}% (Latest ${m.roce_pct}%)`,
-      m.med_5y_roce_pct >= (sc.is_financial ? 15 : 18) ? "text-pos" : ""
-    )
-  );
-  qMetrics.appendChild(
-    buildEvidenceMetricRow(
-      "8Y Cycle Floor & Moat Stability",
-      "Target: Floor ≥ 10% • Stability ≥ 65/100",
-      `Floor ${m.cycle_floor_roce_pct}% • ${m.moat_stability_score}/100`,
-      m.moat_stability_score >= 65 ? "text-pos" : ""
-    )
-  );
-  if (sc.is_financial) {
-    const npaText =
-      m.gnpa_pct > 0
-        ? `GNPA ${m.gnpa_pct}% / NNPA ${m.nnpa_pct}%`
-        : `ROA ${m.roa_pct}% (${m.profit_consistency} yrs PAT > 0)`;
-    qMetrics.appendChild(
-      buildEvidenceMetricRow(
-        "Banking Asset Quality & ROA",
-        "Target: ROA ≥ 1.2% • Net NPA ≤ 1.0%",
-        npaText,
-        m.roa_pct >= 1.2 ? "text-pos" : ""
-      )
-    );
-  } else {
-    qMetrics.appendChild(
-      buildEvidenceMetricRow(
-        "5Y Cumulative CFO / EBITDA",
-        "Target: ≥ 80% cash conversion",
-        `${m.cfo_to_ebitda_pct}% (${m.profit_consistency} yrs PAT > 0)`,
-        m.cfo_to_ebitda_pct >= 80 ? "text-pos" : m.cfo_to_ebitda_pct < 55 ? "text-neg" : ""
-      )
-    );
-  }
-  qMetrics.appendChild(
-    buildEvidenceMetricRow(
-      "Debt / Equity & Operating Margin",
-      sc.is_financial ? "Capitalised leverage • OPM" : "Target: D/E ≤ 0.5x • OPM ≥ 15%",
-      `D/E ${m.debt_to_equity}x • OPM ${m.op_margin_pct}%`,
-      !sc.is_financial && m.debt_to_equity <= 0.5 ? "text-pos" : ""
-    )
-  );
-  qCard.appendChild(qMetrics);
-  evGrid.appendChild(qCard);
-
-  // Card 2: GARP Valuation
-  const vCard = el("div", "evidence-card");
-  const vHead = el("div", "ev-header");
-  vHead.appendChild(el("span", "ev-title", "GARP & Fair P/E Valuation"));
-  vHead.appendChild(el("span", "ev-score text-cyan", `${sc.pillars.value.toFixed(1)} / 100`));
-  vCard.appendChild(vHead);
-  vCard.appendChild(createProgressSvg(sc.pillars.value, "#38bdf8"));
-  const vMetrics = el("div", "ev-metrics");
-  vMetrics.appendChild(
-    buildEvidenceMetricRow(
-      "Current P/E vs Fair GARP P/E",
-      "Target: CMP P/E ≤ 1.1x Fair P/E",
-      formatPeVsFair(m),
-      m.pe_ratio <= m.fair_pe * 1.1 ? "text-pos" : m.pe_ratio > m.fair_pe * 1.5 ? "text-warn" : ""
-    )
-  );
-  vMetrics.appendChild(
-    buildEvidenceMetricRow(
-      "PEG Ratio (Growth-Adjusted)",
-      "Target: PEG ≤ 1.5x",
-      `${m.peg_ratio}x`,
-      m.peg_ratio <= 1.5 ? "text-pos" : m.peg_ratio > 2.2 ? "text-warn" : ""
-    )
-  );
-  vMetrics.appendChild(
-    buildEvidenceMetricRow(
-      "Earnings Yield & FCF Yield",
-      "Target: EY ≥ 4.5% • FCF ≥ 2.5%",
-      `EY ${m.earnings_yield_pct}% • FCF ${m.fcf_yield_pct}%`
-    )
-  );
-  vMetrics.appendChild(
-    buildEvidenceMetricRow(
-      "Price / Book & EV / EBITDA",
-      "Balance-sheet & enterprise multiple",
-      `P/B ${m.pb_ratio}x • EV/EBITDA ${m.ev_ebitda}x`
-    )
-  );
-  vCard.appendChild(vMetrics);
-  evGrid.appendChild(vCard);
-
-  // Card 3: 5Y + 2Q Growth
-  const gCard = el("div", "evidence-card");
-  const gHead = el("div", "ev-header");
-  gHead.appendChild(el("span", "ev-title", "5Y Compounding + Latest 2Q Growth"));
-  gHead.appendChild(el("span", "ev-score text-indigo", `${sc.pillars.growth.toFixed(1)} / 100`));
-  gCard.appendChild(gHead);
-  gCard.appendChild(createProgressSvg(sc.pillars.growth, "#818cf8"));
-  const gMetrics = el("div", "ev-metrics");
-  gMetrics.appendChild(
-    buildEvidenceMetricRow(
-      "Sales CAGR (5Y / 3Y)",
-      "Target: ≥ 12% structural top-line",
-      `${m.rev_cagr_5y_pct}% (5Y) • ${m.rev_cagr_3y_pct}% (3Y)`,
-      m.rev_cagr_5y_pct >= 12 ? "text-pos" : ""
-    )
-  );
-  gMetrics.appendChild(
-    buildEvidenceMetricRow(
-      "Net Profit CAGR (5Y / 3Y)",
-      "Target: ≥ 15% earnings compounding",
-      `${m.pat_cagr_5y_pct}% (5Y) • ${m.pat_cagr_3y_pct}% (3Y)`,
-      m.pat_cagr_5y_pct >= 15 ? "text-pos" : m.pat_cagr_3y_pct < 0 ? "text-neg" : ""
-    )
-  );
-  gMetrics.appendChild(
-    buildEvidenceMetricRow(
-      `Latest 2Q Sales & PAT YoY${m.latest_qtr_label ? ` (${m.latest_qtr_label})` : ""}`,
-      "Target: Positive quarterly trajectory",
-      `Sales ${fmtSigned(m.qtr_rev_yoy_pct)}% • PAT ${fmtSigned(m.qtr_pat_yoy_pct)}%`,
-      m.qtr_pat_yoy_pct >= 12 ? "text-pos" : m.qtr_pat_yoy_pct < 0 ? "text-neg" : ""
-    )
-  );
-  gMetrics.appendChild(
-    buildEvidenceMetricRow(
-      "Quarterly Margin Δ YoY",
-      "Target: Stable / expanding OPM",
-      `${fmtSigned(m.qtr_opm_delta_pct)} pp`,
-      m.qtr_opm_delta_pct >= 0 ? "text-pos" : "text-warn"
-    )
-  );
-  gCard.appendChild(gMetrics);
-  evGrid.appendChild(gCard);
-
-  // Card 4: Piotroski, Street Revisions & Smart Money
-  const mCard = el("div", "evidence-card");
-  const mHead = el("div", "ev-header");
-  mHead.appendChild(el("span", "ev-title", "Piotroski, Revisions & Smart Money"));
-  mHead.appendChild(el("span", "ev-score text-warn", `${sc.pillars.momentum.toFixed(1)} / 100`));
-  mCard.appendChild(mHead);
-  mCard.appendChild(createProgressSvg(sc.pillars.momentum, "#f59e0b"));
-  const mMetrics = el("div", "ev-metrics");
-  mMetrics.appendChild(
-    buildEvidenceMetricRow(
-      "Piotroski F-Score",
-      "Target: ≥ 7 / 9 institutional grade",
-      `${m.piotroski_f_score} / 9`,
-      m.piotroski_f_score >= 7 ? "text-pos" : m.piotroski_f_score <= 4 ? "text-neg" : ""
-    )
-  );
-  if (
-    sc.street &&
-    sc.street.has_coverage &&
-    bd.sub_scores &&
-    bd.sub_scores.eps_revision_momentum !== undefined
-  ) {
-    const revSubScore = Number(bd.sub_scores.eps_revision_momentum || 50);
-    mMetrics.appendChild(
-      buildEvidenceMetricRow(
-        "Street EPS Revision Sub-Score",
-        "30d/90d sell-side upgrade breadth",
-        `${revSubScore.toFixed(0)} / 100 (${Math.round(Number(sc.street.consensus_buy_pct || 0))}% Buy)`,
-        revSubScore >= 60 ? "text-pos" : revSubScore <= 35 ? "text-neg" : "text-cyan"
-      )
-    );
-  }
-  const ownVal = us
-    ? `Inst ${m.inst_pct}%${m.promoter_pct > 0 ? ` • Insider ${m.promoter_pct}%` : ""}`
-    : `Prom ${m.promoter_pct}% • Inst ${m.inst_pct}% (4Q Δ ${fmtSigned(m.inst_chg_1y_pct)}%)`;
-  mMetrics.appendChild(
-    buildEvidenceMetricRow(
-      us ? "Institutional & Insider Ownership" : "Promoter & Institutional Ownership",
-      "Long-term alignment & 4Q flow",
-      ownVal
-    )
-  );
-  mMetrics.appendChild(
-    buildEvidenceMetricRow(
-      "12M-1M Momentum & Volatility",
-      "Target: Steady trend • Vol ≤ 30%",
-      `${fmtSigned(m.mom_12_1_pct)}% Mom • ${m.volatility_pct}% Vol`,
-      m.mom_12_1_pct >= 0 ? "text-pos" : "text-warn"
-    )
-  );
-  mCard.appendChild(mMetrics);
-
-  if (sc.piotroski_checks && sc.piotroski_checks.length > 0) {
-    const checksWrap = el("div", "fscore-checks-wrap");
-    for (const chk of sc.piotroski_checks) {
-      checksWrap.appendChild(el("span", "check-pill", `✓ ${chk}`));
-    }
-    mCard.appendChild(checksWrap);
-  }
-  evGrid.appendChild(mCard);
-  container.appendChild(evGrid);
-
-  // e1) 5-Year Price Chart
+  // 5-Year Price Chart
   const chartCard = el("div", "dd-section-card");
   const idxChartLabel =
     idxTag === "NASDAQ100"
@@ -1948,10 +2856,22 @@ function renderCompanyDetail(detail) {
       ? "rgba(56, 189, 248, 0.14)"
       : "rgba(16, 185, 129, 0.12)";
   chartCard.appendChild(
-    el("div", "dd-section-title", `5-Year Historical Price Trajectory (${idxChartLabel})`)
+    el(
+      "div",
+      "dd-section-title",
+      pro
+        ? `5-Year Historical Price Trajectory (${idxChartLabel})`
+        : `5-Year Stock Price History (${idxChartLabel})`
+    )
   );
   chartCard.appendChild(
-    el("div", "dd-section-sub", "Daily adjusted close history used for point-in-time valuation & momentum")
+    el(
+      "div",
+      "dd-section-sub",
+      pro
+        ? "Daily adjusted close history used for point-in-time valuation & momentum"
+        : `5-year share price trend in ${ccy === "USD" ? "US Dollars ($)" : "Indian Rupees (₹)"}`
+    )
   );
   const chartBox = el("div", "chart-box-sm");
   chartCard.appendChild(chartBox);
@@ -1973,22 +2893,28 @@ function renderCompanyDetail(detail) {
     { height: 185 }
   );
 
-  // e2) 6-Year Audited Financials Table
+  // 6-Year Audited Financials Table (Clear plain-English headers in Simple View, Pro labels in Pro View)
   const finCard = el("div", "dd-section-card");
   finCard.appendChild(
     el(
       "div",
       "dd-section-title",
-      `6-Year Audited Consolidated Financials (${us ? "USD Millions · $M" : "INR Crores · ₹Cr"})`
+      pro
+        ? `6-Year Audited Consolidated Financials (${us ? "USD Millions · $M" : "INR Crores · ₹Cr"})`
+        : `6-Year Sales & Profit Track Record (${
+            us ? "Amounts in $ Millions" : "Amounts in ₹ Crores"
+          })`
     )
   );
   finCard.appendChild(
     el(
       "div",
       "dd-section-sub",
-      us
-        ? "Official SEC EDGAR XBRL 10-K audited annual statements"
-        : "Audited consolidated NSE annual filings"
+      pro
+        ? us
+          ? "Official SEC EDGAR XBRL 10-K audited annual statements"
+          : "Audited consolidated NSE annual filings"
+        : "Official audited yearly company results over the last 6 financial years"
     )
   );
 
@@ -1997,15 +2923,26 @@ function renderCompanyDetail(detail) {
   const thead = document.createElement("thead");
   const htr = document.createElement("tr");
   const unitTag = us ? "($M)" : "(₹Cr)";
-  for (const col of [
-    "FY",
-    `Sales ${unitTag}`,
-    `EBITDA ${unitTag}`,
-    `PAT ${unitTag}`,
-    sc.is_financial ? "ROE %" : "ROCE %",
-    "OPM %",
-    sc.is_financial ? "D/E" : "CFO/EBITDA",
-  ]) {
+  const finCols = pro
+    ? [
+        "FY",
+        `Sales ${unitTag}`,
+        `EBITDA ${unitTag}`,
+        `PAT ${unitTag}`,
+        sc.is_financial ? "ROE %" : "ROCE %",
+        "OPM %",
+        sc.is_financial ? "D/E" : "CFO/EBITDA",
+      ]
+    : [
+        "Year",
+        `Annual Sales ${unitTag}`,
+        `Operating Profit ${unitTag}`,
+        `Net Profit ${unitTag}`,
+        sc.is_financial ? "Return on Equity" : "Return on Capital",
+        "Profit Margin",
+        sc.is_financial ? `Shareholder Equity ${unitTag}` : "Cash Conversion",
+      ];
+  for (const col of finCols) {
     htr.appendChild(el("th", "", col));
   }
   thead.appendChild(htr);
@@ -2024,13 +2961,27 @@ function renderCompanyDetail(detail) {
     );
     r.appendChild(el("td", "", `${sc.is_financial ? f.roe_pct : f.roce_pct}%`));
     r.appendChild(el("td", "", `${f.op_margin_pct}%`));
-    r.appendChild(
-      el(
-        "td",
-        "",
-        sc.is_financial ? `${f.debt_to_equity}x` : `${Math.round(Number(f.cfo_to_ebitda_pct || 0))}%`
-      )
-    );
+    if (pro) {
+      r.appendChild(
+        el(
+          "td",
+          "",
+          sc.is_financial
+            ? `${f.debt_to_equity}x`
+            : `${Math.round(Number(f.cfo_to_ebitda_pct || 0))}%`
+        )
+      );
+    } else {
+      r.appendChild(
+        el(
+          "td",
+          "",
+          sc.is_financial
+            ? Math.round(Number(f.total_equity_cr || 0)).toLocaleString(locale)
+            : `${Math.round(Number(f.cfo_to_ebitda_pct || 0))}%`
+        )
+      );
+    }
     ftbody.appendChild(r);
   }
   fTable.appendChild(ftbody);
@@ -2343,7 +3294,7 @@ function renderPlannerResults(plan) {
       el("div", "company-primary", formatStockPrice(s.price, stockCurrency(s)))
     );
     cmpTd.appendChild(
-      el("span", "sector-sub", `P/E ${s.pe_ratio}x vs Fair ~${s.fair_pe}x`)
+      el("span", "sector-sub", `P/E ${formatPeVsFair({ pe_ratio: s.pe_ratio, fair_pe: s.fair_pe })}`)
     );
     tr.appendChild(cmpTd);
 
@@ -2750,6 +3701,12 @@ document.addEventListener("DOMContentLoaded", () => {
   // Planner & Backtest Controls
   document.getElementById("run-planner-btn").addEventListener("click", runPlanner);
   document.getElementById("run-backtest-btn").addEventListener("click", runBacktest);
+
+  // Simple / Pro Explanation Mode Switchers (Leaderboard & Sticky Deep Dive Drawer)
+  document.getElementById("screener-mode-simple-btn").addEventListener("click", () => setProMode(false));
+  document.getElementById("screener-mode-pro-btn").addEventListener("click", () => setProMode(true));
+  document.getElementById("dd-mode-simple-btn").addEventListener("click", () => setProMode(false));
+  document.getElementById("dd-mode-pro-btn").addEventListener("click", () => setProMode(true));
 
   // Slide-Over Deep Dive Drawer Controls
   document.getElementById("dd-close-btn").addEventListener("click", closeDeepDive);

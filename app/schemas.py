@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 TICKER_RE = re.compile(r"^[A-Z0-9&-]{1,20}(\.(NS|BO))?$")
 
@@ -68,6 +68,33 @@ class TickerSyncRequest(BaseModel):
             cleaned = f"{cleaned}.NS"
         if not TICKER_RE.match(cleaned):
             raise ValueError("Invalid NSE/BSE ticker symbol.")
+        return cleaned
+
+
+class AiMemoScoreSummary(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    composite_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    quality_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    growth_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    value_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    momentum_score: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    rank: Optional[int] = Field(default=None, ge=1, le=5000)
+
+
+class AiMemoRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    ticker: str = Field(..., min_length=1, max_length=24)
+    preset: StrategyPreset = "qglp_compounder"
+    score_summary: Optional[AiMemoScoreSummary] = None
+
+    @field_validator("ticker")
+    @classmethod
+    def validate_memo_ticker(cls, value: str) -> str:
+        cleaned = value.strip().upper()
+        if not TICKER_RE.match(cleaned):
+            raise ValueError("Invalid NSE/BSE or US ticker symbol.")
         return cleaned
 
 

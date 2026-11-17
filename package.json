@@ -1,0 +1,21 @@
+{
+  "name": "artha-quant",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ArthaQuant V3.0 — Plain-English Quantitative Screener & Netlify AI Analyst Function",
+  "scripts": {
+    "build": "sh scripts/build_netlify.sh"
+  },
+  "dependencies": {
+    "@google/genai": "^1.7.0",
+    "@netlify/blobs": "^10.0.2",
+    "@netlify/functions": "^6.0.3",
+    "openai": "^5.8.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "esbuild": "^0.25.5",
+    "typescript": "^5.8.3"
+  }
+}

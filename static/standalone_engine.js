@@ -503,6 +503,1019 @@ function computePiotroskiFScore(latest, prev, isFinancial) {
   return [score, checks];
 }
 
+const OIL_AND_COMMODITY_KEYWORDS = [
+  "oil & gas e&p",
+  "oil & gas integrated",
+  "oil & gas refining",
+  "oil & gas equipment",
+  "petroleum",
+  "coal",
+  "exxon",
+  "chevron",
+  "conocophillips",
+  "occidental",
+  "valero",
+  "phillips 66",
+  "marathon",
+  "halliburton",
+  "schlumberger",
+  "baker hughes",
+  "devon",
+  "diamondback",
+  "eog ",
+  "reliance",
+  "oil india",
+  "natural gas corpn",
+];
+
+const PIOTROSKI_PLAIN_MAP = {
+  "Positive Net Profit (PAT > 0)": "Made a net profit this year",
+  "Healthy Banking ROE (>= 12%)": "Earned healthy returns on shareholder money (12%+)",
+  "Strong Banking ROA (>= 1.0%)": "Earned solid profit on total lending assets",
+  "Positive Operating Cash Flow (CFO > 0)": "Generated positive cash from day-to-day operations",
+  "Clean Accrual Quality (CFO >= 0.9x PAT)": "Reported profits are backed by real bank cash",
+  "Stable/Improving Return on Assets": "Profitability on company assets held steady or improved",
+  "Controlled Balance Sheet Leverage": "Kept debt levels controlled vs last year",
+  "Healthy Liquidity Trend": "Maintained a healthy short-term cash cushion",
+  "No Material Equity Dilution": "Did not dilute shareholders with extra shares",
+  "Resilient Operating Margin": "Protected profit margins on sales vs last year",
+  "Stable/Improving Asset Turnover": "Generated steady or higher sales from company assets",
+};
+
+function peRoundInt(val) {
+  const r = Math.floor(Number(val) + 0.5);
+  return r === 0 ? 0 : r;
+}
+
+function peRoundDec(val, decimals = 1) {
+  const f = Math.pow(10, decimals);
+  const res = Math.floor(Number(val) * f + 0.5) / f;
+  return res === 0 ? 0 : res;
+}
+
+function peFmt(val, decimals = 1) {
+  if (decimals <= 0) return String(peRoundInt(val));
+  let v = peRoundDec(val, decimals);
+  if (Math.abs(v - 99.9) < 1e-6) v = 100.0;
+  return v.toFixed(decimals);
+}
+
+function peSfmt(val, decimals = 1) {
+  if (decimals <= 0) {
+    const iv = peRoundInt(val);
+    return iv >= 0 ? `+${iv}` : String(iv);
+  }
+  let v = peRoundDec(val, decimals);
+  if (Math.abs(v - 99.9) < 1e-6) v = 100.0;
+  return `${v >= 0 ? "+" : ""}${v.toFixed(decimals)}`;
+}
+
+function peVerdictTag(score100) {
+  if (score100 >= 75.0) return "Standout";
+  if (score100 >= 58.0) return "Solid";
+  if (score100 >= 42.0) return "Mixed";
+  return "Weak / Expensive";
+}
+
+function translatePenaltyReason(rawReason, isFin) {
+  const low = String(rawReason || "").toLowerCase();
+  if (low.includes("loss-making")) return "unprofitable in the latest year";
+  if (low.includes("inconsistent profitability")) {
+    const m = String(rawReason || "").match(/\((\d+\/\d+)\s+profitable/);
+    const yrTxt = m ? m[1] : "fewer";
+    return `inconsistent yearly profits (${yrTxt} profitable years)`;
+  }
+  if (low.includes("widespread sell-side eps cuts")) {
+    return "covering bank analysts recently cut profit forecasts";
+  }
+  if (low.includes("negative net worth")) return "negative shareholder net worth";
+  if (low.includes("high corporate debt")) {
+    return isFin ? "heavy balance-sheet debt load" : "heavy corporate debt load";
+  }
+  if (low.includes("weak 5y cumulative cash conversion")) {
+    return "weak conversion of paper profits into real cash";
+  }
+  if (low.includes("structural multi-year profit contraction")) {
+    return "multi-year decline in annual profits";
+  }
+  if (low.includes("recent 2q earnings slowdown")) {
+    return "recent quarterly profit and sales slowdown";
+  }
+  if (low.includes("promoter/institutional exit")) {
+    return "recent selling by founders or institutional investors";
+  }
+  if (low.includes("elevated banking npas")) {
+    return "elevated bad loans on the lending book";
+  }
+  if (low.includes("commodity cyclicality risk")) {
+    return "wide profit swings across commodity cycles";
+  }
+  if (low.includes("weak piotroski")) {
+    return "weak annual financial health checklist score";
+  }
+  if (low.includes("valuation rich")) {
+    return "stretched stock price relative to fair value";
+  }
+  return "fundamental caution flag";
+}
+
+function translatePiotroskiChecks(checks) {
+  const out = [];
+  for (const chk of checks || []) {
+    const mapped = PIOTROSKI_PLAIN_MAP[chk];
+    if (mapped) out.push(mapped);
+  }
+  return out;
+}
+
+function buildPlainEnglish(ctx) {
+  const compName = String(ctx.name || ctx.ticker || "This company").trim();
+  const compSector = String(ctx.sector || "Diversified").trim();
+  const industryStr = String(ctx.industry || "").trim();
+  const rawSummary = String(ctx.business_summary || "").trim();
+  const marketCode = String(ctx.market_code || "IN");
+  const currency = String(ctx.currency || (marketCode === "US" ? "USD" : "INR"));
+  const ccySym = currency === "USD" ? "$" : "₹";
+  const hundredUnit = `${ccySym}100`;
+
+  const isFin = Boolean(ctx.is_fin);
+  const isCommodityBiz = Boolean(ctx.is_commodity_biz);
+  const isCyclical = Boolean(ctx.is_cyclical);
+  const buybackEquity = Boolean(ctx.buyback_distorted_equity);
+
+  const patCr = safeFloat(ctx.pat_cr, 0.0);
+  const patFyCr = safeFloat(ctx.pat_fy_cr, 0.0);
+  const equityCr = safeFloat(ctx.equity_cr, 0.0);
+
+  const peRatio = peRoundDec(safeFloat(ctx.pe_ratio, 99.9), 1);
+  const fairPe = peRoundDec(safeFloat(ctx.fair_pe, 18.0), 1);
+  const pegRatio = peRoundDec(safeFloat(ctx.peg_ratio, 9.9), 2);
+  const pbRatio = peRoundDec(safeFloat(ctx.pb_ratio, 25.0), 2);
+  const fcfYieldPct = peRoundDec(safeFloat(ctx.fcf_yield_pct, 0.0), 2);
+  const earningsYieldPct = peRoundDec(safeFloat(ctx.earnings_yield_pct, 0.0), 2);
+
+  const roceCur = peRoundDec(safeFloat(ctx.roce_cur, 0.0), 1);
+  const med5yRoce = peRoundDec(safeFloat(ctx.med_5y_roce, 0.0), 1);
+  const roeCur = peRoundDec(safeFloat(ctx.roe_cur, 0.0), 1);
+  const med5yRoe = peRoundDec(safeFloat(ctx.med_5y_roe, 0.0), 1);
+  const sustainedRoce = peRoundDec(safeFloat(ctx.sustained_roce ?? med5yRoce, 0.0), 1);
+  const roaPct = peRoundDec(safeFloat(ctx.roa_pct, 0.0), 2);
+  const cycleFloorRet = peRoundDec(safeFloat(ctx.cycle_floor_ret, 0.0), 1);
+  const moatStability = peRoundInt(safeFloat(ctx.moat_stability, 50.0));
+  const opmCur = peRoundDec(safeFloat(ctx.opm_cur, 0.0), 1);
+  const deCur = peRoundDec(safeFloat(ctx.de_cur, 0.0), 2);
+  const cumCfoEbitda5y = peRoundDec(safeFloat(ctx.cum_cfo_ebitda_5y, 0.0), 1);
+  const cfoToDebtPct = peRoundDec(safeFloat(ctx.cfo_to_debt_pct, 0.0), 1);
+
+  const profitableYrs = safeInt(ctx.profitable_yrs, 0);
+  const w5Len = Math.max(1, safeInt(ctx.window_5y_len, 5));
+
+  const revCagr3y = peRoundDec(safeFloat(ctx.rev_cagr_3y, 0.0), 1);
+  const revCagr5y = peRoundDec(safeFloat(ctx.rev_cagr_5y, 0.0), 1);
+  const patCagr3y = peRoundDec(safeFloat(ctx.pat_cagr_3y, 0.0), 1);
+  const patCagr5y = peRoundDec(safeFloat(ctx.pat_cagr_5y, 0.0), 1);
+
+  const hasQtrData = Boolean(ctx.has_qtr_data);
+  const qtrRevYoy = peRoundDec(safeFloat(ctx.qtr_rev_yoy, 0.0), 1);
+  const qtrPatYoy = peRoundDec(safeFloat(ctx.qtr_pat_yoy, 0.0), 1);
+  const latestQtrLabel = String(ctx.latest_qtr_label || "").trim();
+
+  const gnpaPct = peRoundDec(safeFloat(ctx.gnpa_pct, 0.0), 2);
+  const nnpaPct = peRoundDec(safeFloat(ctx.nnpa_pct, 0.0), 2);
+
+  const fScore = safeInt(ctx.f_score, 0);
+  const fChecks = Array.isArray(ctx.f_checks) ? ctx.f_checks : [];
+  const promoterPct = peRoundDec(safeFloat(ctx.promoter_pct, 0.0), 1);
+  const instPct = peRoundDec(safeFloat(ctx.inst_pct, 0.0), 1);
+  const mom121Pct = peRoundDec(safeFloat(ctx.mom_12_1_pct, 0.0), 1);
+  const above200dma = Boolean(ctx.above_200dma);
+
+  const compositeScore = peRoundDec(safeFloat(ctx.composite_score, 0.0), 1);
+  const rating = String(ctx.rating || "Hold");
+  const valuationZone = String(ctx.valuation_zone || "Fair GARP Price");
+  const valuationCapped = Boolean(ctx.valuation_capped);
+
+  const pillars = ctx.pillars || {};
+  const qualityScore = peRoundDec(safeFloat(pillars.quality, 0.0), 1);
+  const valueScore = peRoundDec(safeFloat(pillars.value, 0.0), 1);
+  const growthScore = peRoundDec(safeFloat(pillars.growth, 0.0), 1);
+  const momentumScore = peRoundDec(safeFloat(pillars.momentum, 0.0), 1);
+
+  const sb = ctx.score_breakdown || {};
+  const weightsPct = sb.weights_pct || {};
+  const contributions = sb.contributions || {};
+  const rawComposite = peRoundDec(safeFloat(sb.raw_composite ?? compositeScore, 0.0), 1);
+  const totalPenalty = peRoundDec(safeFloat(sb.total_penalty, 0.0), 1);
+  const penaltyItems = Array.isArray(sb.penalty_items) ? sb.penalty_items : [];
+
+  const street = ctx.street || {};
+  const stAnalystCnt = safeInt(street.analyst_count, 0);
+  const stHasCov = Boolean(street.has_coverage) && stAnalystCnt > 0;
+  const stBuyPct = peRoundDec(safeFloat(street.consensus_buy_pct, 0.0), 1);
+  const stTargetMean = peRoundDec(safeFloat(street.target_mean, 0.0), 2);
+  const stUpsidePct = peRoundDec(safeFloat(street.target_upside_pct, 0.0), 1);
+  const stFwdFy1 = peRoundDec(safeFloat(street.fwd_eps_growth_fy1_pct, 0.0), 1);
+  const stUp30 = safeInt(street.eps_rev_up_30d, 0);
+  const stDn30 = safeInt(street.eps_rev_down_30d, 0);
+  const stUp90 = safeInt(street.eps_rev_up_90d, 0);
+  const stDn90 = safeInt(street.eps_rev_down_90d, 0);
+  const stRevBreadth = peRoundDec(safeFloat(street.rev_breadth_pct, 0.0), 1);
+
+  const indLow = industryStr.toLowerCase();
+  const nmLow = compName.toLowerCase();
+  const isRegulatedInfra =
+    !isFin &&
+    !isCommodityBiz &&
+    (compSector === "Power & Energy" ||
+      (compSector === "Energy, Oil & Power" &&
+        (indLow.includes("utilities") ||
+          indLow.includes("midstream") ||
+          (!indLow && !OIL_AND_COMMODITY_KEYWORDS.some((kw) => nmLow.includes(kw))))));
+
+  const isUnprofitableNow = patCr <= 0.0 || patFyCr <= 0.0;
+  const isLossOrNoPe = isUnprofitableNow || peRatio >= 99.0;
+
+  let archetypeCode;
+  let archetypeLabel;
+  if (isLossOrNoPe) {
+    archetypeCode = "loss_turnaround";
+    archetypeLabel = "Unprofitable / Turnaround";
+  } else if (buybackEquity) {
+    archetypeCode = "buyback_compounder";
+    archetypeLabel = "Share-Buyback Cash Cow";
+  } else if (isFin) {
+    archetypeCode = "financial_lender";
+    archetypeLabel = "Banking & Financial Leader";
+  } else if (isRegulatedInfra) {
+    archetypeCode = "regulated_infra";
+    archetypeLabel = "Regulated Infrastructure";
+  } else if (isCyclical) {
+    archetypeCode = "cyclical_commodity";
+    archetypeLabel = "Cyclical / Commodity Business";
+  } else {
+    archetypeCode = "secular_compounder";
+    archetypeLabel =
+      sustainedRoce >= 18.0 && deCur <= 0.5 ? "Cash-Rich Compounder" : "Steady Operating Business";
+  }
+
+  const mktAdj = marketCode === "US" ? "US" : "Indian";
+  let whatItDoes;
+  if (rawSummary) {
+    whatItDoes = rawSummary;
+  } else if (industryStr) {
+    whatItDoes = `${compName} is an established ${mktAdj} ${industryStr.toLowerCase()} business operating in the ${compSector} sector.`;
+  } else {
+    whatItDoes = `${compName} is an established ${mktAdj} enterprise operating across the ${compSector} sector.`;
+  }
+
+  let oneLineVerdict;
+  if (archetypeCode === "loss_turnaround") {
+    oneLineVerdict = isUnprofitableNow
+      ? "Currently unprofitable — wait for steady profits before investing"
+      : "Priced far ahead of current profits — high expectations baked in";
+  } else if (archetypeCode === "buyback_compounder") {
+    if (peRatio <= fairPe * 1.15 && compositeScore >= 65.0) {
+      oneLineVerdict = "Cash-rich share-buyback leader at a reasonable entry price";
+    } else if (peRatio > fairPe * 1.35 || valuationZone === "Overvalued / Wait for Dip") {
+      oneLineVerdict = "World-class cash generator, but stock price looks expensive today";
+    } else {
+      oneLineVerdict = "Strong cash-generating buyback compounder — accumulate on dips";
+    }
+  } else if (archetypeCode === "financial_lender") {
+    if (compositeScore >= 68.0 && peRatio <= fairPe * 1.15) {
+      oneLineVerdict = "Consistent financial compounder at a reasonable valuation";
+    } else if (qualityScore >= 70.0 && peRatio > fairPe * 1.3) {
+      oneLineVerdict = "Well-run financial franchise, though shares trade at a premium";
+    } else if (compositeScore >= 57.0) {
+      oneLineVerdict = "Steady financial institution at a sensible long-term price";
+    } else {
+      oneLineVerdict = "Mixed financial track record — stronger lenders available";
+    }
+  } else if (archetypeCode === "regulated_infra") {
+    if (compositeScore >= 60.0 && peRatio <= fairPe * 1.15) {
+      oneLineVerdict = "Steady utility & infrastructure operator at a sensible price";
+    } else if (peRatio > fairPe * 1.3) {
+      oneLineVerdict = "Predictable utility business, but stock price leaves little upside";
+    } else {
+      oneLineVerdict = "Contracted infrastructure operator carrying long-term project debt";
+    }
+  } else if (archetypeCode === "cyclical_commodity") {
+    if (compositeScore >= 65.0 && peRatio <= fairPe * 1.05) {
+      oneLineVerdict = "Strong cyclical business at a fair price — mind industry swings";
+    } else if (peRatio > fairPe * 1.3) {
+      oneLineVerdict = "Cyclical business trading at an expensive point in the cycle";
+    } else {
+      oneLineVerdict = "Profits move with industry cycles — demand a wide safety margin";
+    }
+  } else if (qualityScore >= 75.0 && deCur <= 0.25 && peRatio <= fairPe * 1.05 && compositeScore >= 68.0) {
+    oneLineVerdict = "Strong, debt-free business at an attractive price";
+  } else if (qualityScore >= 72.0 && peRatio <= fairPe * 1.15 && compositeScore >= 65.0) {
+    oneLineVerdict = "High-quality compounder trading at a sensible price";
+  } else if (qualityScore >= 70.0 && (peRatio > fairPe * 1.3 || valueScore < 40.0)) {
+    oneLineVerdict = "World-class business, but stock price is expensive today";
+  } else if (compositeScore >= 57.0) {
+    oneLineVerdict = "Solid operating business with steady long-term fundamentals";
+  } else if (compositeScore >= 45.0) {
+    oneLineVerdict = "Decent business with mixed growth or price trade-offs";
+  } else {
+    oneLineVerdict = "Weak business fundamentals or stretched balance sheet — be cautious";
+  }
+
+  const roceI = peRoundInt(med5yRoce);
+  const roeI = peRoundInt(med5yRoe);
+  const floorI = peRoundInt(cycleFloorRet);
+
+  let s1;
+  if (archetypeCode === "loss_turnaround") {
+    if (isUnprofitableNow) {
+      s1 = `${compName} is currently unprofitable — cannot be valued on current profits yet, having earned a net profit in ${profitableYrs} of the last ${w5Len} years.`;
+    } else if (isFin) {
+      const eVerb =
+        roeI >= 0
+          ? `earns ${ccySym}${roeI} per ${hundredUnit}`
+          : `loses ${ccySym}${Math.abs(roeI)} per ${hundredUnit}`;
+      s1 = `${compName} ${eVerb} of shareholder equity over a 5-year median, but current net profits are still tiny relative to its market value — cannot be valued on current profits yet.`;
+    } else {
+      const eVerb =
+        roceI >= 0
+          ? `earns ${ccySym}${roceI} per ${hundredUnit}`
+          : `loses ${ccySym}${Math.abs(roceI)} per ${hundredUnit}`;
+      s1 = `${compName} ${eVerb} invested in the business over a 5-year median, but current net profits are still tiny relative to its market value — cannot be valued on current profits yet.`;
+    }
+  } else if (archetypeCode === "financial_lender") {
+    if (gnpaPct > 0.0) {
+      const loanPhrase =
+        nnpaPct <= 0.8
+          ? "very clean loan quality"
+          : nnpaPct <= 1.5
+          ? "manageable bad-loan levels"
+          : "elevated bad loans requiring caution";
+      s1 = `${compName} earns ${ccySym}${roeI} per ${hundredUnit} of shareholder equity over a 5-year median with ${loanPhrase} (${peFmt(nnpaPct, 2)}% net bad loans) and stayed profitable in ${profitableYrs} of ${w5Len} years.`;
+    } else {
+      s1 = `${compName} earns ${ccySym}${roeI} per ${hundredUnit} of shareholder equity over a 5-year median (generating ${ccySym}${peFmt(roaPct, 2)} profit per ${hundredUnit} of total assets) across ${profitableYrs} of ${w5Len} profitable years.`;
+    }
+  } else if (archetypeCode === "buyback_compounder") {
+    const retBuyback = isFin ? roeI : roceI;
+    s1 = `${compName} earns ${ccySym}${retBuyback} per ${hundredUnit} invested — book equity looks small/negative only because of years of share buybacks, while strong annual cash flow comfortably covers ${peFmt(cfoToDebtPct, 0)}% of total debt.`;
+  } else if (archetypeCode === "regulated_infra") {
+    s1 = `${compName} earns a steady ${ccySym}${roceI} per ${hundredUnit} invested across regulated or contracted infrastructure assets, where long-term project borrowing (${peFmt(deCur, 2)}x equity) is supported by predictable utility cash flows.`;
+  } else if (archetypeCode === "cyclical_commodity") {
+    const floorPhrase =
+      floorI >= 0
+        ? `dipping to ${ccySym}${floorI} per ${hundredUnit}`
+        : `swinging to a ${ccySym}${Math.abs(floorI)} loss per ${hundredUnit}`;
+    s1 = `${compName} earns ${ccySym}${roceI} per ${hundredUnit} invested over a 5-year median, but profits move with commodity and industry cycles (${floorPhrase} in tougher years), so even a low valuation during peak profits needs cycle caution.`;
+  } else {
+    let debtPhrase;
+    if (deCur <= 0.15) debtPhrase = "with virtually zero debt";
+    else if (deCur <= 0.5) debtPhrase = "with very low debt";
+    else if (deCur <= 1.2) debtPhrase = "with manageable debt";
+    else debtPhrase = "though carrying noticeable debt";
+    const cashI = peRoundInt(cumCfoEbitda5y);
+    const cashPhrase =
+      cashI >= 70
+        ? `turning ${cashI}% of operating profits into real bank cash`
+        : `converting ${cashI}% of operating profits into cash`;
+    const eVerb =
+      roceI >= 0
+        ? `earns ${ccySym}${roceI} per ${hundredUnit} invested`
+        : `loses ${ccySym}${Math.abs(roceI)} per ${hundredUnit} invested`;
+    s1 = `${compName} ${eVerb} over a 5-year median ${debtPhrase}, ${cashPhrase} across ${profitableYrs} of ${w5Len} profitable years.`;
+  }
+
+  const qInt = peRoundInt(qualityScore);
+  const vInt = peRoundInt(valueScore);
+  const gInt = peRoundInt(growthScore);
+  const penInt = peRoundInt(totalPenalty);
+
+  let s2;
+  if (archetypeCode === "loss_turnaround") {
+    if (isUnprofitableNow) {
+      s2 = `Its overall score landed at ${peFmt(compositeScore, 1)}/100 (${rating}) because current losses trigger a ${penInt}-point safety deduction and leave no profit cushion to value the shares on.`;
+    } else {
+      const dedStr = penInt > 0 ? ` plus a ${penInt}-point caution deduction` : "";
+      s2 = `Its overall score landed at ${peFmt(compositeScore, 1)}/100 (${rating}) because the stock price already bakes in years of high optimism relative to today's small profit base (price-value score ${vInt}/100${dedStr}).`;
+    }
+  } else if (qualityScore >= 70.0 && (peRatio > fairPe * 1.35 || valueScore < 35.0)) {
+    const capNote =
+      valuationCapped && penInt > 0
+        ? ` and triggered an ${penInt}-point rich-price guardrail deduction`
+        : penInt > 0
+        ? ` alongside a ${penInt}-point caution deduction`
+        : "";
+    s2 = `Its score landed at ${peFmt(compositeScore, 1)}/100 (${rating}) mainly because an expensive stock valuation (${peFmt(peRatio, 1)}x annual profits vs a fair range near ~${peFmt(fairPe, 1)}x) pulled its price-value score down to ${vInt}/100${capNote}, holding back an otherwise standout ${qInt}/100 business.`;
+  } else if (peRatio <= fairPe * 0.92 && compositeScore >= 65.0) {
+    s2 = `It earned a high ${peFmt(compositeScore, 1)}/100 (${rating}) because strong business quality (${qInt}/100) pairs with an attractive bargain price at ${peFmt(peRatio, 1)}x annual profits versus a fair value range near ~${peFmt(fairPe, 1)}x.`;
+  } else if (penInt > 0 && penaltyItems.length > 0) {
+    const topReason = translatePenaltyReason(penaltyItems[0].reason || "", isFin);
+    s2 = `Starting from a raw score of ${peFmt(rawComposite, 1)}/100, a ${penInt}-point safety deduction (${topReason}) brought the final score to ${peFmt(compositeScore, 1)}/100 (${rating}).`;
+  } else if (compositeScore >= 68.0) {
+    s2 = `It earned a strong ${peFmt(compositeScore, 1)}/100 (${rating}) by combining high business quality (${qInt}/100) and steady growth (${gInt}/100) at a sensible ${peFmt(peRatio, 1)}x profits (fair range ~${peFmt(fairPe, 1)}x) with zero caution flags.`;
+  } else {
+    let dragPhrase;
+    if (valueScore < qualityScore && valueScore < growthScore) {
+      dragPhrase = `a somewhat rich stock price at ${peFmt(peRatio, 1)}x profits (vs ~${peFmt(fairPe, 1)}x fair range)`;
+    } else if (growthScore < qualityScore) {
+      dragPhrase = `slower multi-year growth (${gInt}/100)`;
+    } else {
+      dragPhrase = `moderate business returns (${qInt}/100)`;
+    }
+    const leadPhrase =
+      qualityScore >= growthScore
+        ? `solid business quality (${qInt}/100)`
+        : `healthy sales & profit growth (${gInt}/100)`;
+    s2 = `Its ${peFmt(compositeScore, 1)}/100 (${rating}) score reflects ${leadPhrase} balanced against ${dragPhrase}.`;
+  }
+
+  const rev5yPhrase =
+    revCagr5y >= 0.0
+      ? `grew ${peFmt(revCagr5y, 1)}% a year`
+      : `shrank ${peFmt(Math.abs(revCagr5y), 1)}% a year`;
+  const pat5yPhrase =
+    patCagr5y >= 0.0
+      ? `profits compounded at ${peFmt(patCagr5y, 1)}% a year`
+      : `profits declined ${peFmt(Math.abs(patCagr5y), 1)}% a year`;
+  let analystTail;
+  if (stHasCov && stAnalystCnt >= 3) {
+    const buyI = peRoundInt(stBuyPct);
+    if (stTargetMean > 0.0) {
+      const upPhrase =
+        stUpsidePct >= 0.0
+          ? `${peFmt(stUpsidePct, 1)}% implied upside`
+          : `${peFmt(Math.abs(stUpsidePct), 1)}% below current price`;
+      analystTail = `while ${stAnalystCnt} covering bank analysts hold a ${buyI}% Buy view with an average target of ${ccySym}${peFmt(stTargetMean, 0)} (${upPhrase}).`;
+    } else {
+      analystTail = `while ${stAnalystCnt} covering bank analysts hold a ${buyI}% Buy consensus.`;
+    }
+  } else if (marketCode === "US") {
+    analystTail = `backed by ${peFmt(instPct, 1)}% long-term institutional ownership.`;
+  } else {
+    analystTail = `backed by ${peFmt(promoterPct, 1)}% founder/promoter and ${peFmt(instPct, 1)}% institutional ownership.`;
+  }
+  const s3 = `Over the past 5 years, annual sales ${rev5yPhrase} and ${pat5yPhrase}, ${analystTail}`;
+
+  let qPlainWhy;
+  let qualityRows;
+  if (isFin && !buybackEquity) {
+    qPlainWhy =
+      roeI >= 0
+        ? `Earns ${ccySym}${roeI} per ${hundredUnit} of shareholder money over a 5-year median with ${profitableYrs}/${w5Len} profitable years.`
+        : `Shareholder returns have been negative recently (${profitableYrs}/${w5Len} profitable years).`;
+    const roeSimple =
+      roeI >= 0
+        ? `Earns ${ccySym}${roeI} per ${hundredUnit} equity`
+        : `Loses ${ccySym}${Math.abs(roeI)} per ${hundredUnit} equity`;
+    const roeTone =
+      med5yRoe >= 14.0 ? "good" : med5yRoe >= 10.0 ? "neutral" : med5yRoe > 0.0 ? "warn" : "bad";
+    const roaSimple =
+      roaPct >= 0.0
+        ? `${ccySym}${peFmt(roaPct, 2)} profit per ${hundredUnit} of assets`
+        : `Loss of ${ccySym}${peFmt(Math.abs(roaPct), 2)} per ${hundredUnit} of assets`;
+    const roaTone =
+      roaPct >= 1.2 ? "good" : roaPct >= 0.7 ? "neutral" : roaPct > 0.0 ? "warn" : "bad";
+
+    const row3Fin =
+      gnpaPct > 0.0
+        ? {
+            simple_label: "Unrecovered bad loans",
+            pro_label: "Net NPA % (Gross NPA %)",
+            simple_value: `${peFmt(nnpaPct, 2)}% net bad loans`,
+            pro_value: `${peFmt(nnpaPct, 2)}% NNPA (${peFmt(gnpaPct, 2)}% GNPA)`,
+            target_hint: "Below 1.0% shows clean lending quality",
+            tone: nnpaPct <= 1.0 ? "good" : nnpaPct <= 1.5 ? "neutral" : "bad",
+          }
+        : {
+            simple_label: "Toughest-year equity return",
+            pro_label: "6Y Cycle-Floor ROE",
+            simple_value: `${peFmt(cycleFloorRet, 1)}% in toughest recent year`,
+            pro_value: `${peFmt(cycleFloorRet, 1)}% Cycle Floor (Stability ${peFmt(moatStability, 0)}/100)`,
+            target_hint: "Staying above 10% in downturns is resilient",
+            tone: cycleFloorRet >= 11.0 ? "good" : cycleFloorRet >= 7.0 ? "neutral" : "warn",
+          };
+
+    qualityRows = [
+      {
+        simple_label: "Return on shareholder money",
+        pro_label: "5Y Median ROE (Latest ROE)",
+        simple_value: roeSimple,
+        pro_value: `${peFmt(med5yRoe, 1)}% 5Y Med (${peFmt(roeCur, 1)}% Latest)`,
+        target_hint: "14%+ is strong for banks & financial leaders",
+        tone: roeTone,
+      },
+      {
+        simple_label: "Profit earned on total assets",
+        pro_label: "Return on Total Assets (ROA)",
+        simple_value: roaSimple,
+        pro_value: `${peFmt(roaPct, 2)}% ROA`,
+        target_hint: "1.2%+ signals high lending & asset quality",
+        tone: roaTone,
+      },
+      row3Fin,
+      {
+        simple_label: "Consistent yearly profits",
+        pro_label: "5-Year Profit Consistency",
+        simple_value: `Profitable in ${profitableYrs} of last ${w5Len} years`,
+        pro_value: `${profitableYrs}/${w5Len} FYs Profitable (Margin ${peFmt(opmCur, 1)}%)`,
+        target_hint: "5 out of 5 profitable years is ideal",
+        tone: profitableYrs === w5Len ? "good" : profitableYrs >= w5Len - 1 ? "neutral" : "bad",
+      },
+    ];
+  } else if (buybackEquity) {
+    const retMedB = isFin ? med5yRoe : med5yRoce;
+    const retLatB = isFin ? roeCur : roceCur;
+    const retBI = peRoundInt(retMedB);
+    const cashBI = peRoundInt(cumCfoEbitda5y);
+    qPlainWhy = `Earns ${ccySym}${retBI} per ${hundredUnit} invested; book equity looks small because of share buybacks while cash flow covers ${peFmt(cfoToDebtPct, 0)}% of total debt.`;
+    qualityRows = [
+      {
+        simple_label: `Profit per ${hundredUnit} invested`,
+        pro_label: isFin ? "5Y Median Return on Capital" : "5Y Median ROCE (Latest)",
+        simple_value: `Earns ${ccySym}${retBI} per ${hundredUnit} invested`,
+        pro_value: `${peFmt(retMedB, 1)}% 5Y Med (${peFmt(retLatB, 1)}% Latest)`,
+        target_hint: "18%+ signals a powerful business moat",
+        tone: "good",
+      },
+      {
+        simple_label: "Debt safety (cash flow vs debt)",
+        pro_label: "Annual Operating Cash Flow / Debt",
+        simple_value: `Annual cash covers ${peFmt(cfoToDebtPct, 0)}% of total debt`,
+        pro_value: `${peFmt(cfoToDebtPct, 1)}% CFO/Debt (Buyback-adjusted)`,
+        target_hint: "35%+ yearly cash coverage comfortably services debt",
+        tone: cfoToDebtPct >= 50.0 ? "good" : "neutral",
+      },
+      {
+        simple_label: "Real cash collected from profits",
+        pro_label: isFin ? "Operating Cash Conversion" : "5Y Cumulative CFO / EBITDA",
+        simple_value: `Turns ${cashBI}% of operating profit into cash`,
+        pro_value: isFin ? `${cashBI}% Cash Conversion` : `${cashBI}% 5Y CFO/EBITDA`,
+        target_hint: "80%+ means profits arrive as real cash",
+        tone: cumCfoEbitda5y >= 80.0 ? "good" : cumCfoEbitda5y >= 60.0 ? "neutral" : "warn",
+      },
+      {
+        simple_label: "Operating profit kept per sale",
+        pro_label: "Operating Margin & 5Y Consistency",
+        simple_value: `Keeps ${ccySym}${peRoundInt(opmCur)} per ${hundredUnit} of sales (${profitableYrs}/${w5Len} yrs profitable)`,
+        pro_value: `${peFmt(opmCur, 1)}% OPM (${profitableYrs}/${w5Len} FYs Profitable)`,
+        target_hint: "15%+ margin with 5/5 profitable years is strong",
+        tone: opmCur >= 15.0 && profitableYrs === w5Len ? "good" : "neutral",
+      },
+    ];
+  } else {
+    const cashI = peRoundInt(cumCfoEbitda5y);
+    if (archetypeCode === "regulated_infra") {
+      qPlainWhy = `Earns ${ccySym}${roceI} per ${hundredUnit} invested across regulated infrastructure assets with ${profitableYrs}/${w5Len} profitable years.`;
+    } else if (archetypeCode === "cyclical_commodity") {
+      qPlainWhy = `Earns ${ccySym}${roceI} per ${hundredUnit} on average, though returns swing to ${ccySym}${floorI} in industry downturns.`;
+    } else if (med5yRoce <= 0.0) {
+      qPlainWhy = `Operations have struggled to earn positive returns on invested money (${profitableYrs}/${w5Len} profitable years).`;
+    } else {
+      qPlainWhy = `Earns ${ccySym}${roceI} per ${hundredUnit} invested in the business and converts ${cashI}% of operating profit into real cash.`;
+    }
+
+    const roceSimple =
+      roceI >= 0
+        ? `Earns ${ccySym}${roceI} per ${hundredUnit} invested`
+        : `Loses ${ccySym}${Math.abs(roceI)} per ${hundredUnit} invested`;
+    const roceTone =
+      archetypeCode === "regulated_infra"
+        ? med5yRoce >= 9.5
+          ? "good"
+          : med5yRoce >= 6.5
+          ? "neutral"
+          : "warn"
+        : med5yRoce >= 18.0
+        ? "good"
+        : med5yRoce >= 11.0
+        ? "neutral"
+        : med5yRoce > 0.0
+        ? "warn"
+        : "bad";
+    const roceHint =
+      archetypeCode === "regulated_infra"
+        ? "8–14% is normal for regulated utilities"
+        : "18%+ signals a strong competitive moat";
+
+    let debtSimple;
+    let debtPro;
+    let debtTone;
+    if (equityCr <= 0.0) {
+      debtSimple = "Negative book net worth";
+      debtPro = "Equity <= 0";
+      debtTone = "bad";
+    } else if (deCur <= 0.1) {
+      debtSimple = "Virtually debt-free";
+      debtPro = `${peFmt(deCur, 2)}x D/E`;
+      debtTone = "good";
+    } else if (deCur <= 0.5) {
+      debtSimple = `Low debt (${peFmt(deCur, 2)}x shareholder equity)`;
+      debtPro = `${peFmt(deCur, 2)}x D/E`;
+      debtTone = "good";
+    } else if (archetypeCode === "regulated_infra" && deCur <= 2.2) {
+      debtSimple = `Long-term project debt (${peFmt(deCur, 2)}x equity)`;
+      debtPro = `${peFmt(deCur, 2)}x D/E (Infra)`;
+      debtTone = "neutral";
+    } else if (deCur <= 1.2) {
+      debtSimple = `Moderate debt (${peFmt(deCur, 2)}x equity)`;
+      debtPro = `${peFmt(deCur, 2)}x D/E`;
+      debtTone = "neutral";
+    } else if (deCur <= 1.8) {
+      debtSimple = `Elevated debt (${peFmt(deCur, 2)}x equity)`;
+      debtPro = `${peFmt(deCur, 2)}x D/E`;
+      debtTone = "warn";
+    } else {
+      debtSimple = `Heavy debt load (${peFmt(deCur, 2)}x equity)`;
+      debtPro = `${peFmt(deCur, 2)}x D/E`;
+      debtTone = "bad";
+    }
+
+    qualityRows = [
+      {
+        simple_label: `Profit per ${hundredUnit} invested`,
+        pro_label: "5Y Median ROCE (Latest ROCE)",
+        simple_value: roceSimple,
+        pro_value: `${peFmt(med5yRoce, 1)}% 5Y Med (${peFmt(roceCur, 1)}% Latest)`,
+        target_hint: roceHint,
+        tone: roceTone,
+      },
+      {
+        simple_label: "Debt vs company net worth",
+        pro_label: "Corporate Debt-to-Equity (D/E)",
+        simple_value: debtSimple,
+        pro_value: debtPro,
+        target_hint:
+          archetypeCode === "regulated_infra"
+            ? "Utilities commonly carry 1.0x–2.2x project debt"
+            : "Under 0.5x means a conservative balance sheet",
+        tone: debtTone,
+      },
+      {
+        simple_label: "Real cash collected from profits",
+        pro_label: "5Y Cumulative CFO / EBITDA",
+        simple_value:
+          cashI >= 0
+            ? `Turns ${cashI}% of operating profit into cash`
+            : "Operating cash flow is negative",
+        pro_value: `${cashI}% 5Y CFO/EBITDA`,
+        target_hint: "75%+ means reported profits arrive as real cash",
+        tone: cumCfoEbitda5y >= 75.0 ? "good" : cumCfoEbitda5y >= 55.0 ? "neutral" : "bad",
+      },
+      {
+        simple_label: "Steady profits across tough years",
+        pro_label: "5Y Profit Consistency & Moat Stability",
+        simple_value: `Profitable in ${profitableYrs}/${w5Len} years (toughest year ${floorI}%)`,
+        pro_value: `${profitableYrs}/${w5Len} FYs Profitable • Stability ${peFmt(moatStability, 0)}/100`,
+        target_hint: "5/5 profitable years without deep slumps",
+        tone:
+          profitableYrs === w5Len && moatStability >= 65.0
+            ? "good"
+            : profitableYrs >= w5Len - 1
+            ? "neutral"
+            : "bad",
+      },
+    ];
+  }
+
+  const sDir =
+    revCagr5y >= 0.0
+      ? `grew ${peFmt(revCagr5y, 1)}%/yr`
+      : `declined ${peFmt(Math.abs(revCagr5y), 1)}%/yr`;
+  const pDir =
+    patCagr5y >= 0.0
+      ? `grew ${peFmt(patCagr5y, 1)}%/yr`
+      : `declined ${peFmt(Math.abs(patCagr5y), 1)}%/yr`;
+  const gPlainWhy = `Over 5 years, annual sales ${sDir} while net profits ${pDir}.`;
+  const qLblSfx = hasQtrData && latestQtrLabel ? ` (${latestQtrLabel})` : "";
+  const hasFwd = stHasCov && stAnalystCnt >= 3 && stFwdFy1 !== 0.0;
+  const growthRows = [
+    {
+      simple_label: "5-year annual sales growth",
+      pro_label: "5Y & 3Y Revenue CAGR",
+      simple_value: `${peSfmt(revCagr5y, 1)}% per year`,
+      pro_value: `${peSfmt(revCagr5y, 1)}% (5Y) • ${peSfmt(revCagr3y, 1)}% (3Y)`,
+      target_hint: "10%+ annual sales growth is healthy",
+      tone: revCagr5y >= 10.0 ? "good" : revCagr5y >= 4.0 ? "neutral" : revCagr5y >= 0.0 ? "warn" : "bad",
+    },
+    {
+      simple_label: "5-year annual profit growth",
+      pro_label: "5Y & 3Y Net Profit CAGR",
+      simple_value: `${peSfmt(patCagr5y, 1)}% per year`,
+      pro_value: `${peSfmt(patCagr5y, 1)}% (5Y) • ${peSfmt(patCagr3y, 1)}% (3Y)`,
+      target_hint: "12%+ steady profit compounding builds wealth",
+      tone: patCagr5y >= 12.0 ? "good" : patCagr5y >= 5.0 ? "neutral" : patCagr5y >= 0.0 ? "warn" : "bad",
+    },
+    {
+      simple_label: `Recent quarterly profit trend${qLblSfx}`,
+      pro_label: "Latest YoY Quarterly Profit & Sales",
+      simple_value: hasQtrData
+        ? `${peSfmt(qtrPatYoy, 1)}% profit, ${peSfmt(qtrRevYoy, 1)}% sales vs last year`
+        : `Tracking ~${peSfmt(patCagr3y, 1)}% recent annual pace`,
+      pro_value: hasQtrData
+        ? `${peSfmt(qtrPatYoy, 1)}% YoY Profit • ${peSfmt(qtrRevYoy, 1)}% YoY Sales`
+        : "Annualized trajectory",
+      target_hint: "Positive recent growth confirms business momentum",
+      tone: qtrPatYoy >= 10.0 ? "good" : qtrPatYoy >= 0.0 ? "neutral" : qtrPatYoy > -12.0 ? "warn" : "bad",
+    },
+    {
+      simple_label: "Expected profit growth next year",
+      pro_label: "Consensus FY1 Forward EPS Growth",
+      simple_value: hasFwd
+        ? `Analysts expect ${peSfmt(stFwdFy1, 1)}% profit growth`
+        : "Scored on verified multi-year history",
+      pro_value: hasFwd ? `${peSfmt(stFwdFy1, 1)}% FY1 Consensus EPS` : "Historical CAGR anchor",
+      target_hint: "10%+ expected growth supports future returns",
+      tone: hasFwd ? (stFwdFy1 >= 10.0 ? "good" : stFwdFy1 >= 0.0 ? "neutral" : "warn") : "neutral",
+    },
+  ];
+
+  let vPlainWhy;
+  let valueRows;
+  if (archetypeCode === "loss_turnaround") {
+    const unprofMsg = isUnprofitableNow
+      ? "Currently unprofitable — cannot be valued on current profits yet"
+      : "Current profits are too small — cannot be valued on current profits yet";
+    vPlainWhy = `${unprofMsg}; wait for earnings to normalize before judging price value.`;
+    const vRow3 = isFin
+      ? {
+          simple_label: "Price vs shareholder book value",
+          pro_label: "Price-to-Book Ratio (P/B)",
+          simple_value:
+            equityCr > 0.0 && pbRatio < 24.9
+              ? `${peFmt(pbRatio, 2)}x shareholder book value`
+              : "Book value compressed",
+          pro_value:
+            equityCr > 0.0 && pbRatio < 24.9 ? `${peFmt(pbRatio, 2)}x P/B` : "N/M (Compressed equity)",
+          target_hint: "1.0x–2.5x book value is typical for lenders",
+          tone: pbRatio <= 2.5 ? "neutral" : "warn",
+        }
+      : {
+          simple_label: "Free cash generated vs stock price",
+          pro_label: "Free Cash Flow (FCF) Yield",
+          simple_value:
+            fcfYieldPct > 0.0
+              ? `${peFmt(fcfYieldPct, 1)}% yearly free cash yield`
+              : "Burning free cash flow currently",
+          pro_value: `${peFmt(fcfYieldPct, 2)}% FCF Yield`,
+          target_hint: "3%+ free cash yield offers valuation support",
+          tone: fcfYieldPct >= 3.0 ? "good" : fcfYieldPct > 0.0 ? "neutral" : "bad",
+        };
+    valueRows = [
+      {
+        simple_label: "Stock price vs annual profit",
+        pro_label: "Trailing Earnings Valuation",
+        simple_value: unprofMsg,
+        pro_value: "N/M (Unprofitable / Turnaround)",
+        target_hint: "Needs steady positive profits for a fair multiple",
+        tone: "bad",
+      },
+      {
+        simple_label: "Price paid for expected growth",
+        pro_label: "Growth-Adjusted Valuation",
+        simple_value: "Not meaningful until profits stabilize",
+        pro_value: "N/M (Turnaround earnings base)",
+        target_hint: "Evaluated once annual profits normalize",
+        tone: "bad",
+      },
+      vRow3,
+      {
+        simple_label: "Buying price comfort",
+        pro_label: "GARP Valuation Zone",
+        simple_value: "High risk — wait for profit recovery",
+        pro_value: valuationZone,
+        target_hint: "Look for profitable margin of safety",
+        tone: "bad",
+      },
+    ];
+  } else {
+    if (peRatio <= fairPe * 0.9) {
+      vPlainWhy = `Trades at a bargain ${peFmt(peRatio, 1)}x annual profits versus a fair range near ~${peFmt(fairPe, 1)}x.`;
+    } else if (peRatio <= fairPe * 1.2) {
+      vPlainWhy = `Trades at ${peFmt(peRatio, 1)}x annual profits, reasonably aligned with its ~${peFmt(fairPe, 1)}x fair value range.`;
+    } else if (peRatio <= fairPe * 1.55) {
+      vPlainWhy = `Trades at ${peFmt(peRatio, 1)}x annual profits — above its ~${peFmt(fairPe, 1)}x fair range, favoring staggered buying.`;
+    } else {
+      vPlainWhy = `Trades at an expensive ${peFmt(peRatio, 1)}x annual profits versus a fair range near ~${peFmt(fairPe, 1)}x.`;
+    }
+    if (archetypeCode === "cyclical_commodity") {
+      vPlainWhy = `${vPlainWhy} Cyclical multiples can look low near peak profits, so keep extra caution.`;
+    }
+
+    let pegSimple;
+    if (pegRatio <= 1.25) pegSimple = "Attractive price for its growth speed";
+    else if (pegRatio <= 1.85) pegSimple = "Reasonable price for its growth";
+    else if (pegRatio <= 2.4) pegSimple = "Priced slightly ahead of growth";
+    else pegSimple = "Expensive relative to its growth speed";
+
+    const vRow3 =
+      isFin && !buybackEquity
+        ? {
+            simple_label: "Price vs shareholder book value",
+            pro_label: "Price-to-Book Ratio (P/B)",
+            simple_value: `${peFmt(pbRatio, 2)}x shareholder book value`,
+            pro_value: `${peFmt(pbRatio, 2)}x P/B`,
+            target_hint: "1.0x–3.0x is reasonable for strong banks",
+            tone: pbRatio <= 2.5 ? "good" : pbRatio <= 4.0 ? "neutral" : "warn",
+          }
+        : {
+            simple_label: `Free cash earned per ${hundredUnit} of stock`,
+            pro_label: "Free Cash Flow Yield & Earnings Yield",
+            simple_value:
+              fcfYieldPct >= 0.0
+                ? `${ccySym}${peFmt(fcfYieldPct, 1)} free cash per ${hundredUnit} at today's price`
+                : "Heavy reinvestment reducing free cash this year",
+            pro_value: `${peFmt(fcfYieldPct, 2)}% FCF Yield (${peFmt(earningsYieldPct, 2)}% EY)`,
+            target_hint: "3%+ cash yield rewards patient holders",
+            tone: fcfYieldPct >= 3.0 ? "good" : fcfYieldPct >= 1.2 ? "neutral" : "warn",
+          };
+
+    let vzSimple;
+    let vzTone;
+    if (valuationZone === "Undervalued (Margin of Safety)") {
+      vzSimple = "Good bargain with margin of safety";
+      vzTone = "good";
+    } else if (valuationZone === "Fair GARP Price") {
+      vzSimple = "Fair price for long-term buyers";
+      vzTone = "good";
+    } else if (valuationZone === "Slightly Rich (Stagger SIP)") {
+      vzSimple = "Slightly rich — stagger purchases slowly";
+      vzTone = "warn";
+    } else {
+      vzSimple = "Expensive today — better to wait for a dip";
+      vzTone = "bad";
+    }
+
+    valueRows = [
+      {
+        simple_label: "Stock price vs annual profit",
+        pro_label: "Trailing P/E vs Quality-Adjusted Fair P/E",
+        simple_value: `Pays ${peFmt(peRatio, 1)}x profits (fair range ~${peFmt(fairPe, 1)}x)`,
+        pro_value: `${peFmt(peRatio, 1)}x P/E vs ~${peFmt(fairPe, 1)}x Fair P/E`,
+        target_hint: "At or below fair range gives a safety cushion",
+        tone:
+          peRatio <= fairPe * 1.05
+            ? "good"
+            : peRatio <= fairPe * 1.25
+            ? "neutral"
+            : peRatio <= fairPe * 1.55
+            ? "warn"
+            : "bad",
+      },
+      {
+        simple_label: "Price paid for expected growth",
+        pro_label: "GARP PEG Ratio",
+        simple_value: pegSimple,
+        pro_value: `${peFmt(pegRatio, 2)}x PEG`,
+        target_hint: "Under 1.5x means growth isn't overpriced",
+        tone: pegRatio <= 1.35 ? "good" : pegRatio <= 1.9 ? "neutral" : pegRatio <= 2.4 ? "warn" : "bad",
+      },
+      vRow3,
+      {
+        simple_label: "Buying price comfort",
+        pro_label: "GARP Valuation Zone",
+        simple_value: vzSimple,
+        pro_value: valuationZone,
+        target_hint: "Avoid overpaying even for great companies",
+        tone: vzTone,
+      },
+    ];
+  }
+
+  const ownSum = peRoundDec(promoterPct + instPct, 1);
+  const buyI = peRoundInt(stBuyPct);
+  const mPlainWhy =
+    stHasCov && stAnalystCnt >= 3
+      ? `Passes ${fScore} of 9 annual safety checks, with ${buyI}% Buy ratings across ${stAnalystCnt} covering bank analysts.`
+      : `Passes ${fScore} of 9 annual financial safety checks with ${peFmt(ownSum, 0)}% long-term insider and institutional backing.`;
+
+  const use30d = stUp30 + stDn30 >= 3;
+  const rUp = use30d ? stUp30 : stUp90;
+  const rDn = use30d ? stDn30 : stDn90;
+  const rTot = rUp + rDn;
+  const trendWord = above200dma ? "steady uptrend" : "below 200-day average";
+
+  const momentumRows = [
+    {
+      simple_label: "Annual financial safety score",
+      pro_label: "Piotroski F-Score (9-Point)",
+      simple_value: `Passed ${fScore} out of 9 safety checks`,
+      pro_value: `${fScore} / 9 F-Score`,
+      target_hint: "7/9 or higher shows improving financial health",
+      tone: fScore >= 7 ? "good" : fScore >= 5 ? "neutral" : "bad",
+    },
+    {
+      simple_label: "Bank & Wall Street analyst view",
+      pro_label: "Sell-Side Consensus & Target Upside",
+      simple_value:
+        stHasCov && stTargetMean > 0.0
+          ? `${buyI}% Buy (${stAnalystCnt} analysts, ${peSfmt(stUpsidePct, 1)}% to target)`
+          : stHasCov
+          ? `${buyI}% Buy across ${stAnalystCnt} analysts`
+          : "Limited analyst coverage",
+      pro_value:
+        stHasCov && stTargetMean > 0.0
+          ? `${buyI}% Buy (N=${stAnalystCnt}) • Target ${ccySym}${peFmt(stTargetMean, 0)} (${peSfmt(stUpsidePct, 1)}%)`
+          : stHasCov
+          ? `${buyI}% Buy (N=${stAnalystCnt})`
+          : "Uncovered",
+      target_hint: "Broad analyst support adds conviction",
+      tone: stHasCov ? (buyI >= 65 ? "good" : buyI >= 40 ? "neutral" : "warn") : "neutral",
+    },
+    {
+      simple_label: "Recent analyst profit forecast changes",
+      pro_label: "Street EPS Revision Breadth",
+      simple_value:
+        stHasCov && rTot >= 3
+          ? `${rUp} raised vs ${rDn} cut profit forecasts recently`
+          : stHasCov
+          ? "Profit forecasts holding steady"
+          : "Tracked via quarterly results",
+      pro_value:
+        stHasCov && rTot >= 3
+          ? `${rUp} Up / ${rDn} Down (${peSfmt(stRevBreadth, 0)}% Breadth)`
+          : "Neutral / Steady Revisions",
+      target_hint: "More upgrades than cuts is a positive sign",
+      tone:
+        stHasCov && rTot >= 3
+          ? stRevBreadth >= 25.0
+            ? "good"
+            : stRevBreadth <= -40.0
+            ? "bad"
+            : "neutral"
+          : "neutral",
+    },
+    {
+      simple_label: "Big-investor backing & price trend",
+      pro_label: "Institutional/Promoter Stake & 200-DMA Trend",
+      simple_value:
+        marketCode === "US"
+          ? `${peFmt(instPct, 0)}% institutional backing (${trendWord})`
+          : `${peFmt(ownSum, 0)}% founder + institutional stake (${trendWord})`,
+      pro_value:
+        marketCode === "US"
+          ? `${peFmt(instPct, 1)}% Inst + ${peFmt(promoterPct, 1)}% Insider • 1Y Mom ${peSfmt(mom121Pct, 1)}%`
+          : `${peFmt(promoterPct, 1)}% Prom + ${peFmt(instPct, 1)}% FII/DII • 1Y Mom ${peSfmt(mom121Pct, 1)}%`,
+      target_hint: "High long-term ownership aligns incentives",
+      tone: ownSum >= 60.0 && above200dma ? "good" : ownSum >= 45.0 ? "neutral" : "warn",
+    },
+  ];
+
+  const receiptSteps = [
+    {
+      key: "quality",
+      simple_title: "1. Is it a strong, safe business?",
+      pro_title: "1. Business Quality & Moat Longevity",
+      score_100: peRoundInt(qualityScore),
+      weight_pct: peRoundDec(safeFloat(weightsPct.quality, 45.0), 1),
+      points_added: peRoundDec(safeFloat(contributions.quality, 0.0), 1),
+      verdict_tag: peVerdictTag(qualityScore),
+      plain_why: qPlainWhy,
+      rows: qualityRows,
+    },
+    {
+      key: "growth",
+      simple_title: "2. Are sales & profits growing?",
+      pro_title: "2. Multi-Year & Quarterly Growth",
+      score_100: peRoundInt(growthScore),
+      weight_pct: peRoundDec(safeFloat(weightsPct.growth, 25.0), 1),
+      points_added: peRoundDec(safeFloat(contributions.growth, 0.0), 1),
+      verdict_tag: peVerdictTag(growthScore),
+      plain_why: gPlainWhy,
+      rows: growthRows,
+    },
+    {
+      key: "value",
+      simple_title: "3. Is the stock fairly priced today?",
+      pro_title: "3. GARP Valuation & Margin of Safety",
+      score_100: peRoundInt(valueScore),
+      weight_pct: peRoundDec(safeFloat(weightsPct.value, 20.0), 1),
+      points_added: peRoundDec(safeFloat(contributions.value, 0.0), 1),
+      verdict_tag: peVerdictTag(valueScore),
+      plain_why: vPlainWhy,
+      rows: valueRows,
+    },
+    {
+      key: "momentum",
+      simple_title: "4. Financial health & expert view",
+      pro_title: "4. Financial Health, Ownership & Street Revisions",
+      score_100: peRoundInt(momentumScore),
+      weight_pct: peRoundDec(safeFloat(weightsPct.momentum, 10.0), 1),
+      points_added: peRoundDec(safeFloat(contributions.momentum, 0.0), 1),
+      verdict_tag: peVerdictTag(momentumScore),
+      plain_why: mPlainWhy,
+      rows: momentumRows,
+    },
+  ];
+
+  return {
+    archetype_code: archetypeCode,
+    archetype_label: archetypeLabel,
+    one_line_verdict: oneLineVerdict,
+    what_it_does: whatItDoes,
+    bottom_line_summary: [s1, s2, s3],
+    receipt_steps: receiptSteps,
+    safety_checks_plain: translatePiotroskiChecks(fChecks),
+  };
+}
+
 function indexSnapshot(raw) {
   const fundsByTicker = new Map();
   for (const f of raw.fundamentals || []) {
@@ -748,6 +1761,18 @@ export function scoreUniversePointInTime(
 
     const sustainedRoce = 0.6 * med5yRoce + 0.4 * roceCur;
     const sustainedRoe = 0.6 * med5yRoe + 0.4 * roeCur;
+    const cfoCur = Number(latest.cfo_cr);
+    const cfoToDebtRatio = cfoCur / Math.max(1.0, Number(latest.total_debt_cr));
+    const isPaymentNetwork = tk === "MA" || tk === "V";
+    const buybackDistortedEquity = Boolean(
+      (!isFin || isPaymentNetwork) &&
+        (equityCr <= 0 || deCur > 1.8 || (marketCode === "US" && pbRatio >= 24.9)) &&
+        patCr > 0 &&
+        cfoCur > 0 &&
+        cfoToDebtRatio >= 0.35 &&
+        sustainedRoce >= 18.0
+    );
+    const cfoToDebtPct = peRoundDec(cfoToDebtRatio * 100.0, 1);
 
     let qReturn;
     let qLev;
@@ -755,7 +1780,9 @@ export function scoreUniversePointInTime(
     let qMargin;
     if (isFin) {
       qReturn = 0.6 * linearScore(sustainedRoe, 8.0, 19.0) + 0.4 * linearScore(roaPct, 0.5, 2.2);
-      qLev = linearScore(deCur, 11.0, 2.0);
+      qLev = buybackDistortedEquity
+        ? linearScore(cfoToDebtRatio, 0.15, 0.65)
+        : linearScore(deCur, 11.0, 2.0);
       qCash = profitConsistencyPct;
       if (gnpaPct > 0) {
         const qAssetQual = 0.55 * linearScore(nnpaPct, 1.8, 0.25) + 0.45 * linearScore(gnpaPct, 5.0, 1.3);
@@ -765,7 +1792,9 @@ export function scoreUniversePointInTime(
       }
     } else {
       qReturn = 0.55 * linearScore(sustainedRoce, 8.0, 30.0) + 0.45 * linearScore(sustainedRoe, 8.0, 26.0);
-      qLev = linearScore(deCur, 1.8, 0.05);
+      qLev = buybackDistortedEquity
+        ? linearScore(cfoToDebtRatio, 0.15, 0.65)
+        : linearScore(deCur, 1.8, 0.05);
       qCash = 0.65 * linearScore(cumCfoEbitda5y, 50.0, 95.0) + 0.35 * profitConsistencyPct;
       qMargin = linearScore(opmCur, 8.0, 26.0);
     }
@@ -806,9 +1835,10 @@ export function scoreUniversePointInTime(
     const vPeRel = patCr > 0 ? linearScore(peRatio / Math.max(8.0, fairPe), 1.75, 0.75) : 0.0;
     const vPb = equityCr > 0 ? linearScore(pbRatio, 4.5, 1.1) : 0.0;
     const vFcf = linearScore(fcfYieldPct, 0.5, 5.5);
+    const effVPb = buybackDistortedEquity && (pbRatio >= 24.9 || equityCr <= 0) ? vFcf : vPb;
 
     const valueScore = isFin
-      ? clamp(0.35 * vPb + 0.35 * vPeRel + 0.3 * vPeg)
+      ? clamp(0.35 * effVPb + 0.35 * vPeRel + 0.3 * vPeg)
       : clamp(0.35 * vPeg + 0.3 * vPeRel + 0.2 * vEy + 0.15 * vFcf);
 
     let valuationZone;
@@ -914,10 +1944,10 @@ export function scoreUniversePointInTime(
         6.0
       );
     }
-    if (equityCr <= 0) {
+    if (equityCr <= 0 && !buybackDistortedEquity) {
       addFlag("Negative net worth / eroded book equity", 15.0);
     }
-    if (!isFin && deCur > 1.8) {
+    if (!isFin && deCur > 1.8 && !buybackDistortedEquity) {
       addFlag(`High corporate debt load (D/E ${deCur.toFixed(2)}x)`, 12.0);
     }
     if (!isFin && cumCfoEbitda5y < 55.0) {
@@ -953,7 +1983,11 @@ export function scoreUniversePointInTime(
     if (fScore <= 3) {
       addFlag(`Weak Piotroski financial health (${fScore}/9)`, 10.0);
     }
-    if ((peRatio > 56.0 && pegRatio > 2.1) || (isCyclicalProfile && peRatio > fairPe * 1.75)) {
+    if (
+      patCr > 0 &&
+      peRatio < 99.0 &&
+      ((peRatio > 56.0 && pegRatio > 2.1) || (isCyclicalProfile && peRatio > fairPe * 1.75))
+    ) {
       addFlag(
         `Valuation rich at ${peRatio.toFixed(1)}x P/E (Fair ~${fairPe.toFixed(1)}x, PEG ${pegRatio.toFixed(1)}x) — wait for pullback`,
         8.0
@@ -1097,6 +2131,73 @@ export function scoreUniversePointInTime(
     };
 
     const s1 = idx.stage1Lookup.get(tk) || {};
+    const pillarsPayload = {
+      quality: roundTo(qualityScore, 1),
+      value: roundTo(valueScore, 1),
+      growth: roundTo(growthScore, 1),
+      momentum: roundTo(momentumScore, 1),
+    };
+    const streetPayload = buildStreetPayload(ssig, streetAvail, curPrice);
+    const plainEnglishPayload = buildPlainEnglish({
+      ticker: tk,
+      name: comp.name,
+      sector: comp.sector,
+      industry: comp.industry || s1.industry || "",
+      business_summary: comp.business_summary || "",
+      market_code: marketCode,
+      currency,
+      is_fin: isFin,
+      is_commodity_biz: isCommodityBiz,
+      is_cyclical: isCyclicalProfile,
+      buyback_distorted_equity: buybackDistortedEquity,
+      pat_cr: patCr,
+      pat_fy_cr: patFyCr,
+      equity_cr: equityCr,
+      pe_ratio: peRatio,
+      fair_pe: fairPe,
+      peg_ratio: pegRatio,
+      pb_ratio: pbRatio,
+      fcf_yield_pct: fcfYieldPct,
+      earnings_yield_pct: earningsYieldPct,
+      roce_cur: roceCur,
+      med_5y_roce: med5yRoce,
+      roe_cur: roeCur,
+      med_5y_roe: med5yRoe,
+      sustained_roce: sustainedRoce,
+      roa_pct: roaPct,
+      cycle_floor_ret: cycleFloorRet,
+      moat_stability: moatStability,
+      opm_cur: opmCur,
+      de_cur: deCur,
+      cum_cfo_ebitda_5y: cumCfoEbitda5y,
+      cfo_to_debt_pct: cfoToDebtPct,
+      profitable_yrs: profitableYrs,
+      window_5y_len: window5y.length,
+      rev_cagr_3y: revCagr3y,
+      rev_cagr_5y: revCagr5y,
+      pat_cagr_3y: patCagr3y,
+      pat_cagr_5y: patCagr5y,
+      has_qtr_data: hasQtrData,
+      qtr_rev_yoy: qtrRevYoy,
+      qtr_pat_yoy: qtrPatYoy,
+      latest_qtr_label: latestQtrLabel,
+      gnpa_pct: gnpaPct,
+      nnpa_pct: nnpaPct,
+      f_score: fScore,
+      f_checks: fChecks,
+      promoter_pct: promoterPct,
+      inst_pct: instPct,
+      mom_12_1_pct: mom12_1Pct,
+      above_200dma: above200dma,
+      composite_score: compositeScore,
+      rating,
+      valuation_zone: valuationZone,
+      valuation_capped: valuationCapped,
+      pillars: pillarsPayload,
+      score_breakdown: scoreBreakdown,
+      street: streetPayload,
+    });
+
     results.push({
       ticker: tk,
       name: comp.name,
@@ -1117,12 +2218,7 @@ export function scoreUniversePointInTime(
       rating,
       conviction,
       valuation_zone: valuationZone,
-      pillars: {
-        quality: roundTo(qualityScore, 1),
-        value: roundTo(valueScore, 1),
-        growth: roundTo(growthScore, 1),
-        momentum: roundTo(momentumScore, 1),
-      },
+      pillars: pillarsPayload,
       metrics: {
         roce_pct: roundTo(isFin ? roeCur : roceCur, 1),
         med_5y_roce_pct: roundTo(isFin ? med5yRoe : med5yRoce, 1),
@@ -1133,6 +2229,8 @@ export function scoreUniversePointInTime(
         op_margin_pct: roundTo(opmCur, 1),
         debt_to_equity: roundTo(deCur, 2),
         cfo_to_ebitda_pct: roundTo(cumCfoEbitda5y, 1),
+        cfo_to_debt_pct: cfoToDebtPct,
+        buyback_equity: buybackDistortedEquity,
         profit_consistency: `${profitableYrs}/${window5y.length}`,
         pe_ratio: roundTo(peRatio, 1),
         fair_pe: fairPe,
@@ -1161,11 +2259,12 @@ export function scoreUniversePointInTime(
         inst_pct: roundTo(instPct, 1),
         latest_fy: Number(latest.fiscal_year),
       },
-      street: buildStreetPayload(ssig, streetAvail, curPrice),
+      street: streetPayload,
       strengths: strengths.slice(0, 5),
       red_flags: redFlags.slice(0, 5),
       piotroski_checks: fChecks,
       score_breakdown: scoreBreakdown,
+      plain_english: plainEnglishPayload,
     });
   }
 

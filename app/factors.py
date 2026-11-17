@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from app.plain_english import build_plain_english
+
 PRESET_WEIGHTS: Dict[str, Dict[str, float]] = {
     "qglp_compounder": {"quality": 45.0, "value": 20.0, "growth": 25.0, "momentum": 10.0},
     "street_quant": {"quality": 35.0, "value": 20.0, "growth": 25.0, "momentum": 20.0},
@@ -534,10 +536,26 @@ def score_universe_point_in_time(
         # --- Pillar 1: Long-Term Quality, Cash Conversion & Anti-Cyclical Moat ---
         sustained_roce = 0.60 * med_5y_roce + 0.40 * roce_cur
         sustained_roe = 0.60 * med_5y_roe + 0.40 * roe_cur
+        cfo_cur = float(latest["cfo_cr"])
+        cfo_to_debt_ratio = cfo_cur / max(1.0, float(latest["total_debt_cr"]))
+        is_payment_network = tk in ("MA", "V")
+        buyback_distorted_equity = bool(
+            ((not is_fin) or is_payment_network)
+            and (equity_cr <= 0 or de_cur > 1.8 or (market_code == "US" and pb_ratio >= 24.9))
+            and pat_cr > 0
+            and cfo_cur > 0
+            and cfo_to_debt_ratio >= 0.35
+            and sustained_roce >= 18.0
+        )
+        cfo_to_debt_pct = _js_round(cfo_to_debt_ratio * 100.0, 1)
 
         if is_fin:
             q_return = 0.60 * _linear_score(sustained_roe, 8.0, 19.0) + 0.40 * _linear_score(roa_pct, 0.5, 2.2)
-            q_lev = _linear_score(de_cur, 11.0, 2.0)
+            q_lev = (
+                _linear_score(cfo_to_debt_ratio, 0.15, 0.65)
+                if buyback_distorted_equity
+                else _linear_score(de_cur, 11.0, 2.0)
+            )
             q_cash = profit_consistency_pct
             if gnpa_pct > 0:
                 q_asset_qual = 0.55 * _linear_score(nnpa_pct, 1.8, 0.25) + 0.45 * _linear_score(gnpa_pct, 5.0, 1.3)
@@ -546,7 +564,11 @@ def score_universe_point_in_time(
                 q_margin = _linear_score(opm_cur, 8.0, 28.0)
         else:
             q_return = 0.55 * _linear_score(sustained_roce, 8.0, 30.0) + 0.45 * _linear_score(sustained_roe, 8.0, 26.0)
-            q_lev = _linear_score(de_cur, 1.8, 0.05)
+            q_lev = (
+                _linear_score(cfo_to_debt_ratio, 0.15, 0.65)
+                if buyback_distorted_equity
+                else _linear_score(de_cur, 1.8, 0.05)
+            )
             q_cash = 0.65 * _linear_score(cum_cfo_ebitda_5y, 50.0, 95.0) + 0.35 * profit_consistency_pct
             q_margin = _linear_score(opm_cur, 8.0, 26.0)
 
@@ -593,9 +615,10 @@ def score_universe_point_in_time(
         v_pe_rel = _linear_score(pe_ratio / max(8.0, fair_pe), 1.75, 0.75) if pat_cr > 0 else 0.0
         v_pb = _linear_score(pb_ratio, 4.5, 1.1) if equity_cr > 0 else 0.0
         v_fcf = _linear_score(fcf_yield_pct, 0.5, 5.5)
+        eff_v_pb = v_fcf if (buyback_distorted_equity and (pb_ratio >= 24.9 or equity_cr <= 0)) else v_pb
 
         if is_fin:
-            value_score = _clamp(0.35 * v_pb + 0.35 * v_pe_rel + 0.30 * v_peg)
+            value_score = _clamp(0.35 * eff_v_pb + 0.35 * v_pe_rel + 0.30 * v_peg)
         else:
             value_score = _clamp(0.35 * v_peg + 0.30 * v_pe_rel + 0.20 * v_ey + 0.15 * v_fcf)
 
@@ -710,9 +733,9 @@ def score_universe_point_in_time(
                 f"Widespread sell-side EPS cuts ({act_dn} down vs {act_up} up over {act_win}, {_js_round_int(rev_breadth)}% breadth)",
                 6.0,
             )
-        if equity_cr <= 0:
+        if equity_cr <= 0 and not buyback_distorted_equity:
             _add_flag("Negative net worth / eroded book equity", 15.0)
-        if not is_fin and de_cur > 1.8:
+        if not is_fin and de_cur > 1.8 and not buyback_distorted_equity:
             _add_flag(f"High corporate debt load (D/E {de_cur:.2f}x)", 12.0)
         if not is_fin and cum_cfo_ebitda_5y < 55.0:
             _add_flag(f"Weak 5Y cumulative cash conversion ({cum_cfo_ebitda_5y:.0f}% CFO/EBITDA)", 10.0)
@@ -740,7 +763,9 @@ def score_universe_point_in_time(
             )
         if f_score <= 3:
             _add_flag(f"Weak Piotroski financial health ({f_score}/9)", 10.0)
-        if (pe_ratio > 56.0 and peg_ratio > 2.1) or (is_cyclical_profile and pe_ratio > fair_pe * 1.75):
+        if pat_cr > 0 and pe_ratio < 99.0 and (
+            (pe_ratio > 56.0 and peg_ratio > 2.1) or (is_cyclical_profile and pe_ratio > fair_pe * 1.75)
+        ):
             _add_flag(
                 f"Valuation rich at {pe_ratio:.1f}x P/E (Fair ~{fair_pe:.1f}x, PEG {peg_ratio:.1f}x) — wait for pullback",
                 8.0,
@@ -881,6 +906,75 @@ def score_universe_point_in_time(
             },
         }
 
+        pillars_payload = {
+            "quality": _js_round(quality_score, 1),
+            "value": _js_round(value_score, 1),
+            "growth": _js_round(growth_score, 1),
+            "momentum": _js_round(momentum_score, 1),
+        }
+        street_payload = _build_street_payload(ssig, street_avail, cur_price)
+        plain_english_payload = build_plain_english(
+            {
+                "ticker": tk,
+                "name": comp["name"],
+                "sector": comp["sector"],
+                "industry": comp.get("industry") or s1_info.get("industry") or "",
+                "business_summary": comp.get("business_summary") or "",
+                "market_code": market_code,
+                "currency": currency,
+                "is_fin": is_fin,
+                "is_commodity_biz": is_commodity_biz,
+                "is_cyclical": is_cyclical_profile,
+                "buyback_distorted_equity": buyback_distorted_equity,
+                "pat_cr": pat_cr,
+                "pat_fy_cr": pat_fy_cr,
+                "equity_cr": equity_cr,
+                "pe_ratio": pe_ratio,
+                "fair_pe": fair_pe,
+                "peg_ratio": peg_ratio,
+                "pb_ratio": pb_ratio,
+                "fcf_yield_pct": fcf_yield_pct,
+                "earnings_yield_pct": earnings_yield_pct,
+                "roce_cur": roce_cur,
+                "med_5y_roce": med_5y_roce,
+                "roe_cur": roe_cur,
+                "med_5y_roe": med_5y_roe,
+                "sustained_roce": sustained_roce,
+                "roa_pct": roa_pct,
+                "cycle_floor_ret": cycle_floor_ret,
+                "moat_stability": moat_stability,
+                "opm_cur": opm_cur,
+                "de_cur": de_cur,
+                "cum_cfo_ebitda_5y": cum_cfo_ebitda_5y,
+                "cfo_to_debt_pct": cfo_to_debt_pct,
+                "profitable_yrs": profitable_yrs,
+                "window_5y_len": len(window_5y),
+                "rev_cagr_3y": rev_cagr_3y,
+                "rev_cagr_5y": rev_cagr_5y,
+                "pat_cagr_3y": pat_cagr_3y,
+                "pat_cagr_5y": pat_cagr_5y,
+                "has_qtr_data": has_qtr_data,
+                "qtr_rev_yoy": qtr_rev_yoy,
+                "qtr_pat_yoy": qtr_pat_yoy,
+                "latest_qtr_label": latest_qtr_label,
+                "gnpa_pct": gnpa_pct,
+                "nnpa_pct": nnpa_pct,
+                "f_score": f_score,
+                "f_checks": f_checks,
+                "promoter_pct": promoter_pct,
+                "inst_pct": inst_pct,
+                "mom_12_1_pct": mom_12_1_pct,
+                "above_200dma": above_200dma,
+                "composite_score": composite_score,
+                "rating": rating,
+                "valuation_zone": valuation_zone,
+                "valuation_capped": valuation_capped,
+                "pillars": pillars_payload,
+                "score_breakdown": score_breakdown,
+                "street": street_payload,
+            }
+        )
+
         results.append(
             {
                 "ticker": tk,
@@ -902,12 +996,7 @@ def score_universe_point_in_time(
                 "rating": rating,
                 "conviction": conviction,
                 "valuation_zone": valuation_zone,
-                "pillars": {
-                    "quality": _js_round(quality_score, 1),
-                    "value": _js_round(value_score, 1),
-                    "growth": _js_round(growth_score, 1),
-                    "momentum": _js_round(momentum_score, 1),
-                },
+                "pillars": pillars_payload,
                 "metrics": {
                     "roce_pct": round(roe_cur if is_fin else roce_cur, 1),
                     "med_5y_roce_pct": round(med_5y_roe if is_fin else med_5y_roce, 1),
@@ -918,6 +1007,8 @@ def score_universe_point_in_time(
                     "op_margin_pct": round(opm_cur, 1),
                     "debt_to_equity": round(de_cur, 2),
                     "cfo_to_ebitda_pct": round(cum_cfo_ebitda_5y, 1),
+                    "cfo_to_debt_pct": cfo_to_debt_pct,
+                    "buyback_equity": buyback_distorted_equity,
                     "profit_consistency": f"{profitable_yrs}/{len(window_5y)}",
                     "pe_ratio": round(pe_ratio, 1),
                     "fair_pe": fair_pe,
@@ -946,11 +1037,12 @@ def score_universe_point_in_time(
                     "inst_pct": round(inst_pct, 1),
                     "latest_fy": int(latest["fiscal_year"]),
                 },
-                "street": _build_street_payload(ssig, street_avail, cur_price),
+                "street": street_payload,
                 "strengths": strengths[:5],
                 "red_flags": red_flags[:5],
                 "piotroski_checks": f_checks,
                 "score_breakdown": score_breakdown,
+                "plain_english": plain_english_payload,
             }
         )
 

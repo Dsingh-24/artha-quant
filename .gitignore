@@ -4,16 +4,20 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# Node dependencies (Netlify Functions)
+node_modules/
+
 # Local SQLite database & user session/auth tables (NEVER commit!)
 data/*.db
 data/*.db-wal
 data/*.db-shm
 data/uploads/
 
-# Netlify local link state & generated static build output
+# Netlify local link state & generated static/function build output
 .netlify
 .netlify/
 dist/
+netlify/functions/data/stock_ai_context.json
 
 # Environment & OS metadata
 .env

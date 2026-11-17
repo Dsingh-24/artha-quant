@@ -30,6 +30,8 @@ def export_public_snapshot(db_path: Path = DEFAULT_DB_PATH, out_path: Path | Non
             "ticker": c["ticker"],
             "name": c["name"],
             "sector": c["sector"],
+            "industry": c.get("industry", ""),
+            "business_summary": c.get("business_summary", ""),
             "cap_tier": c["cap_tier"],
             "is_financial": bool(c["is_financial"]),
             "promoter_pct": round(float(c.get("promoter_pct") or 0.0), 2),
@@ -123,7 +125,7 @@ def export_public_snapshot(db_path: Path = DEFAULT_DB_PATH, out_path: Path | Non
                 arr[i] = last_val
 
     payload = {
-        "snapshot_version": "2.5.0",
+        "snapshot_version": "3.0.0",
         "as_of_date": all_dates[-1] if all_dates else "2026-11-16",
         "companies": companies,
         "stage1_funnel": stage1_funnel,

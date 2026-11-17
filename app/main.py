@@ -46,7 +46,9 @@ from app.live_funnel import (
     sync_single_live_ticker,
 )
 from app.planner import build_investment_plan
+from app.plain_english import generate_local_ai_memo
 from app.schemas import (
+    AiMemoRequest,
     AuthCredentials,
     BacktestRequest,
     CompanyTickerQuery,
@@ -543,6 +545,112 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             "fundamentals": fundamentals,
             "price_history": sampled_prices,
         }
+
+    def require_session_or_same_origin(
+        request: Request,
+        x_csrf_token: Optional[str] = Header(default=None, alias="X-CSRF-Token"),
+    ) -> Optional[Dict[str, Any]]:
+        has_sid = bool(
+            request.cookies.get(HTTPS_SESSION_COOKIE) or request.cookies.get(LOCAL_HTTP_SESSION_COOKIE)
+        )
+        if has_sid:
+            return require_session(request=request, x_csrf_token=x_csrf_token)
+
+        sec_fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+        origin = (request.headers.get("origin") or "").strip().lower()
+        allowed_origins = {
+            "http://127.0.0.1:8000",
+            "http://localhost:8000",
+            "https://127.0.0.1:8000",
+            "https://localhost:8000",
+        }
+        if sec_fetch_site == "same-origin" or origin in allowed_origins:
+            return None
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
+
+    @app.post("/api/ai-memo")
+    async def get_or_generate_ai_memo(
+        request: Request,
+        _auth: Optional[Dict[str, Any]] = Depends(require_session_or_same_origin),
+    ) -> Response:
+        try:
+            raw_body = await request.json()
+            if not isinstance(raw_body, dict):
+                raise ValueError("Expected JSON object.")
+            payload = AiMemoRequest(**raw_body)
+        except (ValueError, ValidationError):
+            return JSONResponse(
+                status_code=400,
+                content={"available": False, "reason": "Unknown ticker"},
+            )
+
+        cleaned = payload.ticker
+        comp = db.get_company(cleaned)
+        validated = cleaned
+        if not comp and not cleaned.endswith((".NS", ".BO")):
+            try:
+                fallback_ns = TickerSyncRequest(ticker=cleaned).ticker
+                comp = db.get_company(fallback_ns)
+                if comp:
+                    validated = fallback_ns
+            except ValidationError:
+                comp = None
+        if not comp:
+            return JSONResponse(
+                status_code=400,
+                content={"available": False, "ticker": cleaned, "reason": "Unknown ticker"},
+            )
+
+        companies, fund_df, price_mat, stage1_rows = market_cache.load()
+        as_of = str(price_mat.index[-1]) if not price_mat.empty else "2026-11-17"
+
+        cached_memo = getattr(db, "get_ai_memo", lambda _t, _d: None)(validated, as_of)
+        if cached_memo:
+            return JSONResponse(status_code=200, content=cached_memo)
+
+        has_local_key = bool(
+            (os.environ.get("GEMINI_API_KEY") or "").strip()
+            or (os.environ.get("OPENAI_API_KEY") or "").strip()
+        )
+        if not has_local_key:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "available": False,
+                    "ticker": validated,
+                    "reason": "No local GEMINI_API_KEY set — open the live Netlify deployment where Netlify AI Gateway is active out-of-the-box.",
+                },
+            )
+
+        s1_lookup = {r["ticker"]: r for r in stage1_rows}
+        qtr_signals = market_cache.get_quarterly_signals()
+        street_signals = market_cache.get_street_signals()
+        eff_preset = payload.preset if payload.preset in PRESET_WEIGHTS else "qglp_compounder"
+        scored = score_universe_point_in_time(
+            companies=companies,
+            fundamentals_df=fund_df,
+            price_matrix=price_mat,
+            as_of_date=as_of,
+            preset=eff_preset,
+            stage1_lookup=s1_lookup,
+            quarterly_signals=qtr_signals,
+            street_signals=street_signals,
+        )
+        scorecard = next((s for s in scored if s["ticker"] == validated), None)
+        if not scorecard:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "available": False,
+                    "ticker": validated,
+                    "reason": "Insufficient fundamental history to generate an AI analyst memo.",
+                },
+            )
+
+        memo = generate_local_ai_memo(company=comp, scorecard=scorecard, as_of_date=as_of)
+        if memo.get("available") and hasattr(db, "upsert_ai_memo"):
+            db.upsert_ai_memo(validated, as_of, str(memo.get("model_used") or ""), memo)
+        return JSONResponse(status_code=200, content=memo)
 
     def _refresh_cache_and_snapshot() -> None:
         market_cache.invalidate()

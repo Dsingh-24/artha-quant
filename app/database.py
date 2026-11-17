@@ -68,6 +68,8 @@ class Database:
                     ticker TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     sector TEXT NOT NULL,
+                    industry TEXT NOT NULL DEFAULT '',
+                    business_summary TEXT NOT NULL DEFAULT '',
                     cap_tier TEXT NOT NULL DEFAULT 'Large/Mid Cap',
                     is_financial INTEGER NOT NULL DEFAULT 0,
                     promoter_pct REAL NOT NULL DEFAULT 0.0,
@@ -193,10 +195,23 @@ class Database:
                     top_holders_json TEXT DEFAULT '[]',
                     updated_at TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS ai_analyst_memos (
+                    ticker TEXT NOT NULL,
+                    snapshot_date TEXT NOT NULL,
+                    model_used TEXT NOT NULL DEFAULT '',
+                    memo_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (ticker, snapshot_date)
+                );
                 """
             )
             # Ensure backward-compatible migration if existing DB lacks newer columns
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(companies)").fetchall()}
+            if "industry" not in cols:
+                conn.execute("ALTER TABLE companies ADD COLUMN industry TEXT NOT NULL DEFAULT ''")
+            if "business_summary" not in cols:
+                conn.execute("ALTER TABLE companies ADD COLUMN business_summary TEXT NOT NULL DEFAULT ''")
             if "promoter_pct" not in cols:
                 conn.execute("ALTER TABLE companies ADD COLUMN promoter_pct REAL NOT NULL DEFAULT 0.0")
             if "inst_pct" not in cols:
@@ -326,20 +341,26 @@ class Database:
         market: str = "IN",
         currency: str = "INR",
         index_tag: Optional[str] = None,
+        industry: str = "",
+        business_summary: str = "",
     ) -> None:
         now = int(time.time())
         resolved_tag = index_tag or ("NIFTY200" if market == "IN" else "NASDAQ100")
+        clean_industry = str(industry or "").strip()
+        clean_summary = str(business_summary or "").strip()
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO companies (
-                    ticker, name, sector, cap_tier, is_financial, promoter_pct, inst_pct,
-                    data_source, market, currency, index_tag, updated_at
+                    ticker, name, sector, industry, business_summary, cap_tier, is_financial,
+                    promoter_pct, inst_pct, data_source, market, currency, index_tag, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ticker) DO UPDATE SET
                     name = excluded.name,
                     sector = excluded.sector,
+                    industry = CASE WHEN excluded.industry != '' THEN excluded.industry ELSE companies.industry END,
+                    business_summary = CASE WHEN excluded.business_summary != '' THEN excluded.business_summary ELSE companies.business_summary END,
                     cap_tier = excluded.cap_tier,
                     is_financial = excluded.is_financial,
                     promoter_pct = CASE WHEN excluded.promoter_pct > 0 THEN excluded.promoter_pct ELSE companies.promoter_pct END,
@@ -354,6 +375,8 @@ class Database:
                     ticker,
                     name,
                     sector,
+                    clean_industry,
+                    clean_summary,
                     cap_tier,
                     1 if is_financial else 0,
                     round(promoter_pct, 2),
@@ -526,8 +549,8 @@ class Database:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT ticker, name, sector, cap_tier, is_financial, promoter_pct, inst_pct,
-                       data_source, market, currency, index_tag, updated_at
+                SELECT ticker, name, sector, industry, business_summary, cap_tier, is_financial,
+                       promoter_pct, inst_pct, data_source, market, currency, index_tag, updated_at
                 FROM companies
                 ORDER BY ticker ASC
                 """
@@ -538,8 +561,8 @@ class Database:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT ticker, name, sector, cap_tier, is_financial, promoter_pct, inst_pct,
-                       data_source, market, currency, index_tag, updated_at
+                SELECT ticker, name, sector, industry, business_summary, cap_tier, is_financial,
+                       promoter_pct, inst_pct, data_source, market, currency, index_tag, updated_at
                 FROM companies
                 WHERE ticker = ?
                 """,
@@ -780,3 +803,53 @@ class Database:
                 }
                 for r in rows
             ]
+
+    # --- Local AI Analyst Memo Cache ---
+
+    def get_ai_memo(self, ticker: str, snapshot_date: str) -> Optional[Dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ticker, snapshot_date, model_used, memo_json, created_at
+                FROM ai_analyst_memos
+                WHERE ticker = ? AND snapshot_date = ?
+                """,
+                (str(ticker), str(snapshot_date)),
+            ).fetchone()
+            if not row:
+                return None
+            try:
+                parsed = json.loads(row["memo_json"])
+                if not isinstance(parsed, dict):
+                    return None
+            except Exception:
+                return None
+            out = dict(parsed)
+            out["ticker"] = out.get("ticker") or row["ticker"]
+            out["as_of_date"] = out.get("as_of_date") or row["snapshot_date"]
+            out["model_used"] = out.get("model_used") or row["model_used"]
+            out["available"] = bool(out.get("available", True))
+            out["cached"] = True
+            return out
+
+    def upsert_ai_memo(
+        self,
+        ticker: str,
+        snapshot_date: str,
+        model_used: str,
+        memo_dict: Dict[str, Any],
+    ) -> None:
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        encoded = json.dumps(memo_dict, separators=(",", ":"))
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_analyst_memos (ticker, snapshot_date, model_used, memo_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(ticker, snapshot_date) DO UPDATE SET
+                    model_used = excluded.model_used,
+                    memo_json = excluded.memo_json,
+                    created_at = excluded.created_at
+                """,
+                (str(ticker), str(snapshot_date), str(model_used or ""), encoded, now_iso),
+            )

@@ -23,6 +23,15 @@ jobs:
           cache: "pip"
           cache-dependency-path: requirements-local.txt
 
+      - name: Set up Node.js 22 for Netlify Functions
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install Node dependencies (`package-lock.json`)
+        run: npm ci
+
       - name: Install backend test dependencies
         run: pip install -r requirements-local.txt
 
@@ -46,8 +55,14 @@ jobs:
           print("Frontend static security check passed (0 violations).")
           EOF
 
-      - name: Build Netlify static bundle (`dist/`)
+      - name: Build Netlify static bundle (`dist/`) & compact AI stock context
         run: sh scripts/build_netlify.sh
+
+      - name: Typecheck & bundle-verify Netlify AI Function (`ai-memo.mts`)
+        run: |
+          ./node_modules/.bin/tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck netlify/functions/ai-memo.mts
+          ./node_modules/.bin/esbuild netlify/functions/ai-memo.mts --bundle --platform=node --format=esm --target=node22 --external:@google/genai --outfile=/tmp/ai-memo-check.mjs
+          rm -f /tmp/ai-memo-check.mjs
 
       - name: Trigger Netlify Deploy via Build Hook (if configured)
         if: github.ref == 'refs/heads/main' && env.NETLIFY_BUILD_HOOK_URL != ''

@@ -4,6 +4,14 @@
   command = "sh scripts/build_netlify.sh"
   publish = "dist"
 
+[build.environment]
+  NODE_VERSION = "22"
+
+[functions]
+  node_bundler = "esbuild"
+  external_node_modules = ["@google/genai"]
+  included_files = ["netlify/functions/data/stock_ai_context.json"]
+
 [[headers]]
   for = "/*"
   [headers.values]
@@ -19,7 +27,7 @@
     Cache-Control = "public, max-age=300, stale-while-revalidate=86400"
 
 [[redirects]]
-  from = "/api/*"
+  from = "/api/auth/*"
   to = "/404"
   status = 404
 

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ArthaQuant V2.5 — Nifty 200, Nasdaq 100 &amp; S&amp;P 500 Rankings, Street Consensus &amp; Wealth Planner</title>
+  <title>ArthaQuant V3.0 — Plain-English Stock Rankings (Nifty 200, Nasdaq 100 &amp; S&amp;P 500), AI Analyst &amp; Wealth Planner</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -30,11 +30,11 @@
         <button id="auth-submit-btn" type="submit" class="btn btn-primary btn-full">Initialize Workspace</button>
       </form>
       <div class="firm-pills">
-        <span class="pill">QGLP Compounders</span>
-        <span class="pill">Street EPS Revisions</span>
-        <span class="pill">Marcellus Coffee-Can</span>
-        <span class="pill">Greenblatt Magic Formula</span>
-        <span class="pill">Piotroski 9-Point</span>
+        <span class="pill">Plain-English Scorecards</span>
+        <span class="pill">6 Business Archetypes</span>
+        <span class="pill">On-Demand AI Analyst Memo</span>
+        <span class="pill">Street Analyst Consensus</span>
+        <span class="pill">Pro Financial Ratios Toggle</span>
       </div>
     </div>
   </section>
@@ -161,11 +161,11 @@
             <div>
               <label class="field-label" for="screener-sort">Sort Rankings By</label>
               <select id="screener-sort" class="input-control">
-                <option value="composite" selected>Overall Rank (Composite Score)</option>
-                <option value="quality">Quality &amp; 8Y Moat Pillar</option>
-                <option value="growth">Growth (5Y + 2Q) Pillar</option>
-                <option value="value">Valuation (Fair P/E Upside) Pillar</option>
-                <option value="mcap">Market Cap (Largest First)</option>
+                <option value="composite" selected>Overall Score (Highest Rank First)</option>
+                <option value="quality">Strongest &amp; Safest Business</option>
+                <option value="growth">Fastest Sales &amp; Profit Growth</option>
+                <option value="value">Best Price vs Fair Value</option>
+                <option value="mcap">Largest Company Size (Market Cap)</option>
               </select>
             </div>
           </div>
@@ -204,7 +204,7 @@
         <div id="podium-section">
           <div class="section-heading-row">
             <h2 id="podium-heading">Top Conviction Leaders</h2>
-            <span class="muted-note">Click any card or row to inspect the exact step-by-step score calculation &amp; 8-year evidence</span>
+            <span class="muted-note">Plain-English business snapshot &amp; verdict — click any card for the 30-second breakdown &amp; AI Analyst Memo</span>
           </div>
           <div id="top-podium-grid" class="podium-grid"></div>
         </div>
@@ -214,9 +214,15 @@
           <div class="panel-header">
             <div>
               <h2 id="table-panel-title">Global Multi-Market Fundamental Rankings</h2>
-              <p class="muted-note" id="table-panel-sub">Click any company to open its full Score Reasoning &amp; Forensic Deep Dive</p>
+              <p class="muted-note" id="table-panel-sub">Click any company to open its Plain-English Score Receipt, Business Snapshot &amp; On-Demand AI Analyst Memo</p>
             </div>
-            <span id="visible-count-badge" class="pill"></span>
+            <div class="inline-group wrap-group">
+              <div id="screener-mode-switcher" class="mode-switcher" role="group" aria-label="Leaderboard Explanation Mode">
+                <button id="screener-mode-simple-btn" type="button" class="mode-switch-btn active">Simple English</button>
+                <button id="screener-mode-pro-btn" type="button" class="mode-switch-btn">Pro Ratios</button>
+              </div>
+              <span id="visible-count-badge" class="pill"></span>
+            </div>
           </div>
           <div class="table-scroll leaderboard-scroll">
             <table class="quant-table leaderboard-table">
@@ -507,12 +513,18 @@
   <div id="deep-dive-backdrop" class="drawer-backdrop hidden"></div>
   <aside id="deep-dive-drawer" class="deep-dive-drawer hidden" aria-label="Stock Score Deep Dive">
     <div class="drawer-sticky-bar">
-      <div class="inline-group">
+      <div class="inline-group wrap-group">
         <button id="dd-prev-btn" type="button" class="btn btn-ghost btn-sm">&larr; Prev Rank</button>
         <button id="dd-next-btn" type="button" class="btn btn-ghost btn-sm">Next Rank &rarr;</button>
         <span id="dd-nav-label" class="muted-note"></span>
       </div>
-      <button id="dd-close-btn" type="button" class="btn btn-ghost btn-sm">Close (Esc) &times;</button>
+      <div class="inline-group wrap-group">
+        <div id="dd-mode-switcher" class="mode-switcher" role="group" aria-label="Score Explanation Mode">
+          <button id="dd-mode-simple-btn" type="button" class="mode-switch-btn active">Simple View (Plain English)</button>
+          <button id="dd-mode-pro-btn" type="button" class="mode-switch-btn">Pro View (+ Financial Ratios)</button>
+        </div>
+        <button id="dd-close-btn" type="button" class="btn btn-ghost btn-sm">Close (Esc) &times;</button>
+      </div>
     </div>
     <div id="company-detail-content" class="drawer-scroll-body"></div>
   </aside>

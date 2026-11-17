@@ -1,4 +1,4 @@
-// Safe SVG chart, score gauge, currency formatter & stacked contribution renderer
+// ArthaQuant V3.0 — Safe SVG chart, score gauge, currency formatter & stacked contribution renderer
 // built exclusively with document.createElementNS and textContent.
 
 const SVG_NS = "http://www.w3.org/2000/svg";
