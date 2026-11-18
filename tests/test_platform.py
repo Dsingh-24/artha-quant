@@ -682,8 +682,32 @@ def test_public_snapshot_and_static_frontend_security_invariants() -> None:
     snap_path = root / "static" / "data" / "market_snapshot.json"
     assert snap_path.exists()
     raw_snap = snap_path.read_text(encoding="utf-8")
-    for sensitive in ('"users"', '"sessions"', '"saved_plans"', '"password_hash"', '"session_hash"', '"csrf_token"'):
+    for sensitive in (
+        '"users"',
+        '"sessions"',
+        '"saved_plans"',
+        '"password_hash"',
+        '"session_hash"',
+        '"csrf_token"',
+        '"paper_portfolios"',
+        '"paper_positions"',
+        '"paper_orders"',
+        '"paper_trades"',
+        '"paper_live_quotes"',
+        '"paper_nav_history"',
+    ):
         assert sensitive not in raw_snap
+
+    export_src = (root / "scripts" / "export_snapshot.py").read_text(encoding="utf-8")
+    for paper_tbl in (
+        "paper_portfolios",
+        "paper_positions",
+        "paper_orders",
+        "paper_trades",
+        "paper_live_quotes",
+        "paper_nav_history",
+    ):
+        assert paper_tbl not in export_src, f"export_snapshot.py must never reference {paper_tbl}"
 
     snap = json.loads(raw_snap)
     companies = snap["companies"]
@@ -730,7 +754,11 @@ def test_public_snapshot_and_static_frontend_security_invariants() -> None:
             assert not any(kw in h_low for kw in mm_noise), f"Market-maker noise {holder} in {tk}"
             assert not re.search(r"\bimc\b", h_low), f"Market-maker IMC noise {holder} in {tk}"
 
-    # Verify static HTML & JS security rules and 100% DOM ID alignment
+    # Verify first-party static HTML/JS/CSS/SVG security rules (excluding static/vendor/) and 100% DOM ID alignment
+    vendor_bundle = root / "static" / "vendor" / "netlify_identity.js"
+    assert vendor_bundle.is_file()
+    assert vendor_bundle.read_text(encoding="utf-8").splitlines()[0].startswith("// @vendor-bundle: @netlify/identity")
+
     forbidden = [
         r"\binnerHTML\b",
         r"\bouterHTML\b",
@@ -738,30 +766,40 @@ def test_public_snapshot_and_static_frontend_security_invariants() -> None:
         r"document\.write",
         r"\blocalStorage\b",
         r"\bsessionStorage\b",
-        r"(?<![.\w])alert\s*\(",
-        r"(?<![.\w])confirm\s*\(",
-        r"(?<![.\w])prompt\s*\(",
-        r"(?<![.\w])eval\s*\(",
+        r"(?:(?<![.\w])|window\.)alert\s*\(",
+        r"(?:(?<![.\w])|window\.)confirm\s*\(",
+        r"(?:(?<![.\w])|window\.)prompt\s*\(",
+        r"(?:(?<![.\w])|window\.)eval\s*\(",
         r'style="',
         r"style='",
         r"\.style\.",
     ]
     for f in sorted((root / "static").rglob("*")):
-        if f.suffix in {".html", ".js"}:
+        if not f.is_file():
+            continue
+        if "vendor" in f.relative_to(root / "static").parts:
+            continue
+        if f.suffix in {".html", ".js", ".css", ".svg"}:
             for line_no, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
                 stripped = line.strip()
-                if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+                if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*") or stripped.startswith("<!--"):
                     continue
                 code_part = re.sub(r"//.*$", "", line) if f.suffix == ".js" else line
                 for pat in forbidden:
                     assert not re.search(pat, code_part), f"Forbidden pattern {pat} in {f.name}:{line_no}"
 
-    html_ids = set(re.findall(r'id="([^"]+)"', (root / "static" / "index.html").read_text(encoding="utf-8")))
-    js_ids = set(
-        re.findall(r'getElementById\(\s*["\']([^"\']+)["\']\s*\)', (root / "static" / "app.js").read_text(encoding="utf-8"))
-    )
-    assert len(js_ids) >= 90
-    assert js_ids - html_ids == set()
+    html_raw_ids = re.findall(r'id="([^"]+)"', (root / "static" / "index.html").read_text(encoding="utf-8"))
+    assert len(html_raw_ids) == len(set(html_raw_ids)), "Duplicate HTML IDs found in index.html"
+    html_ids = set(html_raw_ids)
+    for js_file, min_refs in (("app.js", 90), ("auth_client.js", 15), ("paper_ui.js", 80), ("charts.js", 0)):
+        js_ids = set(
+            re.findall(
+                r'getElementById\(\s*["\']([^"\']+)["\']\s*\)',
+                (root / "static" / js_file).read_text(encoding="utf-8"),
+            )
+        )
+        assert len(js_ids) >= min_refs
+        assert js_ids - html_ids == set(), f"Missing HTML IDs referenced in {js_file}: {js_ids - html_ids}"
 
 
 def test_python_js_bit_for_bit_parity_across_five_modes(tmp_path: Path) -> None:
@@ -1158,3 +1196,650 @@ def test_v30_buyback_accounting_and_ai_memo_validation_and_fallback(tmp_path: Pa
     assert "new OpenAI()" in fn_txt
     for forbidden_secret in ("AIzaSy", "sk-proj-", "sk-live-"):
         assert forbidden_secret not in fn_txt
+
+
+def test_v40_paper_trading_multi_tenant_idor_csrf_and_input_validation(tmp_path: Path) -> None:
+    import json
+
+    from app.security import hash_password
+    from scripts.export_snapshot import export_public_snapshot
+
+    db_file = tmp_path / "idor_paper.db"
+    app = create_app(db_path=db_file)
+    db = app.state.db
+
+    # 1. Authenticate advisor_a via setup and create a second distinct user advisor_b
+    client_a = TestClient(app, base_url="https://127.0.0.1:8000")
+    st_a = client_a.get("/api/auth/status").json()
+    setup_a = client_a.post(
+        "/api/auth/setup",
+        json={"username": "advisor_a", "password": "StrongPassphrase!A2026"},
+        headers={"X-CSRF-Token": st_a["csrf_token"]},
+    )
+    assert setup_a.status_code == 200
+    csrf_a = setup_a.json()["csrf_token"]
+
+    db.create_user("advisor_b", hash_password("StrongPassphrase!B2026"), role="advisor")
+    client_b = TestClient(app, base_url="https://127.0.0.1:8000")
+    st_b = client_b.get("/api/auth/status").json()
+    login_b = client_b.post(
+        "/api/auth/login",
+        json={"username": "advisor_b", "password": "StrongPassphrase!B2026"},
+        headers={"X-CSRF-Token": st_b["csrf_token"]},
+    )
+    assert login_b.status_code == 200
+    csrf_b = login_b.json()["csrf_token"]
+
+    anon_client = TestClient(app, base_url="https://127.0.0.1:8000")
+
+    # 2. Unauthenticated requests to all /api/paper/* endpoints must be rejected with 401
+    assert anon_client.get("/api/paper/overview").status_code == 401
+    assert anon_client.post("/api/paper/portfolios", json={"name": "Anon", "currency": "INR", "initial_cash": 100_000}).status_code == 401
+    assert anon_client.post("/api/paper/orders", json={"portfolio_id": "pf_x", "ticker": "TCS.NS", "side": "BUY", "shares": 1}).status_code == 401
+    assert anon_client.post("/api/paper/orders/ord_x/cancel").status_code == 401
+    assert anon_client.post("/api/paper/deploy-basket", json={"portfolio_id": "pf_x", "items": [{"ticker": "TCS.NS", "market_shares": 1}]}).status_code == 401
+    assert anon_client.post("/api/paper/refresh").status_code == 401
+
+    # 3. Missing or invalid X-CSRF-Token on POST /api/paper/* must be rejected with 403
+    no_csrf_pf = client_a.post(
+        "/api/paper/portfolios",
+        json={"name": "No CSRF Wallet", "currency": "INR", "initial_cash": 500_000},
+    )
+    assert no_csrf_pf.status_code == 403
+    bad_csrf_pf = client_a.post(
+        "/api/paper/portfolios",
+        json={"name": "Bad CSRF Wallet", "currency": "INR", "initial_cash": 500_000},
+        headers={"X-CSRF-Token": "forged_csrf_token"},
+    )
+    assert bad_csrf_pf.status_code == 403
+
+    # 4. advisor_a creates a wallet, buys shares, and queues an OPEN Buy-on-Dip order
+    pf_res = client_a.post(
+        "/api/paper/portfolios",
+        json={"name": "Advisor A Private Wallet", "currency": "INR", "initial_cash": 500_000},
+        headers={"X-CSRF-Token": csrf_a},
+    )
+    assert pf_res.status_code == 200
+    pf_a_id = pf_res.json()["created_portfolio_id"]
+
+    tcs_px = float(db.get_latest_price_row("TCS.NS")["close_price"])
+    dip_px = round(tcs_px * 0.90, 2)
+    ord_res = client_a.post(
+        "/api/paper/orders",
+        json={
+            "portfolio_id": pf_a_id,
+            "ticker": "TCS.NS",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "shares": 5,
+            "limit_price": dip_px,
+            "note": "Private dip order",
+        },
+        headers={"X-CSRF-Token": csrf_a},
+    )
+    assert ord_res.status_code == 200
+    ord_a_id = ord_res.json()["order"]["id"]
+    assert ord_res.json()["order"]["status"] == "OPEN"
+
+    # 5. Strict Multi-Tenant IDOR Isolation: advisor_b receives 404 on every cross-tenant action!
+    ov_b_default = client_b.get("/api/paper/overview")
+    assert ov_b_default.status_code == 200
+    assert ov_b_default.json()["portfolios"] == []
+    assert ov_b_default.json()["active_portfolio"] is None
+
+    assert client_b.get(f"/api/paper/overview?portfolio_id={pf_a_id}").status_code == 404
+    assert (
+        client_b.post(
+            f"/api/paper/portfolios/{pf_a_id}/deposit",
+            json={"amount": 50_000},
+            headers={"X-CSRF-Token": csrf_b},
+        ).status_code
+        == 404
+    )
+    assert (
+        client_b.post(
+            "/api/paper/orders",
+            json={"portfolio_id": pf_a_id, "ticker": "TCS.NS", "side": "BUY", "order_type": "MARKET", "shares": 1},
+            headers={"X-CSRF-Token": csrf_b},
+        ).status_code
+        == 404
+    )
+    assert (
+        client_b.post(
+            f"/api/paper/orders/{ord_a_id}/cancel",
+            json={},
+            headers={"X-CSRF-Token": csrf_b},
+        ).status_code
+        == 404
+    )
+    assert (
+        client_b.post(
+            "/api/paper/deploy-basket",
+            json={"portfolio_id": pf_a_id, "items": [{"ticker": "TCS.NS", "market_shares": 1}]},
+            headers={"X-CSRF-Token": csrf_b},
+        ).status_code
+        == 404
+    )
+    assert (
+        client_b.post(
+            "/api/paper/refresh",
+            json={"portfolio_id": pf_a_id},
+            headers={"X-CSRF-Token": csrf_b},
+        ).status_code
+        == 404
+    )
+
+    # Confirm advisor_a's order & reserved_cash are completely untouched after advisor_b's attempts
+    ov_a = client_a.get(f"/api/paper/overview?portfolio_id={pf_a_id}").json()
+    assert len(ov_a["active_portfolio"]["open_orders"]) == 1
+    assert ov_a["active_portfolio"]["open_orders"][0]["id"] == ord_a_id
+
+    # 6. Ticker allowlist & SQL injection / negative / zero input rejection
+    for bad_ticker in ("NOT_A_REAL_TICKER", "TCS.NS; DROP TABLE paper_portfolios;--", "'; SELECT * FROM users;--", ""):
+        bad_tk_res = client_a.post(
+            "/api/paper/orders",
+            json={"portfolio_id": pf_a_id, "ticker": bad_ticker, "side": "BUY", "order_type": "MARKET", "shares": 2},
+            headers={"X-CSRF-Token": csrf_a},
+        )
+        assert bad_tk_res.status_code == 400
+
+    for invalid_pf in (
+        {"name": "Zero Cash", "currency": "INR", "initial_cash": 0},
+        {"name": "Neg Cash", "currency": "INR", "initial_cash": -10_000},
+    ):
+        assert client_a.post("/api/paper/portfolios", json=invalid_pf, headers={"X-CSRF-Token": csrf_a}).status_code in (400, 422)
+
+    for invalid_dep in ({"amount": 0}, {"amount": -500}):
+        assert (
+            client_a.post(f"/api/paper/portfolios/{pf_a_id}/deposit", json=invalid_dep, headers={"X-CSRF-Token": csrf_a}).status_code
+            in (400, 422)
+        )
+
+    for invalid_ord in (
+        {"portfolio_id": pf_a_id, "ticker": "TCS.NS", "side": "BUY", "order_type": "MARKET", "shares": 0},
+        {"portfolio_id": pf_a_id, "ticker": "TCS.NS", "side": "BUY", "order_type": "MARKET", "shares": -5},
+        {"portfolio_id": pf_a_id, "ticker": "TCS.NS", "side": "BUY", "order_type": "LIMIT", "shares": 2, "limit_price": -100},
+        {"portfolio_id": pf_a_id, "ticker": "TCS.NS", "side": "BUY", "order_type": "LIMIT", "shares": 2},
+    ):
+        assert client_a.post("/api/paper/orders", json=invalid_ord, headers={"X-CSRF-Token": csrf_a}).status_code in (400, 422)
+
+    # 7. Exporting public snapshot from a DB containing active paper_* records leaks ZERO paper_* data
+    snap_out = tmp_path / "exported_snap.json"
+    export_public_snapshot(db_path=db_file, out_path=snap_out)
+    snap_txt = snap_out.read_text(encoding="utf-8")
+    snap_json = json.loads(snap_txt)
+    for forbidden_key in (
+        "paper_portfolios",
+        "paper_positions",
+        "paper_orders",
+        "paper_trades",
+        "paper_live_quotes",
+        "paper_nav_history",
+        pf_a_id,
+        ord_a_id,
+        "Advisor A Private Wallet",
+    ):
+        assert forbidden_key not in snap_txt
+        assert forbidden_key not in snap_json
+
+
+def test_v40_financial_accounting_buy_on_dip_basket_fx_and_daily_refresh(tmp_path: Path) -> None:
+    # Run against DB-less CI snapshot-hydrated multi-market universe (`IN` + `US`)
+    client, csrf = _authenticated_multimarket_client(tmp_path, force_snapshot_hydration=True)
+    db = client.app.state.db
+
+    # 1. Create ₹5,00,000 INR wallet
+    pf_res = client.post(
+        "/api/paper/portfolios",
+        json={
+            "name": "India QGLP ₹5L",
+            "currency": "INR",
+            "initial_cash": 500_000,
+            "strategy_preset": "qglp_compounder",
+            "benchmark_ticker": "^NSEI",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert pf_res.status_code == 200
+    pf_id = pf_res.json()["created_portfolio_id"]
+    pf0 = pf_res.json()["active_portfolio"]
+    assert pf0["cash_balance"] == 500_000.0
+    assert pf0["reserved_cash"] == 0.0
+    assert pf0["available_cash"] == 500_000.0
+    assert pf0["total_deposited"] == 500_000.0
+    assert pf0["return_pct"] == 0.0
+    assert len(pf0["nav_history"]) == 1
+
+    # 2. Execute MARKET BUY on TCS.NS -> deduct gross + 25bps fee, record shares, avg_cost, entry_score, entry_rating
+    tcs_px = round(float(db.get_latest_price_row("TCS.NS")["close_price"]), 2)
+    buy_shares = 20
+    exp_gross = round(buy_shares * tcs_px, 2)
+    exp_fee = round(exp_gross * 0.0025, 2)
+    exp_debit = round(exp_gross + exp_fee, 2)
+
+    m_buy = client.post(
+        "/api/paper/orders",
+        json={
+            "portfolio_id": pf_id,
+            "ticker": "TCS.NS",
+            "side": "BUY",
+            "order_type": "MARKET",
+            "shares": buy_shares,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert m_buy.status_code == 200
+    m_body = m_buy.json()
+    pf1 = m_body["active_portfolio"]
+    assert pf1["cash_balance"] == round(500_000.0 - exp_debit, 2)
+    assert pf1["reserved_cash"] == 0.0
+    assert len(pf1["positions"]) == 1
+    pos_tcs = pf1["positions"][0]
+    assert pos_tcs["ticker"] == "TCS.NS"
+    assert pos_tcs["shares"] == buy_shares
+    assert pos_tcs["avg_cost"] == tcs_px
+    assert pos_tcs["entry_score"] > 0
+    assert pos_tcs["entry_rating"] in {"Strong Buy", "Buy", "Hold", "Avoid"}
+    assert m_body["trade"]["fee_amount"] == exp_fee
+    assert m_body["trade"]["gross_amount"] == exp_gross
+
+    # 3. Place two LIMIT BUY (Buy-on-Dip at -7%) orders -> status == OPEN, reserved_cash locked, overspend rejected!
+    icici_px = round(float(db.get_latest_price_row("ICICIBANK.NS")["close_price"]), 2)
+    infy_px = round(float(db.get_latest_price_row("INFY.NS")["close_price"]), 2)
+    icici_lim = round(icici_px * 0.93, 2)
+    infy_lim = round(infy_px * 0.93, 2)
+
+    icici_sh = 50
+    infy_sh = 30
+    icici_res_amt = round(round(icici_sh * icici_lim, 2) + round(round(icici_sh * icici_lim, 2) * 0.0025, 2), 2)
+    infy_res_amt = round(round(infy_sh * infy_lim, 2) + round(round(infy_sh * infy_lim, 2) * 0.0025, 2), 2)
+
+    dip1 = client.post(
+        "/api/paper/orders",
+        json={
+            "portfolio_id": pf_id,
+            "ticker": "ICICIBANK.NS",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "shares": icici_sh,
+            "limit_price": icici_lim,
+            "note": "Buy-on-Dip -7%",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert dip1.status_code == 200
+    assert dip1.json()["order"]["status"] == "OPEN"
+    ord_icici_id = dip1.json()["order"]["id"]
+
+    dip2 = client.post(
+        "/api/paper/orders",
+        json={
+            "portfolio_id": pf_id,
+            "ticker": "INFY.NS",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "shares": infy_sh,
+            "limit_price": infy_lim,
+            "note": "Cancel test dip",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert dip2.status_code == 200
+    assert dip2.json()["order"]["status"] == "OPEN"
+    ord_infy_id = dip2.json()["order"]["id"]
+
+    pf2 = dip2.json()["active_portfolio"]
+    assert pf2["reserved_cash"] == round(icici_res_amt + infy_res_amt, 2)
+    assert pf2["available_cash"] == round(pf2["cash_balance"] - pf2["reserved_cash"], 2)
+
+    # Attempt to overspend (cash_balance - reserved_cash) via MARKET BUY or LIMIT BUY -> 400!
+    too_many_shares = int(pf2["available_cash"] // tcs_px) + 5
+    overspend_mkt = client.post(
+        "/api/paper/orders",
+        json={
+            "portfolio_id": pf_id,
+            "ticker": "TCS.NS",
+            "side": "BUY",
+            "order_type": "MARKET",
+            "shares": too_many_shares,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert overspend_mkt.status_code == 400
+
+    overspend_lim = client.post(
+        "/api/paper/orders",
+        json={
+            "portfolio_id": pf_id,
+            "ticker": "TCS.NS",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "shares": int(pf2["available_cash"] // (tcs_px * 0.9)) + 5,
+            "limit_price": round(tcs_px * 0.9, 2),
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert overspend_lim.status_code == 400
+
+    # 4. Cancel INFY.NS LIMIT BUY -> verify reserved_cash cleanly releases infy_res_amt!
+    cancel_res = client.post(
+        f"/api/paper/orders/{ord_infy_id}/cancel",
+        json={},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert cancel_res.status_code == 200
+    pf3 = cancel_res.json()["active_portfolio"]
+    assert pf3["reserved_cash"] == icici_res_amt
+    assert len(pf3["open_orders"]) == 1
+    assert pf3["open_orders"][0]["id"] == ord_icici_id
+
+    # 5. Simulate Daily Refresh #1: day_low > limit_price -> order stays OPEN
+    nsei_base = round(float(db.get_latest_price_row("^NSEI")["close_price"]), 2)
+    cash_before_refresh = pf3["cash_balance"]
+
+    client.app.state.quote_fetcher = lambda _syms: {
+        "ICICIBANK.NS": {
+            "close_price": round(icici_px * 0.96, 2),
+            "day_low": round(icici_px * 0.95, 2),  # still > icici_lim (0.93x)
+            "day_high": icici_px,
+            "trade_date": "2026-11-18",
+        },
+        "TCS.NS": {
+            "close_price": round(tcs_px * 1.04, 2),
+            "day_low": tcs_px,
+            "day_high": round(tcs_px * 1.05, 2),
+            "trade_date": "2026-11-18",
+        },
+        "^NSEI": {
+            "close_price": round(nsei_base * 1.01, 2),
+            "day_low": nsei_base,
+            "day_high": round(nsei_base * 1.015, 2),
+            "trade_date": "2026-11-18",
+        },
+    }
+    ref1 = client.post("/api/paper/refresh", json={"portfolio_id": pf_id}, headers={"X-CSRF-Token": csrf})
+    assert ref1.status_code == 200
+    assert ref1.json()["orders_filled"] == 0
+    assert ref1.json()["active_portfolio"]["reserved_cash"] == icici_res_amt
+    assert len(ref1.json()["active_portfolio"]["open_orders"]) == 1
+
+    # 6. Simulate Daily Refresh #2: day_low <= limit_price AND close < limit_price -> fills at min(close, limit_price)!
+    gap_close = round(icici_lim * 0.98, 2)  # below limit_price to verify excess reservation refund!
+    gap_low = round(icici_lim * 0.97, 2)
+    tcs_up_px = round(tcs_px * 1.08, 2)
+    client.app.state.quote_fetcher = lambda _syms: {
+        "ICICIBANK.NS": {
+            "close_price": gap_close,
+            "day_low": gap_low,
+            "day_high": icici_lim,
+            "trade_date": "2026-11-19",
+        },
+        "TCS.NS": {
+            "close_price": tcs_up_px,
+            "day_low": tcs_px,
+            "day_high": tcs_up_px,
+            "trade_date": "2026-11-19",
+        },
+        "^NSEI": {
+            "close_price": round(nsei_base * 1.02, 2),
+            "day_low": nsei_base,
+            "day_high": round(nsei_base * 1.025, 2),
+            "trade_date": "2026-11-19",
+        },
+    }
+    ref2 = client.post("/api/paper/refresh", json={"portfolio_id": pf_id}, headers={"X-CSRF-Token": csrf})
+    assert ref2.status_code == 200
+    r2_body = ref2.json()
+    assert r2_body["orders_filled"] == 1
+    assert r2_body["filled_orders"][0]["id"] == ord_icici_id
+    assert r2_body["filled_orders"][0]["filled_price"] == gap_close
+
+    actual_icici_gross = round(icici_sh * gap_close, 2)
+    actual_icici_fee = round(actual_icici_gross * 0.0025, 2)
+    actual_icici_debit = round(actual_icici_gross + actual_icici_fee, 2)
+    assert actual_icici_debit < icici_res_amt  # confirms excess reserved cash was refunded, not over-debited!
+
+    pf4 = r2_body["active_portfolio"]
+    assert pf4["reserved_cash"] == 0.0
+    assert pf4["open_orders"] == []
+    assert pf4["cash_balance"] == round(cash_before_refresh - actual_icici_debit, 2)
+    assert len(pf4["positions"]) == 2
+    assert len(pf4["nav_history"]) >= 2
+
+    # Verify attribution_by_rating sums match positions' invested & current_value penny-for-penny
+    attr = pf4["attribution_by_rating"]
+    assert sum(b["count"] for b in attr) == 2
+    assert abs(sum(b["invested"] for b in attr) - sum(p["invested_value"] for p in pf4["positions"])) <= 0.02
+    assert abs(sum(b["current_value"] for b in attr) - sum(p["market_value"] for p in pf4["positions"])) <= 0.02
+
+    # 7. Virtual cash deposit updates total_deposited without faking higher net_return_amount / inflating return_pct
+    net_ret_before_dep = pf4["net_return_amount"]
+    dep_res = client.post(
+        f"/api/paper/portfolios/{pf_id}/deposit",
+        json={"amount": 200_000},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert dep_res.status_code == 200
+    pf5 = dep_res.json()["active_portfolio"]
+    assert pf5["total_deposited"] == 700_000.0
+    assert pf5["cash_balance"] == round(pf4["cash_balance"] + 200_000.0, 2)
+    assert abs(pf5["net_return_amount"] - net_ret_before_dep) <= 0.02
+    assert pf5["return_pct"] == round((pf5["net_return_amount"] / 700_000.0) * 100.0, 2)
+
+    # 8. Deploy Basket in a new USD Strategy Wallet (atomic immediate market fills + queued -7% dip limit orders)
+    usd_pf = client.post(
+        "/api/paper/portfolios",
+        json={
+            "name": "US Dip Hunter $25K",
+            "currency": "USD",
+            "initial_cash": 25_000,
+            "strategy_preset": "street_quant",
+            "benchmark_ticker": "^GSPC",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert usd_pf.status_code == 200
+    usd_pf_id = usd_pf.json()["created_portfolio_id"]
+
+    # First verify atomic rollback if basket exceeds $25,000
+    huge_basket = client.post(
+        "/api/paper/deploy-basket",
+        json={
+            "portfolio_id": usd_pf_id,
+            "items": [
+                {"ticker": "AAPL", "market_shares": 5, "dip_shares": 5, "dip_pct": 7.0},
+                {"ticker": "MSFT", "market_shares": 10_000, "dip_shares": 5_000, "dip_pct": 7.0},
+            ],
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert huge_basket.status_code == 400
+    after_rollback = client.get(f"/api/paper/overview?portfolio_id={usd_pf_id}").json()["active_portfolio"]
+    assert after_rollback["cash_balance"] == 25_000.0
+    assert after_rollback["reserved_cash"] == 0.0
+    assert after_rollback["positions"] == []
+    assert after_rollback["open_orders"] == []
+
+    # Valid atomic basket deployment
+    ok_basket = client.post(
+        "/api/paper/deploy-basket",
+        json={
+            "portfolio_id": usd_pf_id,
+            "items": [
+                {"ticker": "AAPL", "market_shares": 6, "dip_shares": 4, "dip_pct": 7.0},
+                {"ticker": "JPM", "market_shares": 5, "dip_shares": 3, "dip_pct": 7.0},
+            ],
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert ok_basket.status_code == 200
+    b_body = ok_basket.json()
+    assert b_body["deployed"]["market_fills_count"] == 2
+    assert b_body["deployed"]["limit_orders_count"] == 2
+    usd_active = b_body["active_portfolio"]
+    assert len(usd_active["positions"]) == 2
+    assert len(usd_active["open_orders"]) == 2
+    assert usd_active["reserved_cash"] > 0
+    assert all(o["status"] == "OPEN" and o["side"] == "BUY" and o["order_type"] == "LIMIT" for o in usd_active["open_orders"])
+
+
+def test_v40_pwa_service_worker_cloud_sql_and_netlify_invariants(tmp_path: Path) -> None:
+    import json
+    import struct
+    import subprocess
+    import zlib
+
+    root = Path(__file__).resolve().parent.parent
+    client, _csrf = _authenticated_client(tmp_path)
+
+    # 1. Verify GET /sw.js endpoint & CSP worker-src / manifest-src directives
+    sw_res = client.get("/sw.js")
+    assert sw_res.status_code == 200
+    assert "javascript" in sw_res.headers["content-type"]
+    assert sw_res.headers["cache-control"] == "no-cache"
+    csp = sw_res.headers["Content-Security-Policy"]
+    assert "manifest-src 'self'" in csp
+    assert "worker-src 'self'" in csp
+
+    # 2. Verify Web App Manifest & valid binary PNG icons (IHDR + CRC32)
+    manifest = json.loads((root / "static" / "manifest.webmanifest").read_text(encoding="utf-8"))
+    assert manifest["short_name"] == "ArthaQuant"
+    assert manifest["display"] == "standalone"
+    assert manifest["start_url"] == "/"
+    assert len(manifest["icons"]) >= 4
+
+    for rel_png, exp_dims in (
+        ("static/icons/icon-192.png", (192, 192)),
+        ("static/icons/icon-512.png", (512, 512)),
+        ("static/icons/apple-touch-icon.png", (180, 180)),
+    ):
+        raw_png = (root / rel_png).read_bytes()
+        assert raw_png[:8] == b"\x89PNG\r\n\x1a\n"
+        assert raw_png[12:16] == b"IHDR"
+        assert struct.unpack(">II", raw_png[16:24]) == exp_dims
+        assert struct.unpack(">I", raw_png[29:33])[0] == (zlib.crc32(raw_png[12:29]) & 0xFFFFFFFF)
+
+    # 3. Verify Service Worker strictly bypasses /api/*, /.netlify/*, /static/data/*, non-GET, and cross-origin
+    sw_src = (root / "static" / "sw.js").read_text(encoding="utf-8")
+    assert 'pathname.startsWith("/api/")' in sw_src
+    assert 'pathname.startsWith("/.netlify/")' in sw_src
+    assert 'pathname.startsWith("/static/data/")' in sw_src
+
+    jsc_bin = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc")
+    if jsc_bin.exists():
+        sw_driver = f"""
+const listeners = {{}};
+const putCalls = [];
+const self = {{
+  location: {{ origin: "https://arthaquant-india.netlify.app" }},
+  addEventListener: (ev, fn) => {{ listeners[ev] = fn; }},
+  skipWaiting: async () => {{}},
+  clients: {{ claim: async () => {{}} }},
+}};
+const caches = {{
+  open: async () => ({{ put: async (req) => {{ putCalls.push(String(req.url || req)); }} }}),
+  match: async () => null,
+  keys: async () => [],
+  delete: async () => true,
+}};
+class URL {{
+  constructor(u) {{
+    const m = /^https?:\\/\\/[^/]+(\\/[^?#]*)?/.exec(u);
+    this.origin = u.startsWith("https://arthaquant-india.netlify.app")
+      ? "https://arthaquant-india.netlify.app"
+      : "https://other.example.com";
+    this.pathname = (m && m[1]) || "/";
+  }}
+}}
+class Request {{
+  constructor(url, opts = {{}}) {{ this.url = url; this.method = opts.method || "GET"; this.mode = opts.mode || "cors"; }}
+}}
+class Response {{
+  constructor(body, init = {{}}) {{
+    this.body = body;
+    this.status = init.status || 200;
+    this.ok = this.status === 200;
+    this.type = "basic";
+    const hdrs = init.headers || {{}};
+    this.headers = {{ get: (k) => hdrs[k] || hdrs[k.toLowerCase()] || "" }};
+  }}
+  clone() {{ return this; }}
+}}
+const fetch = async (req) => new Response("ok", {{ status: 200, headers: {{ "Cache-Control": "public, max-age=60" }} }});
+{sw_src}
+
+(async () => {{
+  const testCases = [
+    ["https://arthaquant-india.netlify.app/api/paper/overview", "GET", false],
+    ["https://arthaquant-india.netlify.app/api/auth/status", "GET", false],
+    ["https://arthaquant-india.netlify.app/.netlify/identity/user", "GET", false],
+    ["https://arthaquant-india.netlify.app/static/data/market_snapshot.json", "GET", false],
+    ["https://arthaquant-india.netlify.app/static/app.js", "POST", false],
+    ["https://evil.example.com/static/app.js", "GET", false],
+    ["https://arthaquant-india.netlify.app/static/app.js", "GET", true],
+  ];
+  for (const [url, method, expectHandled] of testCases) {{
+    let handled = null;
+    listeners.fetch({{
+      request: new Request(url, {{ method }}),
+      respondWith: (p) => {{ handled = p; }},
+    }});
+    if (Boolean(handled) !== expectHandled) {{
+      throw new Error("Mismatch for " + method + " " + url + ": handled=" + Boolean(handled));
+    }}
+    if (handled) await handled;
+  }}
+  if (putCalls.some(u => u.includes("/api/") || u.includes("/.netlify/") || u.includes("/static/data/"))) {{
+    throw new Error("Sensitive URL cached: " + JSON.stringify(putCalls));
+  }}
+  print("SW_JSC_OK");
+}})().catch(e => {{ print("SW_ERR:" + e); quit(1); }});
+"""
+        sw_drv_path = tmp_path / "sw_check.js"
+        sw_drv_path.write_text(sw_driver, encoding="utf-8")
+        proc = subprocess.run([str(jsc_bin), str(sw_drv_path)], check=True, capture_output=True, text=True)
+        assert "SW_JSC_OK" in proc.stdout
+
+    # 4. Verify Postgres migration DDL, zero sql.raw, Origin verification, UTC schedule, and public npm registry lockfile
+    mig_files = sorted((root / "netlify" / "database" / "migrations").glob("*create_paper_trading.sql"))
+    assert len(mig_files) == 1
+    mig_sql = mig_files[0].read_text(encoding="utf-8")
+    for tbl in (
+        "CREATE TABLE IF NOT EXISTS paper_portfolios",
+        "CREATE TABLE IF NOT EXISTS paper_positions",
+        "CREATE TABLE IF NOT EXISTS paper_orders",
+        "CREATE TABLE IF NOT EXISTS paper_trades",
+        "CREATE TABLE IF NOT EXISTS paper_live_quotes",
+        "CREATE TABLE IF NOT EXISTS paper_nav_history",
+    ):
+        assert tbl in mig_sql
+    assert "ON DELETE CASCADE" in mig_sql
+    assert "cash_balance >= 0" in mig_sql
+    assert "reserved_cash >= 0" in mig_sql
+
+    pg_svc_txt = (root / "netlify" / "lib" / "paper-pg-service.mts").read_text(encoding="utf-8")
+    paper_api_txt = (root / "netlify" / "functions" / "paper-api.mts").read_text(encoding="utf-8")
+    cron_txt = (root / "netlify" / "functions" / "daily-paper-refresh.mts").read_text(encoding="utf-8")
+    for code_txt in (pg_svc_txt, paper_api_txt, cron_txt):
+        assert "sql.raw" not in code_txt
+    assert "verifyRequestOrigin" in paper_api_txt
+    assert "getUser(" in paper_api_txt
+    assert 'schedule: "30 21 * * 1-5"' in cron_txt
+
+    lock_txt = (root / "package-lock.json").read_text(encoding="utf-8")
+    lock_json = json.loads(lock_txt)
+
+    def _collect_resolved(node: object, acc: list[str]) -> None:
+        if isinstance(node, dict):
+            if isinstance(node.get("resolved"), str):
+                acc.append(node["resolved"])
+            for v in node.values():
+                _collect_resolved(v, acc)
+        elif isinstance(node, list):
+            for item in node:
+                _collect_resolved(item, acc)
+
+    resolved_urls: list[str] = []
+    _collect_resolved(lock_json, resolved_urls)
+    assert len(resolved_urls) >= 50
+    assert all(u.startswith("https://registry.npmjs.org/") for u in resolved_urls)

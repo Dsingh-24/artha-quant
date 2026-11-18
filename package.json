@@ -1,20 +1,24 @@
 {
   "name": "artha-quant",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "private": true,
   "type": "module",
-  "description": "ArthaQuant V3.0 — Plain-English Quantitative Screener & Netlify AI Analyst Function",
+  "description": "ArthaQuant V4.0 — Global Equity Rankings, Netlify AI Analyst & Multi-Strategy Paper Trading PWA",
   "scripts": {
     "build": "sh scripts/build_netlify.sh"
   },
   "dependencies": {
     "@google/genai": "^1.7.0",
     "@netlify/blobs": "^10.0.2",
+    "@netlify/database": "^1.1.0",
     "@netlify/functions": "^6.0.3",
-    "openai": "^5.8.2"
+    "@netlify/identity": "^1.2.0",
+    "openai": "^5.8.2",
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
+    "@types/pg": "^8.23.1",
     "esbuild": "^0.25.5",
     "typescript": "^5.8.3"
   }

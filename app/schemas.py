@@ -129,3 +129,126 @@ class PlannerRequest(BaseModel):
     max_stocks: int = Field(default=8, ge=5, le=15)
     market: MarketFilter = "ALL"
     save_plan: bool = False
+
+
+PaperCurrency = Literal["INR", "USD"]
+PaperOrderSide = Literal["BUY", "SELL"]
+PaperOrderType = Literal["MARKET", "LIMIT"]
+ALLOWED_BENCHMARKS = {"^NSEI", "^GSPC", "^NDX"}
+
+
+class PaperPortfolioCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = Field(..., min_length=1, max_length=64)
+    currency: PaperCurrency = "INR"
+    initial_cash: float = Field(..., gt=0.0, le=10_000_000_000.0)
+    strategy_preset: StrategyPreset = "qglp_compounder"
+    benchmark_ticker: Optional[str] = Field(default=None, max_length=16)
+    fee_bps: float = Field(default=25.0, ge=0.0, le=200.0)
+
+    @field_validator("name")
+    @classmethod
+    def clean_portfolio_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Portfolio name cannot be blank.")
+        return cleaned
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def normalize_currency(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().upper()
+        return value
+
+    @field_validator("strategy_preset", mode="before")
+    @classmethod
+    def normalize_preset(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return "qglp_compounder"
+        return value
+
+    @field_validator("benchmark_ticker")
+    @classmethod
+    def validate_benchmark_symbol(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = value.strip().upper()
+        if not cleaned:
+            return None
+        if cleaned not in ALLOWED_BENCHMARKS:
+            raise ValueError("Unsupported benchmark_ticker; expected ^NSEI, ^GSPC, or ^NDX.")
+        return cleaned
+
+
+class PaperDepositRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    amount: float = Field(..., gt=0.0, le=10_000_000_000.0)
+
+
+class PaperOrderRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    portfolio_id: str = Field(..., min_length=1, max_length=64)
+    ticker: str = Field(default="", max_length=128)
+    side: PaperOrderSide
+    order_type: PaperOrderType = "MARKET"
+    shares: int = Field(..., gt=0, le=10_000_000)
+    limit_price: Optional[float] = Field(default=None, gt=0.0, le=100_000_000.0)
+    note: str = Field(default="", max_length=160)
+
+    @field_validator("side", "order_type", mode="before")
+    @classmethod
+    def normalize_enum_str(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().upper()
+        return value
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def normalize_note(cls, value: object) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()[:160]
+
+
+class PaperBasketItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    ticker: str = Field(default="", max_length=128)
+    market_shares: int = Field(default=0, ge=0, le=10_000_000)
+    dip_shares: int = Field(default=0, ge=0, le=10_000_000)
+    dip_pct: float = Field(default=7.0, gt=0.0, le=50.0)
+    note: str = Field(default="", max_length=160)
+
+    @field_validator("dip_shares", mode="before")
+    @classmethod
+    def normalize_dip_shares(cls, value: object) -> object:
+        return 0 if value is None else value
+
+    @field_validator("dip_pct", mode="before")
+    @classmethod
+    def normalize_dip_pct(cls, value: object) -> object:
+        return 7.0 if value is None else value
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def normalize_basket_note(cls, value: object) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()[:160]
+
+
+class PaperDeployBasketRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    portfolio_id: str = Field(..., min_length=1, max_length=64)
+    items: list[PaperBasketItem] = Field(..., min_length=1, max_length=30)
+
+
+class PaperRefreshRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    portfolio_id: Optional[str] = Field(default=None, max_length=64)

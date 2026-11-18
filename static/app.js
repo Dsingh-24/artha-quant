@@ -1,8 +1,13 @@
-// ArthaQuant V3.0 Frontend Controller — Everyday-Investor Plain-English UI,
-// Simple / Pro Ratios Toggle & On-Demand AI Analyst Memo
+// ArthaQuant V4.0 Frontend Controller — Everyday-Investor Plain-English UI,
+// Simple / Pro Ratios Toggle, AI Analyst Memo, Multi-Strategy Paper Trading & Installable PWA
 // Built exclusively with safe DOM creation (createElement, createElementNS, textContent)
 // and CSS class toggling.
 
+import {
+  closePaperAuthModal,
+  initPaperAuthClient,
+  maskUserIdentity,
+} from "/static/auth_client.js";
 import {
   createConsensusBarSvg,
   createContributionBarSvg,
@@ -13,6 +18,13 @@ import {
   formatStockPrice,
   renderMultiLineChart,
 } from "/static/charts.js";
+import {
+  closeAllPaperModals,
+  initPaperTradingUI,
+  loadPaperOverview,
+  openDeployBlueprintModal,
+  openPaperOrderTicket,
+} from "/static/paper_ui.js";
 import {
   getCompanyDetailSnapshot,
   importCsvInMemory,
@@ -45,6 +57,7 @@ const state = {
   csrfToken: null,
   needsSetup: false,
   username: null,
+  activeTab: "screener",
   proMode: false,
   funnelView: "stage2",
   screenerMarket: "ALL",
@@ -58,9 +71,12 @@ const state = {
   presetWeightsMap: DEFAULT_PRESET_WEIGHTS,
   selectedTicker: null,
   currentDetail: null,
+  currentPlan: null,
   drawerOpen: false,
   backtestLoaded: false,
   plannerLoaded: false,
+  deferredInstallPrompt: null,
+  iosSafariInstallable: false,
   aiMemoCache: new Map(),
   aiMemoInFlight: new Set(),
 };
@@ -840,6 +856,46 @@ function resolveScoreBreakdown(sc) {
 
 // --- Auth & Session Bootstrapping ---
 
+function findStockInUniverse(rawSym) {
+  const sym = String(rawSym || "").trim().toUpperCase();
+  if (!sym) return null;
+  for (const s of state.stocks) {
+    if (s.ticker.toUpperCase() === sym || displaySymbol(s.ticker).toUpperCase() === sym) {
+      return s;
+    }
+  }
+  return null;
+}
+
+function wirePaperBridge() {
+  initPaperTradingUI({
+    getStaticMode: () => state.staticMode,
+    getCsrfToken: () => state.csrfToken,
+    getAllStocks: () => state.stocks,
+    findStockByTicker: findStockInUniverse,
+    openDeepDive: (tk) => openDeepDive(tk),
+    switchTab: (tab) => switchTab(tab),
+    showToast: (msg, isErr) => showToast(msg, isErr),
+  });
+}
+
+async function bootstrapPaperAuth() {
+  wirePaperBridge();
+  await initPaperAuthClient({
+    staticMode: state.staticMode,
+    getLocalUsername: () => state.username,
+    getCsrfToken: () => state.csrfToken,
+    showToast: (msg, isErr) => showToast(msg, isErr),
+    onAuthChanged: (_user, meta) => {
+      if (meta && meta.openPaperTab) {
+        switchTab("paper");
+      } else if (state.activeTab === "paper") {
+        loadPaperOverview();
+      }
+    },
+  });
+}
+
 async function initAuth() {
   try {
     const status = await apiRequest("/api/auth/status");
@@ -848,6 +904,7 @@ async function initAuth() {
 
     if (status.authenticated) {
       state.username = status.username;
+      await bootstrapPaperAuth();
       await enterWorkspace();
     } else {
       showAuthGate();
@@ -856,6 +913,7 @@ async function initAuth() {
     state.staticMode = true;
     state.username = "Cloud Snapshot";
     document.getElementById("logout-btn").classList.add("hidden");
+    await bootstrapPaperAuth();
     await enterWorkspace();
   }
 }
@@ -894,6 +952,7 @@ async function handleAuthSubmit(ev) {
     state.csrfToken = res.csrf_token;
     state.username = res.username;
     document.getElementById("auth-password").value = "";
+    await bootstrapPaperAuth();
     await enterWorkspace();
   } catch (err) {
     errBox.textContent = err.message;
@@ -919,14 +978,15 @@ async function enterWorkspace() {
   document.getElementById("app-shell").classList.remove("hidden");
   document.getElementById("user-badge").textContent = state.staticMode
     ? "Mode: Cloud Snapshot (Nifty 200 + Nasdaq 100 + S&P 500)"
-    : `Advisor: ${state.username}`;
+    : `Advisor: ${maskUserIdentity(state.username)}`;
   await loadScreener(true);
 }
 
 // --- Navigation & Market Switchers ---
 
 function switchTab(tabName) {
-  for (const btn of document.querySelectorAll(".nav-tab")) {
+  state.activeTab = tabName;
+  for (const btn of document.querySelectorAll(".nav-tab, .mobile-nav-btn")) {
     btn.classList.toggle("active", btn.dataset.tab === tabName);
   }
   for (const panel of document.querySelectorAll(".tab-panel")) {
@@ -937,6 +997,9 @@ function switchTab(tabName) {
   }
   if (tabName === "planner" && !state.plannerLoaded) {
     runPlanner();
+  }
+  if (tabName === "paper") {
+    loadPaperOverview();
   }
 }
 
@@ -1502,17 +1565,26 @@ function renderTopPodium(visibleStocks) {
 
     const footer = el("div", "podium-footer");
     footer.appendChild(createFriendlyValZonePill(s, state.proMode));
+    const ctaWrap = el("div", "inline-group wrap-group");
+    const ptBtn = el("button", "btn-paper-trade-xs", "Paper Trade");
+    ptBtn.type = "button";
+    ptBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      openPaperOrderTicket(s, { side: "BUY", orderType: "LIMIT" });
+    });
     const btn = el(
       "button",
       "btn-deep-dive",
-      state.proMode ? "View Score Reasoning →" : "Plain-English Breakdown →"
+      state.proMode ? "Score Math →" : "Breakdown →"
     );
     btn.type = "button";
     btn.addEventListener("click", (ev) => {
       ev.stopPropagation();
       openDeepDive(s.ticker);
     });
-    footer.appendChild(btn);
+    ctaWrap.appendChild(ptBtn);
+    ctaWrap.appendChild(btn);
+    footer.appendChild(ctaWrap);
     card.appendChild(footer);
 
     card.addEventListener("click", () => openDeepDive(s.ticker));
@@ -1785,8 +1857,9 @@ function renderStage2Table(stocks) {
     fundTd.appendChild(snapWrap);
     tr.appendChild(fundTd);
 
-    // 7. Breakdown / Deep Dive Button
+    // 7. Breakdown / Deep Dive + Paper Trade Buttons
     const actionTd = document.createElement("td");
+    const actStack = el("div", "action-cell-group");
     const ddBtn = el(
       "button",
       "btn-deep-dive",
@@ -1797,7 +1870,15 @@ function renderStage2Table(stocks) {
       ev.stopPropagation();
       openDeepDive(s.ticker);
     });
-    actionTd.appendChild(ddBtn);
+    const ptBtn = el("button", "btn-paper-trade-xs", "Paper Trade");
+    ptBtn.type = "button";
+    ptBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      openPaperOrderTicket(s, { side: "BUY", orderType: "LIMIT" });
+    });
+    actStack.appendChild(ddBtn);
+    actStack.appendChild(ptBtn);
+    actionTd.appendChild(actStack);
     tr.appendChild(actionTd);
 
     tr.addEventListener("click", () => openDeepDive(s.ticker));
@@ -2417,6 +2498,14 @@ function renderCompanyDetail(detail) {
   ratingWrap.appendChild(el("span", ratingBadgeClass(sc.rating), sc.rating));
   heroRight.appendChild(ratingWrap);
   heroRight.appendChild(createFriendlyValZonePill(sc, pro));
+  const heroTradeWrap = el("div", "top-gap");
+  const heroTradeBtn = el("button", "btn btn-paper-trade btn-xs", "Paper Trade / Set Dip Limit");
+  heroTradeBtn.type = "button";
+  heroTradeBtn.addEventListener("click", () => {
+    openPaperOrderTicket(sc, { side: "BUY", orderType: "LIMIT" });
+  });
+  heroTradeWrap.appendChild(heroTradeBtn);
+  heroRight.appendChild(heroTradeWrap);
 
   heroTop.appendChild(heroLeft);
   heroTop.appendChild(heroRight);
@@ -3195,6 +3284,7 @@ async function runPlanner() {
 }
 
 function renderPlannerResults(plan) {
+  state.currentPlan = plan;
   const planCcy =
     plan.plan_currency || (isUsdMarketMode(state.plannerMarket) ? "USD" : "INR");
   const g = plan.goal_summary || {};
@@ -3331,15 +3421,24 @@ function renderPlannerResults(plan) {
     }
     tr.appendChild(whyTd);
 
-    // 8. Deep Dive Button
+    // 8. Paper Trade & Deep Dive Buttons
     const ddTd = document.createElement("td");
+    const actWrap = el("div", "action-cell-group");
+    const ptBtn = el("button", "btn-paper-trade-xs", "Paper Trade");
+    ptBtn.type = "button";
+    ptBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      openPaperOrderTicket(s, { side: "BUY", orderType: "LIMIT" });
+    });
     const ddBtn = el("button", "btn-deep-dive", "Deep Dive →");
     ddBtn.type = "button";
     ddBtn.addEventListener("click", (ev) => {
       ev.stopPropagation();
       openDeepDive(s.ticker);
     });
-    ddTd.appendChild(ddBtn);
+    actWrap.appendChild(ptBtn);
+    actWrap.appendChild(ddBtn);
+    ddTd.appendChild(actWrap);
     tr.appendChild(ddTd);
 
     tr.addEventListener("click", () => openDeepDive(s.ticker));
@@ -3649,13 +3748,88 @@ function renderBacktestResults(res) {
   }
 }
 
+// --- PWA Service Worker & Install App UX ---
+
+function registerPwaServiceWorker() {
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("/sw.js").catch(() => {
+        // Ignore service worker registration errors in local headless test environments
+      });
+    });
+  }
+}
+
+function initPwaInstallUx() {
+  const installBtn = document.getElementById("install-pwa-btn");
+  if (!installBtn) return;
+
+  const isStandalone =
+    (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) ||
+    window.navigator.standalone === true;
+  if (isStandalone) {
+    installBtn.classList.add("hidden");
+    return;
+  }
+
+  const ua = String(window.navigator.userAgent || "");
+  const isIosMobile = /iPhone|iPad|iPod/i.test(ua);
+  const isSafari = /Safari/i.test(ua) && !/CriOS|FxiOS|EdgiOS/i.test(ua);
+  if (isIosMobile && isSafari) {
+    state.iosSafariInstallable = true;
+    installBtn.classList.remove("hidden");
+  }
+
+  window.addEventListener("beforeinstallprompt", (ev) => {
+    ev.preventDefault();
+    state.deferredInstallPrompt = ev;
+    installBtn.classList.remove("hidden");
+  });
+
+  window.addEventListener("appinstalled", () => {
+    state.deferredInstallPrompt = null;
+    installBtn.classList.add("hidden");
+    showToast("ArthaQuant App installed! Open anytime from your Home Screen or Desktop.");
+  });
+
+  installBtn.addEventListener("click", async () => {
+    if (state.deferredInstallPrompt) {
+      const promptEvent = state.deferredInstallPrompt;
+      promptEvent.prompt();
+      const choice = await promptEvent.userChoice.catch(() => ({ outcome: "dismissed" }));
+      if (choice && choice.outcome === "accepted") {
+        state.deferredInstallPrompt = null;
+        installBtn.classList.add("hidden");
+      }
+      return;
+    }
+    if (state.iosSafariInstallable) {
+      showToast(
+        "Install on iPhone/iPad: Tap the Safari Share icon below, then select 'Add to Home Screen'."
+      );
+    }
+  });
+}
+
+async function handleDeployPlannerBlueprintClick() {
+  if (!state.currentPlan) {
+    await runPlanner();
+  }
+  if (state.currentPlan) {
+    await openDeployBlueprintModal(state.currentPlan);
+  }
+}
+
 // --- Event Listeners ---
 
 document.addEventListener("DOMContentLoaded", () => {
+  registerPwaServiceWorker();
+  initPwaInstallUx();
+
   document.getElementById("auth-form").addEventListener("submit", handleAuthSubmit);
   document.getElementById("logout-btn").addEventListener("click", handleLogout);
 
-  for (const tabBtn of document.querySelectorAll(".nav-tab")) {
+  for (const tabBtn of document.querySelectorAll(".nav-tab, .mobile-nav-btn")) {
     tabBtn.addEventListener("click", () => switchTab(tabBtn.dataset.tab));
   }
 
@@ -3698,8 +3872,14 @@ document.addEventListener("DOMContentLoaded", () => {
     loadScreener(false);
   });
 
-  // Planner & Backtest Controls
+  // Planner, Paper Basket Deploy & Backtest Controls
   document.getElementById("run-planner-btn").addEventListener("click", runPlanner);
+  document
+    .getElementById("deploy-paper-basket-btn")
+    .addEventListener("click", handleDeployPlannerBlueprintClick);
+  document
+    .getElementById("deploy-paper-basket-header-btn")
+    .addEventListener("click", handleDeployPlannerBlueprintClick);
   document.getElementById("run-backtest-btn").addEventListener("click", runBacktest);
 
   // Simple / Pro Explanation Mode Switchers (Leaderboard & Sticky Deep Dive Drawer)
@@ -3708,14 +3888,23 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("dd-mode-simple-btn").addEventListener("click", () => setProMode(false));
   document.getElementById("dd-mode-pro-btn").addEventListener("click", () => setProMode(true));
 
-  // Slide-Over Deep Dive Drawer Controls
+  // Slide-Over Deep Dive Drawer Controls + Paper Trade Trigger
+  document.getElementById("dd-paper-trade-btn").addEventListener("click", () => {
+    const target =
+      (state.currentDetail && state.currentDetail.scorecard) || state.selectedTicker;
+    openPaperOrderTicket(target, { side: "BUY", orderType: "LIMIT" });
+  });
   document.getElementById("dd-close-btn").addEventListener("click", closeDeepDive);
   document.getElementById("deep-dive-backdrop").addEventListener("click", closeDeepDive);
   document.getElementById("dd-prev-btn").addEventListener("click", () => stepDeepDive(-1));
   document.getElementById("dd-next-btn").addEventListener("click", () => stepDeepDive(1));
   document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape" && state.drawerOpen) {
-      closeDeepDive();
+    if (ev.key === "Escape") {
+      closeAllPaperModals();
+      closePaperAuthModal();
+      if (state.drawerOpen) {
+        closeDeepDive();
+      }
     }
   });
 

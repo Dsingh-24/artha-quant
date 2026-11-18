@@ -1,4 +1,4 @@
-// ArthaQuant V3.0 — Safe SVG chart, score gauge, currency formatter & stacked contribution renderer
+// ArthaQuant V4.0 — Safe SVG chart, score gauge, currency formatter & stacked contribution renderer
 // built exclusively with document.createElementNS and textContent.
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -9,6 +9,23 @@ function svgEl(tag, attrs = {}) {
     node.setAttribute(k, String(v));
   }
   return node;
+}
+
+export function formatExactCurrency(amount, currency = "INR", decimals = 0) {
+  const num = Number(amount || 0);
+  const abs = Math.abs(num);
+  const sign = num < 0 ? "-" : "";
+  const frac = Math.max(0, Math.min(2, Number(decimals || 0)));
+  if (currency === "USD") {
+    return `${sign}$${abs.toLocaleString("en-US", {
+      minimumFractionDigits: frac,
+      maximumFractionDigits: frac,
+    })}`;
+  }
+  return `${sign}₹${abs.toLocaleString("en-IN", {
+    minimumFractionDigits: frac,
+    maximumFractionDigits: frac,
+  })}`;
 }
 
 export function formatCurrencyCompact(amount, currency = "INR") {

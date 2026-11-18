@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="ArthaQuant Icon">
+  <defs>
+    <radialGradient id="aq-bg-glow" cx="50%" cy="28%" r="72%">
+      <stop offset="0%" stop-color="#172542" />
+      <stop offset="58%" stop-color="#101827" />
+      <stop offset="100%" stop-color="#090e18" />
+    </radialGradient>
+    <linearGradient id="aq-curve-grad" x1="116" y1="372" x2="396" y2="258" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#10b981" />
+      <stop offset="55%" stop-color="#22d3ee" />
+      <stop offset="100%" stop-color="#38bdf8" />
+    </linearGradient>
+    <linearGradient id="aq-area-grad" x1="256" y1="258" x2="256" y2="392" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.32" />
+      <stop offset="55%" stop-color="#38bdf8" stop-opacity="0.14" />
+      <stop offset="100%" stop-color="#090e18" stop-opacity="0.0" />
+    </linearGradient>
+    <linearGradient id="aq-border-grad" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2f4569" stop-opacity="0.85" />
+      <stop offset="100%" stop-color="#172236" stop-opacity="0.45" />
+    </linearGradient>
+  </defs>
+
+  <!-- Dark Navy Rounded-Square Base (#090e18) -->
+  <rect x="0" y="0" width="512" height="512" rx="108" ry="108" fill="#090e18" />
+  <rect x="16" y="16" width="480" height="480" rx="96" ry="96" fill="url(#aq-bg-glow)" stroke="url(#aq-border-grad)" stroke-width="3" />
+
+  <!-- Subtle Quant Factor Pillars -->
+  <rect x="128" y="348" width="32" height="42" rx="6" fill="#10b981" fill-opacity="0.14" />
+  <rect x="196" y="330" width="32" height="60" rx="6" fill="#10b981" fill-opacity="0.18" />
+  <rect x="264" y="308" width="32" height="82" rx="6" fill="#38bdf8" fill-opacity="0.18" />
+  <rect x="332" y="282" width="32" height="108" rx="6" fill="#38bdf8" fill-opacity="0.24" />
+
+  <!-- Baseline Axis -->
+  <line x1="112" y1="390" x2="400" y2="390" stroke="#22324d" stroke-width="4" stroke-linecap="round" />
+
+  <!-- Upward Equity Curve Area & Line -->
+  <path d="M 116 372 L 184 340 L 236 354 L 312 302 L 392 258 L 392 390 L 116 390 Z" fill="url(#aq-area-grad)" />
+  <path d="M 116 372 L 184 340 L 236 354 L 312 302 L 392 258" fill="none" stroke="url(#aq-curve-grad)" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" />
+
+  <!-- Peak Signal Node -->
+  <circle cx="392" cy="258" r="17" fill="#38bdf8" fill-opacity="0.24" />
+  <circle cx="392" cy="258" r="9" fill="#38bdf8" stroke="#f1f5f9" stroke-width="3" />
+
+  <!-- Geometric 'A' Emblem -->
+  <path d="M 192 118 L 146 222 L 171 222 L 181 198 L 219 198 L 229 222 L 254 222 L 208 118 Z M 200 147 L 211 177 L 189 177 Z" fill="#f1f5f9" />
+
+  <!-- Geometric 'Q' Emblem with Cyan-Emerald Quant Tail -->
+  <circle cx="316" cy="170" r="46" fill="none" stroke="#f1f5f9" stroke-width="22" />
+  <line x1="336" y1="190" x2="366" y2="220" stroke="url(#aq-curve-grad)" stroke-width="20" stroke-linecap="round" />
+</svg>

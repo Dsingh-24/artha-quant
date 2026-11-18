@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile, status
+from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -46,6 +46,12 @@ from app.live_funnel import (
     sync_single_live_ticker,
 )
 from app.planner import build_investment_plan
+from app.paper_trading import (
+    PaperNotFoundError,
+    PaperTradingService,
+    PaperValidationError,
+    QuoteFetcher,
+)
 from app.plain_english import generate_local_ai_memo
 from app.schemas import (
     AiMemoRequest,
@@ -54,6 +60,11 @@ from app.schemas import (
     CompanyTickerQuery,
     FunnelExpandRequest,
     FunnelRefreshRequest,
+    PaperDeployBasketRequest,
+    PaperDepositRequest,
+    PaperOrderRequest,
+    PaperPortfolioCreateRequest,
+    PaperRefreshRequest,
     PlannerRequest,
     ScreenerRequest,
     TickerSyncRequest,
@@ -147,7 +158,11 @@ class MarketDataCache:
             return companies, fund_df, p_mat, stage1_rows
 
 
-def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = True) -> FastAPI:
+def create_app(
+    db_path: Path = DEFAULT_DB_PATH,
+    seed_fallback_if_empty: bool = True,
+    quote_fetcher: Optional[QuoteFetcher] = None,
+) -> FastAPI:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(UPLOAD_DIR, 0o700)
@@ -158,6 +173,7 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
     if seed_fallback_if_empty and db.count_companies() == 0:
         seed_calibrated_nse_universe(db)
     market_cache = MarketDataCache(db)
+    paper_service = PaperTradingService(db=db, market_cache=market_cache, quote_fetcher=quote_fetcher)
     rate_limiter = SlidingWindowRateLimiter(max_requests=220, window_seconds=60)
 
     app = FastAPI(
@@ -169,6 +185,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
     )
     app.state.db = db
     app.state.market_cache = market_cache
+    app.state.paper_service = paper_service
+    app.state.quote_fetcher = quote_fetcher
 
     app.add_middleware(
         CORSMiddleware,
@@ -200,6 +218,8 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             "img-src 'self' data:; "
             "font-src 'self'; "
             "connect-src 'self'; "
+            "manifest-src 'self'; "
+            "worker-src 'self'; "
             "object-src 'none'; "
             "frame-ancestors 'none'; "
             "base-uri 'self'; "
@@ -264,6 +284,17 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
     @app.get("/")
     def serve_index() -> FileResponse:
         return FileResponse(str(STATIC_DIR / "index.html"))
+
+    @app.get("/sw.js")
+    def serve_service_worker() -> Response:
+        sw_path = STATIC_DIR / "sw.js"
+        if not sw_path.is_file():
+            raise HTTPException(status_code=404, detail="Service worker not found.")
+        return FileResponse(
+            str(sw_path),
+            media_type="application/javascript",
+            headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
+        )
 
     # --- Auth & Session Lifecycle ---
 
@@ -823,6 +854,117 @@ def create_app(db_path: Path = DEFAULT_DB_PATH, seed_fallback_if_empty: bool = T
             plan["saved_plan_id"] = plan_id
         plan["saved_plans"] = db.list_user_plans(int(sess["user_id"]))
         return plan
+
+    # --- Multi-Strategy Paper Trading & Buy-on-Dip Limit Order Endpoints ---
+
+    def _paper_identity(sess: Dict[str, Any]) -> Tuple[str, str]:
+        uid = f"local:{sess['user_id']}"
+        uname = str(sess.get("username") or f"user_{sess['user_id']}")
+        return uid, uname
+
+    @app.get("/api/paper/overview")
+    def get_paper_overview(
+        portfolio_id: Optional[str] = None,
+        sess: Dict[str, Any] = Depends(require_session),
+    ) -> Dict[str, Any]:
+        uid, uname = _paper_identity(sess)
+        try:
+            return paper_service.get_overview(user_id=uid, username=uname, portfolio_id=portfolio_id)
+        except PaperNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except PaperValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/paper/portfolios")
+    def create_paper_portfolio(
+        payload: PaperPortfolioCreateRequest,
+        sess: Dict[str, Any] = Depends(require_session),
+    ) -> Dict[str, Any]:
+        uid, uname = _paper_identity(sess)
+        try:
+            return paper_service.create_portfolio(user_id=uid, username=uname, payload=payload)
+        except PaperNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except PaperValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/paper/portfolios/{portfolio_id}/deposit")
+    def deposit_paper_cash(
+        portfolio_id: str,
+        payload: PaperDepositRequest,
+        sess: Dict[str, Any] = Depends(require_session),
+    ) -> Dict[str, Any]:
+        uid, uname = _paper_identity(sess)
+        try:
+            return paper_service.deposit_cash(
+                user_id=uid,
+                username=uname,
+                portfolio_id=portfolio_id,
+                amount=payload.amount,
+            )
+        except PaperNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except PaperValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/paper/orders")
+    def submit_paper_order(
+        payload: PaperOrderRequest,
+        sess: Dict[str, Any] = Depends(require_session),
+    ) -> Dict[str, Any]:
+        uid, uname = _paper_identity(sess)
+        try:
+            return paper_service.place_order(user_id=uid, username=uname, payload=payload)
+        except PaperNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except PaperValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/paper/orders/{order_id}/cancel")
+    def cancel_paper_order(
+        order_id: str,
+        sess: Dict[str, Any] = Depends(require_session),
+    ) -> Dict[str, Any]:
+        uid, uname = _paper_identity(sess)
+        try:
+            return paper_service.cancel_order(user_id=uid, username=uname, order_id=order_id)
+        except PaperNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except PaperValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/paper/deploy-basket")
+    def deploy_paper_basket(
+        payload: PaperDeployBasketRequest,
+        sess: Dict[str, Any] = Depends(require_session),
+    ) -> Dict[str, Any]:
+        uid, uname = _paper_identity(sess)
+        try:
+            return paper_service.deploy_basket(user_id=uid, username=uname, payload=payload)
+        except PaperNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except PaperValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/api/paper/refresh")
+    def refresh_paper_portfolios(
+        payload: Optional[PaperRefreshRequest] = Body(default=None),
+        sess: Dict[str, Any] = Depends(require_session),
+    ) -> Dict[str, Any]:
+        uid, uname = _paper_identity(sess)
+        pf_id = payload.portfolio_id if payload else None
+        override_fetcher = getattr(app.state, "quote_fetcher", None) or paper_service.quote_fetcher
+        try:
+            return paper_service.refresh_quotes_and_orders(
+                user_id=uid,
+                username=uname,
+                portfolio_id=pf_id,
+                quote_fetcher=override_fetcher,
+            )
+        except PaperNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except PaperValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     return app
 

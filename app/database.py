@@ -42,6 +42,26 @@ class Database:
         finally:
             conn.close()
 
+    @contextmanager
+    def atomic_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Acquire an immediate SQLite write transaction for atomic multi-table mutations."""
+        conn = sqlite3.connect(str(self.db_path), timeout=20.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("BEGIN IMMEDIATE;")
+        try:
+            yield conn
+            conn.execute("COMMIT;")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK;")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
     def _init_schema(self) -> None:
         with self.connect() as conn:
             conn.executescript(
@@ -203,6 +223,100 @@ class Database:
                     memo_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (ticker, snapshot_date)
+                );
+
+                CREATE TABLE IF NOT EXISTS paper_portfolios (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    currency TEXT NOT NULL CHECK(currency IN ('INR','USD')),
+                    strategy_preset TEXT NOT NULL DEFAULT 'qglp_compounder',
+                    benchmark_ticker TEXT NOT NULL DEFAULT '^NSEI',
+                    cash_balance REAL NOT NULL CHECK(cash_balance >= 0),
+                    reserved_cash REAL NOT NULL DEFAULT 0 CHECK(reserved_cash >= 0),
+                    total_deposited REAL NOT NULL CHECK(total_deposited >= 0),
+                    fee_bps REAL NOT NULL DEFAULT 25,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_paper_portfolios_user ON paper_portfolios(user_id);
+
+                CREATE TABLE IF NOT EXISTS paper_positions (
+                    portfolio_id TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    shares INTEGER NOT NULL CHECK(shares >= 0),
+                    avg_cost REAL NOT NULL,
+                    native_currency TEXT NOT NULL,
+                    entry_score REAL NOT NULL,
+                    entry_rating TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (portfolio_id, ticker),
+                    FOREIGN KEY (portfolio_id) REFERENCES paper_portfolios(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS paper_orders (
+                    id TEXT PRIMARY KEY,
+                    portfolio_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
+                    order_type TEXT NOT NULL CHECK(order_type IN ('MARKET','LIMIT')),
+                    shares INTEGER NOT NULL CHECK(shares > 0),
+                    limit_price REAL,
+                    reserved_amount REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL CHECK(status IN ('OPEN','FILLED','CANCELLED','EXPIRED')),
+                    score_at_order REAL,
+                    rating_at_order TEXT,
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    filled_at TEXT,
+                    filled_price REAL,
+                    FOREIGN KEY (portfolio_id) REFERENCES paper_portfolios(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_paper_orders_user ON paper_orders(user_id);
+                CREATE INDEX IF NOT EXISTS idx_paper_orders_status_ticker ON paper_orders(status, ticker);
+
+                CREATE TABLE IF NOT EXISTS paper_trades (
+                    id TEXT PRIMARY KEY,
+                    portfolio_id TEXT NOT NULL,
+                    order_id TEXT,
+                    ticker TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    shares INTEGER NOT NULL,
+                    exec_price_native REAL NOT NULL,
+                    fx_rate REAL NOT NULL DEFAULT 1.0,
+                    gross_amount REAL NOT NULL,
+                    fee_amount REAL NOT NULL,
+                    net_amount REAL NOT NULL,
+                    realized_pnl REAL NOT NULL DEFAULT 0.0,
+                    score_at_trade REAL,
+                    rating_at_trade TEXT,
+                    executed_at TEXT NOT NULL,
+                    FOREIGN KEY (portfolio_id) REFERENCES paper_portfolios(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_paper_trades_portfolio ON paper_trades(portfolio_id, executed_at DESC);
+
+                CREATE TABLE IF NOT EXISTS paper_live_quotes (
+                    ticker TEXT PRIMARY KEY,
+                    close_price REAL NOT NULL,
+                    day_low REAL NOT NULL,
+                    day_high REAL NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS paper_nav_history (
+                    portfolio_id TEXT NOT NULL,
+                    snap_date TEXT NOT NULL,
+                    cash_balance REAL NOT NULL,
+                    holdings_value REAL NOT NULL,
+                    total_nav REAL NOT NULL,
+                    total_deposited REAL NOT NULL,
+                    return_pct REAL NOT NULL,
+                    benchmark_close REAL NOT NULL,
+                    benchmark_return_pct REAL NOT NULL,
+                    PRIMARY KEY (portfolio_id, snap_date),
+                    FOREIGN KEY (portfolio_id) REFERENCES paper_portfolios(id) ON DELETE CASCADE
                 );
                 """
             )
@@ -853,3 +967,68 @@ class Database:
                 """,
                 (str(ticker), str(snapshot_date), str(model_used or ""), encoded, now_iso),
             )
+
+    # --- Paper Trading Storage Helpers (User-Scoped, Strictly Parameterized) ---
+
+    def get_latest_price_row(self, ticker: str) -> Optional[Dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ticker, trade_date, close_price
+                FROM daily_prices
+                WHERE ticker = ?
+                ORDER BY trade_date DESC
+                LIMIT 1
+                """,
+                (str(ticker),),
+            ).fetchone()
+            if row:
+                return dict(row)
+            s1 = conn.execute(
+                "SELECT ticker, last_price FROM stage1_funnel WHERE ticker = ?",
+                (str(ticker),),
+            ).fetchone()
+            if s1 and float(s1["last_price"] or 0.0) > 0:
+                return {
+                    "ticker": str(s1["ticker"]),
+                    "trade_date": time.strftime("%Y-%m-%d", time.gmtime()),
+                    "close_price": float(s1["last_price"]),
+                }
+            return None
+
+    def get_paper_live_quotes(self) -> Dict[str, Dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT ticker, close_price, day_low, day_high, trade_date, updated_at FROM paper_live_quotes"
+            ).fetchall()
+            return {r["ticker"]: dict(r) for r in rows}
+
+    def upsert_paper_live_quotes(self, quotes: Iterable[Dict[str, Any]]) -> int:
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        rows_to_save: List[Tuple[Any, ...]] = []
+        for q in quotes:
+            tk = str(q["ticker"])
+            c_px = round(float(q["close_price"]), 2)
+            lo_px = round(float(q.get("day_low", c_px)), 2)
+            hi_px = round(float(q.get("day_high", c_px)), 2)
+            t_date = str(q.get("trade_date") or time.strftime("%Y-%m-%d", time.gmtime()))
+            u_at = str(q.get("updated_at") or now_iso)
+            if c_px > 0:
+                rows_to_save.append((tk, c_px, lo_px, hi_px, t_date, u_at))
+        if not rows_to_save:
+            return 0
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO paper_live_quotes (ticker, close_price, day_low, day_high, trade_date, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker) DO UPDATE SET
+                    close_price = excluded.close_price,
+                    day_low = excluded.day_low,
+                    day_high = excluded.day_high,
+                    trade_date = excluded.trade_date,
+                    updated_at = excluded.updated_at
+                """,
+                rows_to_save,
+            )
+        return len(rows_to_save)
