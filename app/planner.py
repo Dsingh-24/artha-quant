@@ -14,7 +14,31 @@ import numpy as np
 
 from app.factors import matches_market_filter, resolve_market_and_index_tag
 
-USD_INR_RATE = 84.5
+USD_INR_TICKER = "USDINR=X"
+USD_INR_RATE = 93.44
+
+
+def resolve_usd_inr_rate(price_matrix: Any = None, usd_inr_rate: float | None = None) -> float:
+    if usd_inr_rate is not None:
+        ov = float(usd_inr_rate)
+        if math.isfinite(ov) and ov > 0:
+            return round(ov, 2)
+    if price_matrix is not None:
+        if hasattr(price_matrix, "columns") and USD_INR_TICKER in price_matrix.columns:
+            series = price_matrix[USD_INR_TICKER].dropna()
+            if not series.empty:
+                latest = float(series.iloc[-1])
+                if math.isfinite(latest) and latest > 0:
+                    return round(latest, 2)
+        elif isinstance(price_matrix, dict) and USD_INR_TICKER in price_matrix:
+            raw_series = price_matrix[USD_INR_TICKER]
+            if isinstance(raw_series, (list, tuple)):
+                for val in reversed(raw_series):
+                    if val is not None and math.isfinite(float(val)) and float(val) > 0:
+                        return round(float(val), 2)
+            elif raw_series is not None and math.isfinite(float(raw_series)) and float(raw_series) > 0:
+                return round(float(raw_series), 2)
+    return USD_INR_RATE
 
 RISK_PROFILES: Dict[str, Dict[str, Any]] = {
     "equity_direct": {
@@ -172,9 +196,12 @@ def build_investment_plan(
     risk_profile: str = "equity_direct",
     max_stocks: int = 8,
     market: str = "ALL",
+    price_matrix: Any = None,
+    usd_inr_rate: float | None = None,
 ) -> Dict[str, Any]:
     eff_market = market if market in ("ALL", "IN", "US", "NASDAQ100", "SP500") else "ALL"
     plan_currency = "USD" if eff_market in ("US", "NASDAQ100", "SP500") else "INR"
+    fx_rate = resolve_usd_inr_rate(price_matrix=price_matrix, usd_inr_rate=usd_inr_rate)
     prof = _resolve_risk_profile(risk_profile, eff_market)
 
     if eff_market != "ALL":
@@ -190,8 +217,8 @@ def build_investment_plan(
         s_mkt, _, _, s_ccy = resolve_market_and_index_tag(stock)
         native_px = max(0.01, float(stock["price"]))
         if plan_currency == "USD":
-            return native_px if s_ccy == "USD" else (native_px / USD_INR_RATE)
-        return (native_px * USD_INR_RATE) if s_ccy == "USD" else native_px
+            return native_px if s_ccy == "USD" else (native_px / fx_rate)
+        return (native_px * fx_rate) if s_ccy == "USD" else native_px
 
     equity_share = (
         sum(
@@ -373,7 +400,7 @@ def build_investment_plan(
     return {
         "market": eff_market,
         "plan_currency": plan_currency,
-        "fx_usd_inr": USD_INR_RATE,
+        "fx_usd_inr": fx_rate,
         "profile_label": prof["label"],
         "expected_cagr_pct": round(prof["blended_mu"] * 100.0, 2),
         "expected_volatility_pct": round(prof["blended_sigma"] * 100.0, 2),

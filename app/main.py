@@ -848,6 +848,7 @@ def create_app(
             risk_profile=payload.risk_profile,
             max_stocks=payload.max_stocks,
             market=payload.market,
+            price_matrix=price_mat,
         )
         if payload.save_plan:
             plan_id = db.save_user_plan(int(sess["user_id"]), payload.plan_name, plan)
@@ -872,6 +873,17 @@ def create_app(
             return paper_service.get_overview(user_id=uid, username=uname, portfolio_id=portfolio_id)
         except PaperNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
+        except PaperValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/api/paper/quote")
+    def get_paper_live_quote(
+        ticker: str = "",
+        _sess: Dict[str, Any] = Depends(require_session),
+    ) -> Dict[str, Any]:
+        override_fetcher = getattr(app.state, "quote_fetcher", None) or paper_service.quote_fetcher
+        try:
+            return paper_service.get_live_ticker_quote(raw_ticker=ticker, quote_fetcher=override_fetcher)
         except PaperValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -913,8 +925,14 @@ def create_app(
         sess: Dict[str, Any] = Depends(require_session),
     ) -> Dict[str, Any]:
         uid, uname = _paper_identity(sess)
+        override_fetcher = getattr(app.state, "quote_fetcher", None) or paper_service.quote_fetcher
         try:
-            return paper_service.place_order(user_id=uid, username=uname, payload=payload)
+            return paper_service.place_order(
+                user_id=uid,
+                username=uname,
+                payload=payload,
+                quote_fetcher=override_fetcher,
+            )
         except PaperNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
         except PaperValidationError as exc:
@@ -953,12 +971,14 @@ def create_app(
     ) -> Dict[str, Any]:
         uid, uname = _paper_identity(sess)
         pf_id = payload.portfolio_id if payload else None
+        m_scope = payload.market_scope if payload else "ALL"
         override_fetcher = getattr(app.state, "quote_fetcher", None) or paper_service.quote_fetcher
         try:
             return paper_service.refresh_quotes_and_orders(
                 user_id=uid,
                 username=uname,
                 portfolio_id=pf_id,
+                market_scope=m_scope,
                 quote_fetcher=override_fetcher,
             )
         except PaperNotFoundError as exc:

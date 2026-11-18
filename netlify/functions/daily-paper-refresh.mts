@@ -19,9 +19,9 @@ export default async (req: Request): Promise<Response> => {
   }
 
   try {
-    const summary = await runGlobalDailyPaperRefresh();
+    const summary = await runGlobalDailyPaperRefresh(undefined, "US");
     console.log(
-      `[daily-paper-refresh] Completed as_of=${summary.as_of_date}: quotes=${summary.quotes_updated}, filled=${summary.orders_filled}, portfolios=${summary.portfolios_snapshotted}, next_run=${nextRun || "n/a"}`,
+      `[daily-paper-refresh] Completed scope=${summary.market_scope} as_of=${summary.as_of_date}: quotes=${summary.quotes_updated}, filled=${summary.orders_filled}, portfolios=${summary.portfolios_snapshotted}, idle=${Boolean(summary.skipped_idle)}, next_run=${nextRun || "n/a"}`,
     );
     return Response.json(
       {
@@ -48,7 +48,7 @@ export default async (req: Request): Promise<Response> => {
   }
 };
 
-// 21:30 UTC Mon-Fri = 4:30 PM EST / 5:30 PM EDT (after US market close) and 3:00 AM IST (after NSE close).
+// 22:00 UTC Mon-Fri = 5:00 PM EST (winter) / 6:00 PM EDT (summer, shifts 1h across US DST), safely after 4:00 PM ET US market close.
 export const config: Config = {
-  schedule: "30 21 * * 1-5",
+  schedule: "0 22 * * 1-5",
 };

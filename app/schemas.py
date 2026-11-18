@@ -134,6 +134,7 @@ class PlannerRequest(BaseModel):
 PaperCurrency = Literal["INR", "USD"]
 PaperOrderSide = Literal["BUY", "SELL"]
 PaperOrderType = Literal["MARKET", "LIMIT"]
+PaperMarketScope = Literal["ALL", "IN", "US"]
 ALLOWED_BENCHMARKS = {"^NSEI", "^GSPC", "^NDX"}
 
 
@@ -252,3 +253,13 @@ class PaperRefreshRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     portfolio_id: Optional[str] = Field(default=None, max_length=64)
+    market_scope: PaperMarketScope = "ALL"
+
+    @field_validator("market_scope", mode="before")
+    @classmethod
+    def normalize_market_scope(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return "ALL"
+        if isinstance(value, str):
+            return value.strip().upper()
+        return value

@@ -8,8 +8,12 @@ import {
   type DatabaseConnection,
 } from "@netlify/database";
 
-export const USD_INR_FX = 84.5;
-export const BENCHMARK_SYMBOLS = ["^NSEI", "^GSPC", "^NDX"] as const;
+export const FX_USD_INR_SYMBOL = "USDINR=X";
+export const USD_INR_FX = 93.44;
+const LIVE_QUOTE_STALE_SECONDS = 300;
+export const BENCHMARK_SYMBOLS = ["^NSEI", "^GSPC", "^NDX", FX_USD_INR_SYMBOL] as const;
+export type PaperMarketScope = "ALL" | "IN" | "US";
+const UNQUOTED_AGE_SENTINEL_SECONDS = 999_999;
 const ATTRIBUTION_RATINGS = ["Strong Buy", "Buy", "Hold"] as const;
 const ALLOWED_PRESETS = new Set<string>([
   "qglp_compounder",
@@ -22,6 +26,155 @@ const ALLOWED_PRESETS = new Set<string>([
 const ALLOWED_CURRENCIES = new Set<string>(["INR", "USD"]);
 const ALLOWED_BENCHMARKS = new Set<string>(["^NSEI", "^GSPC", "^NDX"]);
 const TICKER_FORMAT_RE = /^[A-Z0-9.^&-]{1,20}$/;
+
+export interface MarketSessionStatus {
+  in_market_open: boolean;
+  us_market_open: boolean;
+  recommended_scope: "IN" | "US" | "NONE";
+}
+
+export interface PaperQuotesMeta extends MarketSessionStatus {
+  latest_quote_updated_at: string | null;
+  relevant_quote_age_seconds: number | null;
+}
+
+export function isIndianTicker(tk: string): boolean {
+  const sym = (tk || "").trim().toUpperCase();
+  return sym === "^NSEI" || sym.endsWith(".NS") || sym.endsWith(".BO");
+}
+
+export function normalizeMarketScope(rawScope?: unknown): PaperMarketScope {
+  if (rawScope === undefined || rawScope === null || rawScope === "") {
+    return "ALL";
+  }
+  if (typeof rawScope === "string") {
+    const cleaned = rawScope.trim().toUpperCase();
+    if (!cleaned) return "ALL";
+    if (cleaned === "ALL" || cleaned === "IN" || cleaned === "US") {
+      return cleaned;
+    }
+  }
+  throw new PaperServiceError("market_scope must be 'ALL', 'IN', or 'US'.", 400);
+}
+
+export function matchesMarketScope(tk: string, marketScope: PaperMarketScope): boolean {
+  if (marketScope === "IN") return isIndianTicker(tk);
+  if (marketScope === "US") return !isIndianTicker(tk);
+  return true;
+}
+
+function benchmarksForScope(marketScope: PaperMarketScope): readonly string[] {
+  if (marketScope === "IN") return ["^NSEI", FX_USD_INR_SYMBOL];
+  if (marketScope === "US") return ["^GSPC", "^NDX", FX_USD_INR_SYMBOL];
+  return BENCHMARK_SYMBOLS;
+}
+
+export function computeMarketSessionStatus(nowUtc: Date = new Date()): MarketSessionStatus {
+  const day = nowUtc.getUTCDay();
+  const isWeekday = day >= 1 && day <= 5;
+  const utcMinutes = nowUtc.getUTCHours() * 60 + nowUtc.getUTCMinutes();
+  const in_market_open = isWeekday && utcMinutes >= 3 * 60 + 45 && utcMinutes <= 10 * 60 + 15;
+  const us_market_open = isWeekday && utcMinutes >= 13 * 60 + 30 && utcMinutes <= 21 * 60 + 15;
+  const recommended_scope: "IN" | "US" | "NONE" = in_market_open
+    ? "IN"
+    : us_market_open
+      ? "US"
+      : "NONE";
+  return { in_market_open, us_market_open, recommended_scope };
+}
+
+function parseIsoEpochMs(rawTs?: string | null): number | null {
+  if (!rawTs || typeof rawTs !== "string") return null;
+  const trimmed = rawTs.trim();
+  if (!trimmed) return null;
+  const ms = Date.parse(trimmed);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export function computeQuotesMeta(params: {
+  liveQuotes: Map<string, LiveQuoteRow>;
+  activeTickers?: string[];
+  benchmarkTicker?: string | null;
+  hasActivePortfolio: boolean;
+  nowUtc?: Date;
+}): PaperQuotesMeta {
+  const nowUtc = params.nowUtc ?? new Date();
+  const session = computeMarketSessionStatus(nowUtc);
+  const recScope = session.recommended_scope;
+  const heldAndOrderTks = Array.from(
+    new Set(
+      (params.activeTickers ?? [])
+        .map((t) => String(t || "").trim().toUpperCase())
+        .filter(Boolean),
+    ),
+  ).sort();
+
+  let latestMs: number | null = null;
+  let latestStr: string | null = null;
+  const candidateForLatest = [...heldAndOrderTks];
+  if (params.benchmarkTicker && params.benchmarkTicker.trim()) {
+    candidateForLatest.push(params.benchmarkTicker.trim().toUpperCase());
+  }
+
+  if (candidateForLatest.length > 0) {
+    for (const tk of candidateForLatest) {
+      const q = params.liveQuotes.get(tk);
+      const uStr = q?.updated_at ? String(q.updated_at) : "";
+      const uMs = parseIsoEpochMs(uStr);
+      if (uMs !== null && (latestMs === null || uMs > latestMs)) {
+        latestMs = uMs;
+        latestStr = uStr;
+      }
+    }
+  }
+
+  if (latestStr === null) {
+    for (const q of params.liveQuotes.values()) {
+      const uStr = q.updated_at ? String(q.updated_at) : "";
+      const uMs = parseIsoEpochMs(uStr);
+      if (uMs !== null && (latestMs === null || uMs > latestMs)) {
+        latestMs = uMs;
+        latestStr = uStr;
+      }
+    }
+  }
+
+  let relevantAge: number | null = null;
+  if (recScope !== "NONE" && params.hasActivePortfolio) {
+    let scopedTks = heldAndOrderTks.filter((tk) => matchesMarketScope(tk, recScope));
+    if (scopedTks.length === 0) {
+      scopedTks = [recScope === "IN" ? "^NSEI" : "^GSPC"];
+    }
+    let oldestMs: number | null = null;
+    let missingQuote = false;
+    for (const tk of scopedTks) {
+      const q = params.liveQuotes.get(tk);
+      const uStr = q?.updated_at ? String(q.updated_at) : "";
+      const uMs = parseIsoEpochMs(uStr);
+      if (uMs === null) {
+        missingQuote = true;
+        break;
+      }
+      if (oldestMs === null || uMs < oldestMs) {
+        oldestMs = uMs;
+      }
+    }
+
+    if (missingQuote || oldestMs === null) {
+      relevantAge = UNQUOTED_AGE_SENTINEL_SECONDS;
+    } else {
+      relevantAge = Math.max(0, Math.round((nowUtc.getTime() - oldestMs) / 1000));
+    }
+  }
+
+  return {
+    in_market_open: session.in_market_open,
+    us_market_open: session.us_market_open,
+    recommended_scope: recScope,
+    latest_quote_updated_at: latestStr,
+    relevant_quote_age_seconds: relevantAge,
+  };
+}
 
 export interface VerifiedPaperUser {
   id: string;
@@ -222,12 +375,46 @@ function resolveMarketLabel(indexTag: string, market: string): string {
   return "Indian Stock · NIFTY 200";
 }
 
-export function computeFxRate(nativeCurrency: string, portfolioCurrency: string): number {
+export function resolveUsdInrRate(liveQuotes?: Map<string, LiveQuoteRow>): number {
+  const fxRow = liveQuotes?.get(FX_USD_INR_SYMBOL);
+  const px = fxRow ? Number(fxRow.close_price) : 0;
+  if (Number.isFinite(px) && px > 0) {
+    return roundTo(px, 4);
+  }
+  return USD_INR_FX;
+}
+
+function isQuoteMissingOrStale(
+  liveQuotes: Map<string, LiveQuoteRow>,
+  symbol: string,
+  nowMs: number,
+  maxAgeSeconds = LIVE_QUOTE_STALE_SECONDS,
+): boolean {
+  const row = liveQuotes.get(symbol);
+  if (!row || !Number.isFinite(Number(row.close_price)) || Number(row.close_price) <= 0) {
+    return true;
+  }
+  const updatedMs = parseIsoEpochMs(row.updated_at);
+  if (updatedMs === null) {
+    return true;
+  }
+  return (nowMs - updatedMs) / 1000 > maxAgeSeconds;
+}
+
+export function computeFxRate(
+  nativeCurrency: string,
+  portfolioCurrency: string,
+  usdInrRate?: number,
+): number {
   const src = (nativeCurrency || "INR").toUpperCase();
   const dst = (portfolioCurrency || "INR").toUpperCase();
   if (src === dst) return 1.0;
-  if (src === "USD" && dst === "INR") return USD_INR_FX;
-  if (src === "INR" && dst === "USD") return 1.0 / USD_INR_FX;
+  const effRate =
+    usdInrRate !== undefined && Number.isFinite(usdInrRate) && usdInrRate > 0
+      ? usdInrRate
+      : USD_INR_FX;
+  if (src === "USD" && dst === "INR") return effRate;
+  if (src === "INR" && dst === "USD") return 1.0 / effRate;
   return 1.0;
 }
 
@@ -428,7 +615,8 @@ function getBaselinePrice(
   if (stock && typeof stock.last_price === "number" && stock.last_price > 0) {
     return { close_price: roundTo(stock.last_price, 2), trade_date: asOf };
   }
-  // Fallback defaults for indices if missing from JSON
+  // Fallback defaults for indices & USD/INR FX if missing from JSON
+  if (ticker === FX_USD_INR_SYMBOL) return { close_price: USD_INR_FX, trade_date: asOf };
   if (ticker === "^NSEI") return { close_price: 25387.4, trade_date: asOf };
   if (ticker === "^GSPC") return { close_price: 7416.59, trade_date: asOf };
   if (ticker === "^NDX") return { close_price: 27197.15, trade_date: asOf };
@@ -528,10 +716,11 @@ async function recordNavSnapshotInTx(
     [pfId],
   );
 
+  const usdInrRate = resolveUsdInrRate(liveQuotes);
   let holdingsVal = 0;
   for (const p of posRes.rows) {
     const q = getQuoteSnapshot(universe, String(p.ticker), liveQuotes);
-    const fx = computeFxRate(String(p.native_currency), pfCcy);
+    const fx = computeFxRate(String(p.native_currency), pfCcy, usdInrRate);
     holdingsVal += roundTo(Number(p.shares) * q.close_price * fx, 2);
   }
   holdingsVal = roundTo(holdingsVal, 2);
@@ -610,6 +799,7 @@ async function executeBuyFillInTx(params: {
   nowIso: string;
   existingOrderId?: string;
   releasedReservation?: number;
+  usdInrRate?: number;
 }): Promise<{
   portfolio: PortfolioRow;
   order: Record<string, unknown>;
@@ -631,12 +821,13 @@ async function executeBuyFillInTx(params: {
     nowIso,
     existingOrderId,
     releasedReservation = 0,
+    usdInrRate,
   } = params;
 
   const pfId = String(portfolio.id);
   const pfCcy = String(portfolio.currency);
   const feeBps = Number(portfolio.fee_bps);
-  const fx = computeFxRate(nativeCurrency, pfCcy);
+  const fx = computeFxRate(nativeCurrency, pfCcy, usdInrRate);
   const { gross, fee, netDebit } = computeBuyCost(shares, execPriceNative, fx, feeBps);
 
   const curCash = roundTo(Number(portfolio.cash_balance), 2);
@@ -810,6 +1001,7 @@ async function executeSellFillInTx(params: {
   note: string;
   nowIso: string;
   existingOrderId?: string;
+  usdInrRate?: number;
 }): Promise<{
   portfolio: PortfolioRow;
   order: Record<string, unknown>;
@@ -830,12 +1022,13 @@ async function executeSellFillInTx(params: {
     note,
     nowIso,
     existingOrderId,
+    usdInrRate,
   } = params;
 
   const pfId = String(portfolio.id);
   const pfCcy = String(portfolio.currency);
   const feeBps = Number(portfolio.fee_bps);
-  const fx = computeFxRate(nativeCurrency, pfCcy);
+  const fx = computeFxRate(nativeCurrency, pfCcy, usdInrRate);
 
   const posRes = await client.query<PositionRow>(
     "SELECT * FROM paper_positions WHERE portfolio_id = $1 AND ticker = $2 FOR UPDATE",
@@ -1006,6 +1199,7 @@ async function queueOpenLimitBuyInTx(params: {
   ratingVal: string;
   note: string;
   nowIso: string;
+  usdInrRate?: number;
 }): Promise<{ portfolio: PortfolioRow; order: Record<string, unknown> }> {
   const {
     client,
@@ -1019,12 +1213,13 @@ async function queueOpenLimitBuyInTx(params: {
     ratingVal,
     note,
     nowIso,
+    usdInrRate,
   } = params;
 
   const pfId = String(portfolio.id);
   const pfCcy = String(portfolio.currency);
   const feeBps = Number(portfolio.fee_bps);
-  const fx = computeFxRate(nativeCurrency, pfCcy);
+  const fx = computeFxRate(nativeCurrency, pfCcy, usdInrRate);
   const { netDebit: reservedAmt } = computeBuyCost(shares, limitPrice, fx, feeBps);
 
   const curCash = roundTo(Number(portfolio.cash_balance), 2);
@@ -1114,6 +1309,10 @@ export async function getPaperOverview(
 
   const portfoliosSummary: Record<string, unknown>[] = [];
   let activeDetail: Record<string, unknown> | null = null;
+  let activeTrackedTks: string[] = [];
+  let activeBmTk: string | null = null;
+  const usdInrRate = resolveUsdInrRate(liveQuotes);
+  const fxUsdInr = roundTo(usdInrRate, 2);
   const targetId = cleanPfId ?? (pfRows.length > 0 ? String(pfRows[0].id) : null);
 
   for (const pf of pfRows) {
@@ -1150,7 +1349,7 @@ export async function getPaperOverview(
     let holdingsVal = 0;
     for (const p of posRows) {
       const q = getQuoteSnapshot(universe, String(p.ticker), liveQuotes);
-      const fx = computeFxRate(String(p.native_currency), pfCcy);
+      const fx = computeFxRate(String(p.native_currency), pfCcy, usdInrRate);
       holdingsVal += roundTo(Number(p.shares) * q.close_price * fx, 2);
     }
     holdingsVal = roundTo(holdingsVal, 2);
@@ -1213,7 +1412,7 @@ export async function getPaperOverview(
       const tk = String(p.ticker);
       const meta = universe.stocks[tk];
       const nativeCcy = String(p.native_currency || meta?.currency || "INR");
-      const fx = computeFxRate(nativeCcy, pfCcy);
+      const fx = computeFxRate(nativeCcy, pfCcy, usdInrRate);
       const q = getQuoteSnapshot(universe, tk, liveQuotes);
       const livePx = roundTo(q.close_price, 2);
       const sh = Number(p.shares);
@@ -1395,6 +1594,12 @@ export async function getPaperOverview(
       };
     });
 
+    activeTrackedTks = [
+      ...positionsOut.map((p) => p.ticker),
+      ...openOrdersOut.map((o) => o.ticker),
+    ];
+    activeBmTk = bmTk;
+
     activeDetail = {
       ...summaryCard,
       best_pick: bestPick,
@@ -1404,6 +1609,17 @@ export async function getPaperOverview(
       nav_history: navHistoryOut,
       attribution_by_rating: attributionOut,
     };
+  }
+
+  const quotesMeta = computeQuotesMeta({
+    liveQuotes,
+    activeTickers: activeTrackedTks,
+    benchmarkTicker: activeBmTk,
+    hasActivePortfolio: activeDetail !== null,
+  });
+  if (activeDetail !== null) {
+    activeDetail.quotes_meta = quotesMeta;
+    activeDetail.fx_usd_inr = fxUsdInr;
   }
 
   const displayEmail = user.email || user.id;
@@ -1417,6 +1633,89 @@ export async function getPaperOverview(
     },
     portfolios: portfoliosSummary,
     active_portfolio: activeDetail,
+    quotes_meta: quotesMeta,
+    fx_usd_inr: fxUsdInr,
+  };
+}
+
+export async function getPaperTickerQuote(
+  rawTicker: unknown,
+  reqUrl?: string,
+): Promise<Record<string, unknown>> {
+  const db = resolveDbConnection();
+  const universe = await loadStockUniverse(reqUrl);
+  const { ticker, entry } = resolveTradableCompany(universe, rawTicker);
+  const nativeCcy = entry.currency || "INR";
+
+  const liveQuotes = await fetchLiveQuotesMap(db);
+  const nowDate = new Date();
+  const nowMs = nowDate.getTime();
+  const nowIso = nowDate.toISOString().replace(/\.\d{3}Z$/, "Z");
+
+  const needTicker = isQuoteMissingOrStale(liveQuotes, ticker, nowMs, LIVE_QUOTE_STALE_SECONDS);
+  const needFx = isQuoteMissingOrStale(liveQuotes, FX_USD_INR_SYMBOL, nowMs, LIVE_QUOTE_STALE_SECONDS);
+
+  if (needTicker || needFx) {
+    const toFetch = Array.from(new Set([ticker, FX_USD_INR_SYMBOL])).sort();
+    const fetched = await fetchYahooChartQuotes(toFetch);
+    const toUpsert: LiveQuoteRow[] = [];
+    for (const sym of toFetch) {
+      const hit = fetched.get(sym);
+      if (hit && hit.close_price > 0) {
+        toUpsert.push({ ...hit, updated_at: nowIso });
+        continue;
+      }
+      if (!liveQuotes.has(sym)) {
+        const base = getBaselinePrice(universe, sym);
+        if (base.close_price > 0) {
+          toUpsert.push({
+            ticker: sym,
+            close_price: base.close_price,
+            day_low: base.close_price,
+            day_high: base.close_price,
+            trade_date: base.trade_date,
+            updated_at: nowIso,
+          });
+        }
+      }
+    }
+
+    for (const q of toUpsert) {
+      await db.sql`
+        INSERT INTO paper_live_quotes (ticker, close_price, day_low, day_high, trade_date, updated_at)
+        VALUES (${q.ticker}, ${q.close_price}, ${q.day_low}, ${q.day_high}, ${q.trade_date}, ${nowIso})
+        ON CONFLICT (ticker) DO UPDATE SET
+          close_price = EXCLUDED.close_price,
+          day_low = EXCLUDED.day_low,
+          day_high = EXCLUDED.day_high,
+          trade_date = EXCLUDED.trade_date,
+          updated_at = EXCLUDED.updated_at
+      `;
+      liveQuotes.set(q.ticker, { ...q, updated_at: nowIso });
+    }
+  }
+
+  const qSnap = getQuoteSnapshot(universe, ticker, liveQuotes);
+  const closePx = roundTo(qSnap.close_price, 2);
+  if (closePx <= 0) {
+    throw new PaperServiceError(`No valid market price available for ${ticker}.`, 400);
+  }
+  const liveRow = liveQuotes.get(ticker);
+  const updatedAt = liveRow?.updated_at ? String(liveRow.updated_at) : nowIso;
+  const usdInrRate = resolveUsdInrRate(liveQuotes);
+
+  return {
+    ticker,
+    name: entry.name || ticker,
+    close_price: closePx,
+    live_price: closePx,
+    current_price: closePx,
+    day_low: roundTo(qSnap.day_low, 2),
+    day_high: roundTo(qSnap.day_high, 2),
+    trade_date: String(qSnap.trade_date),
+    updated_at: updatedAt,
+    native_currency: nativeCcy,
+    fx_usd_inr: roundTo(usdInrRate, 2),
   };
 }
 
@@ -1602,14 +1901,53 @@ export async function placePaperOrder(
   const { ticker, entry } = resolveTradableCompany(universe, body.ticker);
   const nativeCcy = entry.currency || "INR";
 
+  // Verify portfolio ownership upfront before any live quote refresh
+  const ownedPfRows = await db.sql<{ id: string; currency: string }>`
+    SELECT id, currency FROM paper_portfolios
+    WHERE id = ${pfId} AND user_id = ${user.id}
+  `;
+  if (ownedPfRows.length === 0) {
+    throw new PaperServiceError("Paper portfolio not found.", 404);
+  }
+  const prePfCcy = String(ownedPfRows[0].currency || "INR");
+
   const liveQuotes = await fetchLiveQuotesMap(db);
+  const nowDate = new Date();
+  const nowMs = nowDate.getTime();
+  const nowIso = nowDate.toISOString().replace(/\.\d{3}Z$/, "Z");
+
+  if (orderType === "MARKET") {
+    const isCrossCcy = nativeCcy.toUpperCase() !== prePfCcy.toUpperCase();
+    const needTk = isQuoteMissingOrStale(liveQuotes, ticker, nowMs, LIVE_QUOTE_STALE_SECONDS);
+    const needFx =
+      isCrossCcy && isQuoteMissingOrStale(liveQuotes, FX_USD_INR_SYMBOL, nowMs, LIVE_QUOTE_STALE_SECONDS);
+    if (needTk || needFx) {
+      const toFetch = Array.from(new Set([ticker, FX_USD_INR_SYMBOL])).sort();
+      const fetched = await fetchYahooChartQuotes(toFetch);
+      for (const [sym, hit] of fetched.entries()) {
+        if (!hit || !(hit.close_price > 0)) continue;
+        await db.sql`
+          INSERT INTO paper_live_quotes (ticker, close_price, day_low, day_high, trade_date, updated_at)
+          VALUES (${sym}, ${hit.close_price}, ${hit.day_low}, ${hit.day_high}, ${hit.trade_date}, ${nowIso})
+          ON CONFLICT (ticker) DO UPDATE SET
+            close_price = EXCLUDED.close_price,
+            day_low = EXCLUDED.day_low,
+            day_high = EXCLUDED.day_high,
+            trade_date = EXCLUDED.trade_date,
+            updated_at = EXCLUDED.updated_at
+        `;
+        liveQuotes.set(sym, { ...hit, updated_at: nowIso });
+      }
+    }
+  }
+
+  const usdInrRate = resolveUsdInrRate(liveQuotes);
   const quote = getQuoteSnapshot(universe, ticker, liveQuotes);
   const curPrice = roundTo(quote.close_price, 2);
   if (curPrice <= 0) {
     throw new PaperServiceError(`No valid market price available for ${ticker}.`, 400);
   }
 
-  const nowIso = utcNowIso();
   let orderOut: Record<string, unknown> = {};
   let tradeOut: Record<string, unknown> | null = null;
 
@@ -1643,6 +1981,7 @@ export async function placePaperOrder(
           ratingVal,
           note: rawNote,
           nowIso,
+          usdInrRate,
         });
         pf = res.portfolio;
         orderOut = res.order;
@@ -1662,6 +2001,7 @@ export async function placePaperOrder(
           ratingVal,
           note: rawNote,
           nowIso,
+          usdInrRate,
         });
         pf = res.portfolio;
         orderOut = res.order;
@@ -1680,6 +2020,7 @@ export async function placePaperOrder(
           ratingVal,
           note: rawNote || `Buy-on-Dip (${dipPctStr}%)`,
           nowIso,
+          usdInrRate,
         });
         pf = res.portfolio;
         orderOut = res.order;
@@ -1699,6 +2040,7 @@ export async function placePaperOrder(
         ratingVal,
         note: rawNote,
         nowIso,
+        usdInrRate,
       });
       pf = res.portfolio;
       orderOut = res.order;
@@ -1718,6 +2060,7 @@ export async function placePaperOrder(
         ratingVal,
         note: rawNote,
         nowIso,
+        usdInrRate,
       });
       pf = res.portfolio;
       orderOut = res.order;
@@ -1925,6 +2268,7 @@ export async function deployPaperBasket(
   }
 
   const liveQuotes = await fetchLiveQuotesMap(db);
+  const usdInrRate = resolveUsdInrRate(liveQuotes);
   const nowIso = utcNowIso();
   const executedTrades: Record<string, unknown>[] = [];
   const queuedOrders: Record<string, unknown>[] = [];
@@ -1966,6 +2310,7 @@ export async function deployPaperBasket(
           ratingVal,
           note: item.note || "Planner Immediate Tranche",
           nowIso,
+          usdInrRate,
         });
         pf = mRes.portfolio;
         allOrders.push(mRes.order);
@@ -1993,6 +2338,7 @@ export async function deployPaperBasket(
             ratingVal,
             note: dipNote,
             nowIso,
+            usdInrRate,
           });
           pf = lRes.portfolio;
           allOrders.push(lRes.order);
@@ -2010,6 +2356,7 @@ export async function deployPaperBasket(
             ratingVal,
             note: dipNote,
             nowIso,
+            usdInrRate,
           });
           pf = lRes.portfolio;
           allOrders.push(lRes.order);
@@ -2131,13 +2478,57 @@ export async function fetchYahooChartQuotes(tickers: string[]): Promise<Map<stri
   return out;
 }
 
-export async function runGlobalDailyPaperRefresh(reqUrl?: string): Promise<{
+export async function runGlobalDailyPaperRefresh(
+  reqUrl?: string,
+  marketScope: PaperMarketScope = "ALL",
+): Promise<{
   quotes_updated: number;
   orders_filled: number;
   portfolios_snapshotted: number;
+  market_scope: PaperMarketScope;
   as_of_date: string;
+  skipped_idle?: boolean;
 }> {
+  const scope = normalizeMarketScope(marketScope);
   const db = resolveDbConnection();
+
+  let totalPortfolios = 0;
+  try {
+    const countRows = await db.sql<{ cnt: number | string }>`
+      SELECT COUNT(*) AS cnt FROM paper_portfolios
+    `;
+    totalPortfolios = Number(countRows[0]?.cnt ?? 0);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "";
+    const causeMsg =
+      err instanceof Error && err.cause instanceof Error ? err.cause.message : "";
+    const combined = `${msg} ${causeMsg}`.toLowerCase();
+    if (
+      combined.includes("does not exist") ||
+      combined.includes("relation") ||
+      combined.includes("econnrefused") ||
+      combined.includes("enotfound") ||
+      combined.includes("etimedout")
+    ) {
+      throw new PaperServiceError(
+        "Paper trading database schema or connection is not yet ready on this deploy branch. Deploy via Netlify to apply netlify/database/migrations/.",
+        503,
+      );
+    }
+    throw err;
+  }
+
+  if (totalPortfolios === 0) {
+    return {
+      quotes_updated: 0,
+      orders_filled: 0,
+      portfolios_snapshotted: 0,
+      market_scope: scope,
+      as_of_date: utcTodayStr(),
+      skipped_idle: true,
+    };
+  }
+
   const universe = await loadStockUniverse(reqUrl);
 
   const [posTks, ordTks, bmTks] = await Promise.all([
@@ -2146,10 +2537,19 @@ export async function runGlobalDailyPaperRefresh(reqUrl?: string): Promise<{
     db.sql<{ benchmark_ticker: string }>`SELECT DISTINCT benchmark_ticker FROM paper_portfolios`,
   ]);
 
-  const tracked = new Set<string>(BENCHMARK_SYMBOLS);
-  for (const r of posTks) if (r.ticker) tracked.add(String(r.ticker));
-  for (const r of ordTks) if (r.ticker) tracked.add(String(r.ticker));
-  for (const r of bmTks) if (r.benchmark_ticker) tracked.add(String(r.benchmark_ticker));
+  const tracked = new Set<string>(benchmarksForScope(scope));
+  for (const r of posTks) {
+    const tk = String(r.ticker || "");
+    if (tk && matchesMarketScope(tk, scope)) tracked.add(tk);
+  }
+  for (const r of ordTks) {
+    const tk = String(r.ticker || "");
+    if (tk && matchesMarketScope(tk, scope)) tracked.add(tk);
+  }
+  for (const r of bmTks) {
+    const tk = String(r.benchmark_ticker || "");
+    if (tk && matchesMarketScope(tk, scope)) tracked.add(tk);
+  }
 
   const sortedTickers = Array.from(tracked).sort();
   const fetched = await fetchYahooChartQuotes(sortedTickers);
@@ -2204,6 +2604,7 @@ export async function runGlobalDailyPaperRefresh(reqUrl?: string): Promise<{
       existingLive.set(q.ticker, q);
     }
 
+    const usdInrRate = resolveUsdInrRate(existingLive);
     const openRes = await client.query<OrderRow>(
       `SELECT * FROM paper_orders
        WHERE status = 'OPEN' AND order_type = 'LIMIT'
@@ -2213,6 +2614,7 @@ export async function runGlobalDailyPaperRefresh(reqUrl?: string): Promise<{
 
     for (const ord of openRes.rows) {
       const tk = String(ord.ticker);
+      if (!matchesMarketScope(tk, scope)) continue;
       const limPx = Number(ord.limit_price || 0);
       if (limPx <= 0) continue;
 
@@ -2251,6 +2653,7 @@ export async function runGlobalDailyPaperRefresh(reqUrl?: string): Promise<{
           nowIso,
           existingOrderId: String(ord.id),
           releasedReservation: Number(ord.reserved_amount || 0),
+          usdInrRate,
         });
         filledCount += 1;
       } else if (String(ord.side) === "SELL" && q.day_high + 1e-9 >= limPx) {
@@ -2271,6 +2674,7 @@ export async function runGlobalDailyPaperRefresh(reqUrl?: string): Promise<{
             note: String(ord.note || ""),
             nowIso,
             existingOrderId: String(ord.id),
+            usdInrRate,
           });
           filledCount += 1;
         } catch {
@@ -2297,7 +2701,9 @@ export async function runGlobalDailyPaperRefresh(reqUrl?: string): Promise<{
     quotes_updated: toUpsert.length,
     orders_filled: filledCount,
     portfolios_snapshotted: snapshottedCount,
+    market_scope: scope,
     as_of_date: refreshSnapDate,
+    skipped_idle: false,
   };
 }
 
@@ -2305,9 +2711,10 @@ export async function refreshUserPaperQuotesAndOrders(
   user: VerifiedPaperUser,
   portfolioId?: string | null,
   reqUrl?: string,
+  marketScope: PaperMarketScope = "ALL",
 ): Promise<Record<string, unknown>> {
+  const scope = normalizeMarketScope(marketScope);
   const db = resolveDbConnection();
-  const universe = await loadStockUniverse(reqUrl);
   const cleanPfId = (portfolioId ?? "").trim() || null;
 
   if (cleanPfId) {
@@ -2323,27 +2730,59 @@ export async function refreshUserPaperQuotesAndOrders(
   const userPfs = await db.sql<{ id: string; benchmark_ticker: string }>`
     SELECT id, benchmark_ticker FROM paper_portfolios WHERE user_id = ${user.id}
   `;
-  const tracked = new Set<string>(BENCHMARK_SYMBOLS);
-  for (const r of userPfs) {
-    if (r.benchmark_ticker) tracked.add(String(r.benchmark_ticker));
+
+  if (userPfs.length === 0) {
+    const overviewIdle = await getPaperOverview(user, null, reqUrl);
+    const todayStr = utcTodayStr();
+    return {
+      ...overviewIdle,
+      status: "ok",
+      market_scope: scope,
+      quotes_updated: 0,
+      orders_filled: 0,
+      portfolios_snapshotted: 0,
+      filled_orders: [],
+      as_of_date: todayStr,
+      skipped_idle: true,
+      refresh_summary: {
+        market_scope: scope,
+        quotes_updated: 0,
+        orders_filled: 0,
+        portfolios_snapshotted: 0,
+        filled_orders: [],
+        as_of_date: todayStr,
+        skipped_idle: true,
+      },
+    };
   }
 
-  if (userPfs.length > 0) {
-    const [posTks, ordTks] = await Promise.all([
-      db.sql<{ ticker: string }>`
-        SELECT DISTINCT p.ticker
-        FROM paper_positions p
-        JOIN paper_portfolios pf ON pf.id = p.portfolio_id
-        WHERE pf.user_id = ${user.id} AND p.shares > 0
-      `,
-      db.sql<{ ticker: string }>`
-        SELECT DISTINCT ticker
-        FROM paper_orders
-        WHERE user_id = ${user.id} AND status = 'OPEN'
-      `,
-    ]);
-    for (const r of posTks) if (r.ticker) tracked.add(String(r.ticker));
-    for (const r of ordTks) if (r.ticker) tracked.add(String(r.ticker));
+  const universe = await loadStockUniverse(reqUrl);
+  const tracked = new Set<string>(benchmarksForScope(scope));
+  for (const r of userPfs) {
+    const bmSym = String(r.benchmark_ticker || "");
+    if (bmSym && matchesMarketScope(bmSym, scope)) tracked.add(bmSym);
+  }
+
+  const [posTks, ordTks] = await Promise.all([
+    db.sql<{ ticker: string }>`
+      SELECT DISTINCT p.ticker
+      FROM paper_positions p
+      JOIN paper_portfolios pf ON pf.id = p.portfolio_id
+      WHERE pf.user_id = ${user.id} AND p.shares > 0
+    `,
+    db.sql<{ ticker: string }>`
+      SELECT DISTINCT ticker
+      FROM paper_orders
+      WHERE user_id = ${user.id} AND status = 'OPEN'
+    `,
+  ]);
+  for (const r of posTks) {
+    const tk = String(r.ticker || "");
+    if (tk && matchesMarketScope(tk, scope)) tracked.add(tk);
+  }
+  for (const r of ordTks) {
+    const tk = String(r.ticker || "");
+    if (tk && matchesMarketScope(tk, scope)) tracked.add(tk);
   }
 
   const sortedTickers = Array.from(tracked).sort();
@@ -2380,6 +2819,7 @@ export async function refreshUserPaperQuotesAndOrders(
   }
 
   const filledOrders: Record<string, unknown>[] = [];
+  let snapshottedCount = 0;
   const client = await connectPoolClient(db);
   try {
     await client.query("BEGIN");
@@ -2398,6 +2838,7 @@ export async function refreshUserPaperQuotesAndOrders(
       existingLive.set(q.ticker, q);
     }
 
+    const usdInrRate = resolveUsdInrRate(existingLive);
     const openRes = await client.query<OrderRow>(
       `SELECT * FROM paper_orders
        WHERE user_id = $1 AND status = 'OPEN' AND order_type = 'LIMIT'
@@ -2408,6 +2849,7 @@ export async function refreshUserPaperQuotesAndOrders(
 
     for (const ord of openRes.rows) {
       const tk = String(ord.ticker);
+      if (!matchesMarketScope(tk, scope)) continue;
       const limPx = Number(ord.limit_price || 0);
       if (limPx <= 0) continue;
 
@@ -2446,6 +2888,7 @@ export async function refreshUserPaperQuotesAndOrders(
           nowIso,
           existingOrderId: String(ord.id),
           releasedReservation: Number(ord.reserved_amount || 0),
+          usdInrRate,
         });
         filledOrders.push(res.order);
       } else if (String(ord.side) === "SELL" && q.day_high + 1e-9 >= limPx) {
@@ -2466,6 +2909,7 @@ export async function refreshUserPaperQuotesAndOrders(
             note: String(ord.note || ""),
             nowIso,
             existingOrderId: String(ord.id),
+            usdInrRate,
           });
           filledOrders.push(res.order);
         } catch {
@@ -2480,6 +2924,7 @@ export async function refreshUserPaperQuotesAndOrders(
     );
     for (const pf of userPfRows.rows) {
       await recordNavSnapshotInTx(client, universe, pf, existingLive, refreshSnapDate);
+      snapshottedCount += 1;
     }
 
     await client.query("COMMIT");
@@ -2494,15 +2939,21 @@ export async function refreshUserPaperQuotesAndOrders(
   return {
     ...overview,
     status: "ok",
+    market_scope: scope,
     quotes_updated: toUpsert.length,
     orders_filled: filledOrders.length,
+    portfolios_snapshotted: snapshottedCount,
     filled_orders: filledOrders,
     as_of_date: refreshSnapDate,
+    skipped_idle: false,
     refresh_summary: {
+      market_scope: scope,
       quotes_updated: toUpsert.length,
       orders_filled: filledOrders.length,
+      portfolios_snapshotted: snapshottedCount,
       filled_orders: filledOrders,
       as_of_date: refreshSnapDate,
+      skipped_idle: false,
     },
   };
 }

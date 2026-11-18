@@ -6,6 +6,8 @@ import {
   deployPaperBasket,
   depositPaperCash,
   getPaperOverview,
+  getPaperTickerQuote,
+  normalizeMarketScope,
   PaperServiceError,
   placePaperOrder,
   refreshUserPaperQuotesAndOrders,
@@ -134,6 +136,12 @@ export default async (req: Request, context: Context): Promise<Response> => {
       return jsonResponse(overview, 200);
     }
 
+    if (req.method === "GET" && pathname === "/api/paper/quote") {
+      const ticker = url.searchParams.get("ticker");
+      const quotePayload = await getPaperTickerQuote(ticker, req.url);
+      return jsonResponse(quotePayload, 200);
+    }
+
     if (req.method === "POST" && pathname === "/api/paper/portfolios") {
       const body = await parseJsonObjectBody(req, false);
       const created = await createPaperPortfolio(user, body, req.url);
@@ -169,7 +177,8 @@ export default async (req: Request, context: Context): Promise<Response> => {
     if (req.method === "POST" && pathname === "/api/paper/refresh") {
       const body = await parseJsonObjectBody(req, true);
       const portfolioId = typeof body.portfolio_id === "string" ? body.portfolio_id : null;
-      const refreshed = await refreshUserPaperQuotesAndOrders(user, portfolioId, req.url);
+      const marketScope = normalizeMarketScope(body.market_scope);
+      const refreshed = await refreshUserPaperQuotesAndOrders(user, portfolioId, req.url, marketScope);
       return jsonResponse(refreshed, 200);
     }
 

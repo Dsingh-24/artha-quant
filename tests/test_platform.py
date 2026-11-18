@@ -791,7 +791,13 @@ def test_public_snapshot_and_static_frontend_security_invariants() -> None:
     html_raw_ids = re.findall(r'id="([^"]+)"', (root / "static" / "index.html").read_text(encoding="utf-8"))
     assert len(html_raw_ids) == len(set(html_raw_ids)), "Duplicate HTML IDs found in index.html"
     html_ids = set(html_raw_ids)
-    for js_file, min_refs in (("app.js", 90), ("auth_client.js", 15), ("paper_ui.js", 80), ("charts.js", 0)):
+    for js_file, min_refs in (
+        ("app.js", 90),
+        ("auth_client.js", 15),
+        ("paper_ui.js", 80),
+        ("advanced_filters.js", 0),
+        ("charts.js", 0),
+    ):
         js_ids = set(
             re.findall(
                 r'getElementById\(\s*["\']([^"\']+)["\']\s*\)',
@@ -1820,11 +1826,19 @@ const fetch = async (req) => new Response("ok", {{ status: 200, headers: {{ "Cac
     pg_svc_txt = (root / "netlify" / "lib" / "paper-pg-service.mts").read_text(encoding="utf-8")
     paper_api_txt = (root / "netlify" / "functions" / "paper-api.mts").read_text(encoding="utf-8")
     cron_txt = (root / "netlify" / "functions" / "daily-paper-refresh.mts").read_text(encoding="utf-8")
-    for code_txt in (pg_svc_txt, paper_api_txt, cron_txt):
+    nse_cron_txt = (root / "netlify" / "functions" / "nse-close-paper-refresh.mts").read_text(encoding="utf-8")
+    ci_yml_txt = (root / ".github" / "workflows" / "ci-and-deploy.yml").read_text(encoding="utf-8")
+    for code_txt in (pg_svc_txt, paper_api_txt, cron_txt, nse_cron_txt):
         assert "sql.raw" not in code_txt
     assert "verifyRequestOrigin" in paper_api_txt
     assert "getUser(" in paper_api_txt
-    assert 'schedule: "30 21 * * 1-5"' in cron_txt
+    assert 'schedule: "0 22 * * 1-5"' in cron_txt
+    assert 'runGlobalDailyPaperRefresh(undefined, "US")' in cron_txt
+    assert "DST" in cron_txt and "EST" in cron_txt
+    assert 'schedule: "15 10 * * 1-5"' in nse_cron_txt
+    assert 'runGlobalDailyPaperRefresh(undefined, "IN")' in nse_cron_txt
+    assert "IST" in nse_cron_txt and "DST" in nse_cron_txt
+    assert "netlify/functions/nse-close-paper-refresh.mts" in ci_yml_txt
 
     lock_txt = (root / "package-lock.json").read_text(encoding="utf-8")
     lock_json = json.loads(lock_txt)
@@ -1843,3 +1857,885 @@ const fetch = async (req) => new Response("ok", {{ status: 200, headers: {{ "Cac
     _collect_resolved(lock_json, resolved_urls)
     assert len(resolved_urls) >= 50
     assert all(u.startswith("https://registry.npmjs.org/") for u in resolved_urls)
+
+
+def test_v41_smart_hybrid_scoped_refresh_quotes_meta_idle_exit_and_live_fx(tmp_path: Path) -> None:
+    import datetime as dt
+    import re
+    import subprocess
+
+    root = Path(__file__).resolve().parent.parent
+    client, csrf = _authenticated_multimarket_client(tmp_path, force_snapshot_hydration=True)
+    db = client.app.state.db
+    paper_service = client.app.state.paper_service
+
+    # 1. Idle-DB Early Exit: 0 portfolios -> 0 outbound quote fetches across API & scheduled global runner
+    fetch_calls: list[list[str]] = []
+
+    def _spy_idle_fetcher(syms: list[str]) -> dict[str, dict[str, object]]:
+        fetch_calls.append(list(syms))
+        return {}
+
+    client.app.state.quote_fetcher = _spy_idle_fetcher
+    for scope in ("IN", "US", "ALL"):
+        idle_res = client.post("/api/paper/refresh", json={"market_scope": scope}, headers={"X-CSRF-Token": csrf})
+        assert idle_res.status_code == 200
+        idle_body = idle_res.json()
+        assert idle_body["skipped_idle"] is True
+        assert idle_body["quotes_updated"] == 0
+        assert idle_body["orders_filled"] == 0
+        assert idle_body["portfolios_snapshotted"] == 0
+        assert idle_body["market_scope"] == scope
+        assert len(fetch_calls) == 0
+
+        global_idle = paper_service.run_global_daily_paper_refresh(market_scope=scope, quote_fetcher=_spy_idle_fetcher)
+        assert global_idle["skipped_idle"] is True
+        assert global_idle["quotes_updated"] == 0
+        assert global_idle["orders_filled"] == 0
+        assert global_idle["portfolios_snapshotted"] == 0
+        assert global_idle["market_scope"] == scope
+        assert len(fetch_calls) == 0
+
+    # Invalid market_scope rejected cleanly with 400/422
+    bad_scope = client.post("/api/paper/refresh", json={"market_scope": "EU"}, headers={"X-CSRF-Token": csrf})
+    assert bad_scope.status_code in (400, 422)
+
+    # 2. quotes_meta session windows when 0 wallets exist (`active_portfolio is None` -> `relevant_quote_age_seconds is None`)
+    current_clock = [dt.datetime(2026, 11, 18, 6, 0, 0, tzinfo=dt.timezone.utc)]  # Wed 11:30 AM IST (NSE Open)
+    paper_service.now_utc_fn = lambda: current_clock[0]
+
+    ov_empty = client.get("/api/paper/overview").json()
+    assert ov_empty["active_portfolio"] is None
+    assert ov_empty["quotes_meta"]["in_market_open"] is True
+    assert ov_empty["quotes_meta"]["us_market_open"] is False
+    assert ov_empty["quotes_meta"]["recommended_scope"] == "IN"
+    assert ov_empty["quotes_meta"]["relevant_quote_age_seconds"] is None
+    assert ov_empty["fx_usd_inr"] == 93.44
+
+    # 3. Create Hybrid Multi-Market INR Wallet with BOTH Indian & US positions + BOTH Indian & US Buy-on-Dip orders
+    client.app.state.quote_fetcher = None  # Use baseline snapshot prices during initial setup
+    pf_res = client.post(
+        "/api/paper/portfolios",
+        json={
+            "name": "Hybrid Global ₹25L",
+            "currency": "INR",
+            "initial_cash": 2_500_000,
+            "strategy_preset": "qglp_compounder",
+            "benchmark_ticker": "^NSEI",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert pf_res.status_code == 200
+    pf_id = pf_res.json()["created_portfolio_id"]
+
+    # Hold 10 shares of TCS.NS (Indian) and 5 shares of MSFT (US)
+    assert (
+        client.post(
+            "/api/paper/orders",
+            json={"portfolio_id": pf_id, "ticker": "TCS.NS", "side": "BUY", "order_type": "MARKET", "shares": 10},
+            headers={"X-CSRF-Token": csrf},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/paper/orders",
+            json={"portfolio_id": pf_id, "ticker": "MSFT", "side": "BUY", "order_type": "MARKET", "shares": 5},
+            headers={"X-CSRF-Token": csrf},
+        ).status_code
+        == 200
+    )
+
+    icici_base = round(float(db.get_latest_price_row("ICICIBANK.NS")["close_price"]), 2)
+    aapl_base = round(float(db.get_latest_price_row("AAPL")["close_price"]), 2)
+    nsei_base = round(float(db.get_latest_price_row("^NSEI")["close_price"]), 2)
+    gspc_base = round(float(db.get_latest_price_row("^GSPC")["close_price"]), 2)
+    ndx_base = round(float(db.get_latest_price_row("^NDX")["close_price"]), 2)
+    tcs_base = round(float(db.get_latest_price_row("TCS.NS")["close_price"]), 2)
+    msft_base = round(float(db.get_latest_price_row("MSFT")["close_price"]), 2)
+
+    icici_lim = round(icici_base * 0.93, 2)
+    aapl_lim = round(aapl_base * 0.93, 2)
+
+    dip_in = client.post(
+        "/api/paper/orders",
+        json={
+            "portfolio_id": pf_id,
+            "ticker": "ICICIBANK.NS",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "shares": 25,
+            "limit_price": icici_lim,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert dip_in.status_code == 200
+    ord_icici_id = dip_in.json()["order"]["id"]
+
+    dip_us = client.post(
+        "/api/paper/orders",
+        json={
+            "portfolio_id": pf_id,
+            "ticker": "AAPL",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "shares": 8,
+            "limit_price": aapl_lim,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert dip_us.status_code == 200
+    ord_aapl_id = dip_us.json()["order"]["id"]
+    aapl_reserved = dip_us.json()["order"]["reserved_amount"]
+
+    # Before any live quotes exist during NSE Open: relevant_quote_age_seconds == 999999 (unquoted sentinel)
+    ov_pre = client.get(f"/api/paper/overview?portfolio_id={pf_id}").json()
+    assert ov_pre["quotes_meta"]["in_market_open"] is True
+    assert ov_pre["quotes_meta"]["us_market_open"] is False
+    assert ov_pre["quotes_meta"]["recommended_scope"] == "IN"
+    assert ov_pre["quotes_meta"]["relevant_quote_age_seconds"] == 999999
+    assert ov_pre["active_portfolio"]["quotes_meta"] == ov_pre["quotes_meta"]
+
+    # Pre-seed AAPL in paper_live_quotes with day_low ALREADY below aapl_lim to prove market_scope="IN" NEVER touches US orders!
+    db.upsert_paper_live_quotes(
+        [
+            {
+                "ticker": "AAPL",
+                "close_price": round(aapl_lim * 0.98, 2),
+                "day_low": round(aapl_lim * 0.96, 2),
+                "day_high": aapl_base,
+                "trade_date": "2026-11-18",
+                "updated_at": "2026-11-18T05:00:00Z",
+            }
+        ]
+    )
+
+    # 4. Market-Scoped Refresh #1 (`market_scope="IN"`): ONLY fetches Indian .NS + ^NSEI (+ USDINR=X) & ONLY fills Indian orders!
+    in_fetch_batches: list[list[str]] = []
+
+    def _in_scope_fetcher(syms: list[str]) -> dict[str, dict[str, object]]:
+        in_fetch_batches.append(list(syms))
+        return {
+            "ICICIBANK.NS": {
+                "close_price": round(icici_lim * 0.99, 2),
+                "day_low": round(icici_lim * 0.97, 2),
+                "day_high": icici_base,
+                "trade_date": "2026-11-18",
+            },
+            "TCS.NS": {
+                "close_price": round(tcs_base * 1.02, 2),
+                "day_low": tcs_base,
+                "day_high": round(tcs_base * 1.03, 2),
+                "trade_date": "2026-11-18",
+            },
+            "^NSEI": {
+                "close_price": round(nsei_base * 1.01, 2),
+                "day_low": nsei_base,
+                "day_high": round(nsei_base * 1.015, 2),
+                "trade_date": "2026-11-18",
+            },
+            "USDINR=X": {
+                "close_price": 93.44,
+                "day_low": 93.20,
+                "day_high": 93.60,
+                "trade_date": "2026-11-18",
+            },
+        }
+
+    client.app.state.quote_fetcher = _in_scope_fetcher
+    ref_in = client.post(
+        "/api/paper/refresh",
+        json={"portfolio_id": pf_id, "market_scope": "IN"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert ref_in.status_code == 200
+    r_in = ref_in.json()
+    assert len(in_fetch_batches) == 1
+    assert set(in_fetch_batches[0]) == {"ICICIBANK.NS", "TCS.NS", "^NSEI", "USDINR=X"}
+    assert all(tk not in in_fetch_batches[0] for tk in ("AAPL", "MSFT", "^GSPC", "^NDX"))
+
+    # Indian order filled; US AAPL order MUST remain OPEN with exact reserved_amount preserved!
+    assert r_in["market_scope"] == "IN"
+    assert r_in["orders_filled"] == 1
+    assert [o["id"] for o in r_in["filled_orders"]] == [ord_icici_id]
+    open_after_in = r_in["active_portfolio"]["open_orders"]
+    assert len(open_after_in) == 1
+    assert open_after_in[0]["id"] == ord_aapl_id
+    assert open_after_in[0]["ticker"] == "AAPL"
+    assert open_after_in[0]["status"] == "OPEN"
+    assert r_in["active_portfolio"]["reserved_cash"] == aapl_reserved
+
+    # Advance NSE session clock by +180s (fresh < 300s) then +375s (stale >= 300s)
+    current_clock[0] = dt.datetime(2026, 11, 18, 6, 3, 0, tzinfo=dt.timezone.utc)
+    ov_in_fresh = client.get(f"/api/paper/overview?portfolio_id={pf_id}").json()
+    assert ov_in_fresh["quotes_meta"]["recommended_scope"] == "IN"
+    assert ov_in_fresh["quotes_meta"]["relevant_quote_age_seconds"] == 180
+    assert ov_in_fresh["quotes_meta"]["latest_quote_updated_at"] == "2026-11-18T06:00:00Z"
+
+    current_clock[0] = dt.datetime(2026, 11, 18, 6, 6, 15, tzinfo=dt.timezone.utc)
+    ov_in_stale = client.get(f"/api/paper/overview?portfolio_id={pf_id}").json()
+    assert ov_in_stale["quotes_meta"]["relevant_quote_age_seconds"] == 375
+
+    # 5. Queue a new Indian Buy-on-Dip order on INFY.NS and pre-seed triggered low to prove market_scope="US" leaves IN untouched!
+    infy_base = round(float(db.get_latest_price_row("INFY.NS")["close_price"]), 2)
+    infy_lim = round(infy_base * 0.93, 2)
+    dip_infy = client.post(
+        "/api/paper/orders",
+        json={
+            "portfolio_id": pf_id,
+            "ticker": "INFY.NS",
+            "side": "BUY",
+            "order_type": "LIMIT",
+            "shares": 20,
+            "limit_price": infy_lim,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert dip_infy.status_code == 200
+    ord_infy_id = dip_infy.json()["order"]["id"]
+    infy_reserved = dip_infy.json()["order"]["reserved_amount"]
+
+    db.upsert_paper_live_quotes(
+        [
+            {
+                "ticker": "INFY.NS",
+                "close_price": round(infy_lim * 0.98, 2),
+                "day_low": round(infy_lim * 0.96, 2),
+                "day_high": infy_base,
+                "trade_date": "2026-11-18",
+                "updated_at": "2026-11-18T10:15:00Z",
+            }
+        ]
+    )
+
+    # Switch clock to US Market Open (Wed 15:00 UTC = 10:00 AM EST)
+    current_clock[0] = dt.datetime(2026, 11, 18, 15, 0, 0, tzinfo=dt.timezone.utc)
+    ov_us_pre = client.get(f"/api/paper/overview?portfolio_id={pf_id}").json()
+    assert ov_us_pre["quotes_meta"]["in_market_open"] is False
+    assert ov_us_pre["quotes_meta"]["us_market_open"] is True
+    assert ov_us_pre["quotes_meta"]["recommended_scope"] == "US"
+    # MSFT (held US position) has never been live-quoted yet -> sentinel 999999
+    assert ov_us_pre["quotes_meta"]["relevant_quote_age_seconds"] == 999999
+
+    # Market-Scoped Refresh #2 (`market_scope="US"`): ONLY fetches US tickers + ^GSPC/^NDX/USDINR=X & ONLY fills US orders!
+    us_fetch_batches: list[list[str]] = []
+
+    def _us_scope_fetcher(syms: list[str]) -> dict[str, dict[str, object]]:
+        us_fetch_batches.append(list(syms))
+        return {
+            "AAPL": {
+                "close_price": round(aapl_lim * 0.99, 2),
+                "day_low": round(aapl_lim * 0.97, 2),
+                "day_high": aapl_base,
+                "trade_date": "2026-11-18",
+            },
+            "MSFT": {
+                "close_price": round(msft_base * 1.03, 2),
+                "day_low": msft_base,
+                "day_high": round(msft_base * 1.04, 2),
+                "trade_date": "2026-11-18",
+            },
+            "^GSPC": {
+                "close_price": round(gspc_base * 1.01, 2),
+                "day_low": gspc_base,
+                "day_high": round(gspc_base * 1.012, 2),
+                "trade_date": "2026-11-18",
+            },
+            "^NDX": {
+                "close_price": round(ndx_base * 1.015, 2),
+                "day_low": ndx_base,
+                "day_high": round(ndx_base * 1.02, 2),
+                "trade_date": "2026-11-18",
+            },
+            "USDINR=X": {
+                "close_price": 93.44,
+                "day_low": 93.30,
+                "day_high": 93.55,
+                "trade_date": "2026-11-18",
+            },
+        }
+
+    client.app.state.quote_fetcher = _us_scope_fetcher
+    ref_us = client.post(
+        "/api/paper/refresh",
+        json={"portfolio_id": pf_id, "market_scope": "US"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert ref_us.status_code == 200
+    r_us = ref_us.json()
+    assert len(us_fetch_batches) == 1
+    assert set(us_fetch_batches[0]) == {"AAPL", "MSFT", "^GSPC", "^NDX", "USDINR=X"}
+    assert all(not tk.endswith(".NS") and tk != "^NSEI" for tk in us_fetch_batches[0])
+
+    # US AAPL order filled; Indian INFY.NS order MUST remain OPEN with exact reserved_amount preserved!
+    assert r_us["market_scope"] == "US"
+    assert r_us["orders_filled"] == 1
+    assert [o["id"] for o in r_us["filled_orders"]] == [ord_aapl_id]
+    open_after_us = r_us["active_portfolio"]["open_orders"]
+    assert len(open_after_us) == 1
+    assert open_after_us[0]["id"] == ord_infy_id
+    assert open_after_us[0]["ticker"] == "INFY.NS"
+    assert open_after_us[0]["status"] == "OPEN"
+    assert r_us["active_portfolio"]["reserved_cash"] == infy_reserved
+
+    # Advance US session clock by +120s -> relevant_quote_age_seconds == 120
+    current_clock[0] = dt.datetime(2026, 11, 18, 15, 2, 0, tzinfo=dt.timezone.utc)
+    ov_us_fresh = client.get(f"/api/paper/overview?portfolio_id={pf_id}").json()
+    assert ov_us_fresh["quotes_meta"]["recommended_scope"] == "US"
+    assert ov_us_fresh["quotes_meta"]["relevant_quote_age_seconds"] == 120
+
+    # Verify Markets Closed windows (after-hours Wed 22:30 UTC & weekend Sat 06:00 UTC -> recommended_scope == "NONE", age is None)
+    for closed_dt in (
+        dt.datetime(2026, 11, 18, 22, 30, 0, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 11, 21, 6, 0, 0, tzinfo=dt.timezone.utc),
+    ):
+        current_clock[0] = closed_dt
+        ov_closed = client.get(f"/api/paper/overview?portfolio_id={pf_id}").json()
+        assert ov_closed["quotes_meta"]["in_market_open"] is False
+        assert ov_closed["quotes_meta"]["us_market_open"] is False
+        assert ov_closed["quotes_meta"]["recommended_scope"] == "NONE"
+        assert ov_closed["quotes_meta"]["relevant_quote_age_seconds"] is None
+
+    # 6. Live Quote Endpoint (`GET /api/paper/quote?ticker=...`) & Dynamic `USDINR=X` FX (`!= 84.5`) + Unheld Market Fill
+    anon_client = TestClient(client.app, base_url="https://127.0.0.1:8000")
+    assert anon_client.get("/api/paper/quote?ticker=MU").status_code == 401
+    for bad_tk in ("", "NOT_IN_UNIVERSE", "MU; DROP TABLE paper_live_quotes;--"):
+        assert client.get(f"/api/paper/quote?ticker={bad_tk}").status_code == 400
+
+    # Advance clock > 300s so USDINR=X and unheld tickers MU / NVDA refresh dynamically at live USDINR=X = 94.20
+    current_clock[0] = dt.datetime(2026, 11, 18, 16, 15, 0, tzinfo=dt.timezone.utc)
+    live_quote_calls: list[list[str]] = []
+
+    def _live_fx_quote_fetcher(syms: list[str]) -> dict[str, dict[str, object]]:
+        live_quote_calls.append(list(syms))
+        out_q: dict[str, dict[str, object]] = {
+            "USDINR=X": {
+                "close_price": 94.20,
+                "day_low": 93.90,
+                "day_high": 94.35,
+                "trade_date": "2026-11-18",
+            }
+        }
+        if "MU" in syms:
+            out_q["MU"] = {
+                "close_price": 712.42,
+                "day_low": 705.10,
+                "day_high": 719.80,
+                "trade_date": "2026-11-18",
+            }
+        if "NVDA" in syms:
+            out_q["NVDA"] = {
+                "close_price": 148.50,
+                "day_low": 146.20,
+                "day_high": 150.10,
+                "trade_date": "2026-11-18",
+            }
+        return out_q
+
+    client.app.state.quote_fetcher = _live_fx_quote_fetcher
+    q_mu = client.get("/api/paper/quote?ticker=MU")
+    assert q_mu.status_code == 200
+    q_mu_body = q_mu.json()
+    assert q_mu_body["ticker"] == "MU"
+    assert q_mu_body["close_price"] == 712.42
+    assert q_mu_body["live_price"] == 712.42
+    assert q_mu_body["day_low"] == 705.10
+    assert q_mu_body["day_high"] == 719.80
+    assert q_mu_body["native_currency"] == "USD"
+    assert q_mu_body["fx_usd_inr"] == 94.20
+    assert q_mu_body["fx_usd_inr"] != 84.5
+
+    # Verify overview reflects the updated live USDINR=X (94.20)
+    ov_fx = client.get(f"/api/paper/overview?portfolio_id={pf_id}").json()
+    assert ov_fx["fx_usd_inr"] == 94.20
+    assert ov_fx["active_portfolio"]["fx_usd_inr"] == 94.20
+    cash_before_nvda = ov_fx["active_portfolio"]["cash_balance"]
+
+    # Place cross-currency MARKET BUY on unheld NVDA in INR wallet -> auto-refreshes NVDA ($148.50) & fills at FX 94.20!
+    nvda_sh = 3
+    nvda_buy = client.post(
+        "/api/paper/orders",
+        json={
+            "portfolio_id": pf_id,
+            "ticker": "NVDA",
+            "side": "BUY",
+            "order_type": "MARKET",
+            "shares": nvda_sh,
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert nvda_buy.status_code == 200
+    nvda_trd = nvda_buy.json()["trade"]
+    assert nvda_trd["exec_price_native"] == 148.50
+    assert nvda_trd["fx_rate"] == 94.20
+    exp_nvda_gross = round(nvda_sh * 148.50 * 94.20, 2)
+    exp_nvda_fee = round(exp_nvda_gross * 0.0025, 2)
+    exp_nvda_debit = round(exp_nvda_gross + exp_nvda_fee, 2)
+    assert nvda_trd["gross_amount"] == exp_nvda_gross
+    assert nvda_trd["fee_amount"] == exp_nvda_fee
+    assert nvda_trd["net_amount"] == exp_nvda_debit
+    assert nvda_buy.json()["active_portfolio"]["cash_balance"] == round(cash_before_nvda - exp_nvda_debit, 2)
+
+    # 7. Zero hardcoded 84.5 FX remaining & esbuild verification on Dual Scheduled Crons
+    for rel_file in (
+        "app/paper_trading.py",
+        "app/planner.py",
+        "netlify/lib/paper-pg-service.mts",
+        "netlify/functions/paper-api.mts",
+        "static/paper_ui.js",
+        "static/standalone_engine.js",
+        "static/advanced_filters.js",
+        "static/app.js",
+    ):
+        txt = (root / rel_file).read_text(encoding="utf-8")
+        assert not re.search(r"\b84\.50?\b", txt), f"Hardcoded 84.5 FX found in {rel_file}"
+
+    paper_ui_txt = (root / "static" / "paper_ui.js").read_text(encoding="utf-8")
+    index_html_txt = (root / "static" / "index.html").read_text(encoding="utf-8")
+    assert 'id="paper-session-pill"' in index_html_txt
+    assert "maybeTriggerSmartAutoRefresh" in paper_ui_txt
+    assert "/api/paper/quote?ticker=" in paper_ui_txt
+    assert 'market_scope: "ALL"' in paper_ui_txt
+
+    esbuild_bin = root / "node_modules" / ".bin" / "esbuild"
+    if esbuild_bin.exists():
+        for fn_rel, out_name in (
+            ("netlify/functions/nse-close-paper-refresh.mts", "nse_cron_bundle.mjs"),
+            ("netlify/functions/daily-paper-refresh.mts", "us_cron_bundle.mjs"),
+            ("netlify/functions/paper-api.mts", "paper_api_bundle.mjs"),
+        ):
+            out_file = tmp_path / out_name
+            subprocess.run(
+                [
+                    str(esbuild_bin),
+                    str(root / fn_rel),
+                    "--bundle",
+                    "--platform=node",
+                    "--format=esm",
+                    "--target=node22",
+                    "--external:@netlify/database",
+                    "--external:pg",
+                    f"--outfile={out_file}",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            assert out_file.exists() and out_file.stat().st_size > 1000
+
+
+def test_v50_calm_ui_advanced_filters_and_subtabs(tmp_path: Path) -> None:
+    import json
+    import re
+    import shutil
+    import subprocess
+    from html.parser import HTMLParser
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    index_html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    paper_ui_js = (root / "static" / "paper_ui.js").read_text(encoding="utf-8")
+    adv_filters_js = (root / "static" / "advanced_filters.js").read_text(encoding="utf-8")
+
+    # 1. Verify calm V5.0 progressive-disclosure landmarks & 4-sub-tab Paper Wallet structure in static/index.html
+    class _LandmarkParser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.by_id: dict[str, dict[str, object]] = {}
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            attr_map = {k: (v if v is not None else "") for k, v in attrs}
+            el_id = attr_map.get("id")
+            if el_id:
+                classes = set(attr_map.get("class", "").split())
+                self.by_id[el_id] = {"tag": tag, "attrs": attr_map, "classes": classes}
+
+    parser = _LandmarkParser()
+    parser.feed(index_html)
+    by_id = parser.by_id
+
+    # Screener calm command bar + progressive-disclosure drawers hidden by default
+    assert "toggle-adv-filters-btn" in by_id
+    assert by_id["toggle-adv-filters-btn"]["attrs"].get("aria-expanded") == "false"
+    assert "hidden" in by_id["adv-filters-count-badge"]["classes"]
+    assert "hidden" in by_id["active-filter-chips-bar"]["classes"]
+    assert "hidden" in by_id["adv-filters-drawer"]["classes"]
+    assert "hidden" in by_id["podium-section"]["classes"]
+    assert "hidden" in by_id["screener-pagination-bar"]["classes"]
+    assert "checked" not in by_id["af-show-podium"]["attrs"]
+
+    # All 4 Advanced Filter group controls + reset button present in index.html
+    for af_id in (
+        "af-val-zone",
+        "af-max-pe",
+        "af-min-roce",
+        "af-max-de",
+        "af-min-growth",
+        "af-archetype",
+        "af-zero-flags",
+        "af-street",
+        "af-52w",
+        "af-cap-tier",
+        "af-above-200dma",
+        "af-reset-btn",
+    ):
+        assert af_id in by_id, f"Missing V5.0 advanced filter control #{af_id}"
+
+    # Planner & Backtest progressive-disclosure drawers hidden by default
+    assert "toggle-pl-adv-btn" in by_id
+    assert "hidden" in by_id["pl-adv-drawer"]["classes"]
+    assert "toggle-bt-adv-btn" in by_id
+    assert "hidden" in by_id["bt-adv-drawer"]["classes"]
+
+    # Paper Wallet 4-sub-tab bar & corresponding panes (Positions active/visible by default; others hidden)
+    assert "paper-subtab-bar" in by_id
+    assert by_id["paper-subtab-bar"]["attrs"].get("role") == "tablist"
+    expected_subtabs = (
+        ("paper-subtab-positions", "positions", True, "paper-pane-positions", False),
+        ("paper-subtab-orders", "orders", False, "paper-pane-orders", True),
+        ("paper-subtab-trades", "trades", False, "paper-pane-trades", True),
+        ("paper-subtab-attribution", "attribution", False, "paper-pane-attribution", True),
+    )
+    for btn_id, data_key, is_active, pane_id, pane_hidden in expected_subtabs:
+        assert btn_id in by_id and pane_id in by_id
+        assert by_id[btn_id]["attrs"].get("data-paper-subtab") == data_key
+        assert ("active" in by_id[btn_id]["classes"]) is is_active
+        assert ("hidden" in by_id[pane_id]["classes"]) is pane_hidden
+
+    for count_pill_id in ("paper-positions-count-pill", "paper-orders-count-pill", "paper-trades-count-pill"):
+        assert count_pill_id in by_id
+
+    # Verify Deep-Dive 3-sub-tab bar & Paper 4-sub-tab controller wiring in app.js / paper_ui.js
+    assert "dd-subtab-bar" in app_js
+    for dd_lbl in ('"Overview"', '"Score & Ratios"', '"Financials & Street"'):
+        assert dd_lbl in app_js
+    assert "export function setPaperSubtab(" in paper_ui_js
+
+    # 2. Execute static/advanced_filters.js + standalone_engine.js against 702-stock market_snapshot.json in WebKit jsc (or Node in Linux CI)
+    jsc_bin = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc")
+    node_bin = shutil.which("node")
+    if not jsc_bin.exists() and not node_bin:
+        pytest.skip("Neither WebKit JavaScriptCore (jsc) nor Node.js available on this host")
+
+    eng_stripped = re.sub(
+        r"^export\s+",
+        "",
+        (root / "static" / "standalone_engine.js").read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
+    )
+    af_stripped = re.sub(r"^export\s+", "", adv_filters_js, flags=re.MULTILINE)
+    snap_str = str((root / "static" / "data" / "market_snapshot.json").resolve())
+
+    runtime_prelude = (
+        ""
+        if jsc_bin.exists()
+        else 'const fs = require("node:fs"); const readFile = (p) => fs.readFileSync(p, "utf-8"); const print = console.log; const quit = (c) => process.exit(c);'
+    )
+
+    driver = f"""
+{runtime_prelude}
+const window = {{
+  fetch: async (_url) => ({{
+    ok: true,
+    json: async () => JSON.parse(readFile({json.dumps(snap_str)})),
+  }}),
+}};
+{eng_stripped}
+{af_stripped}
+
+(async () => {{
+  const res = await runScreenerSnapshot({{
+    preset: "qglp_compounder",
+    sector: "ALL",
+    min_score: 0,
+    market: "ALL",
+  }});
+  const stocks = res.stocks;
+  const s1Map = new Map();
+  for (const r of res.stage1_funnel) {{
+    if (r && r.ticker) s1Map.set(r.ticker, r);
+  }}
+
+  const runFilter = (flt) => stocks.filter((s) => matchesAdvancedFilters(s, flt, s1Map));
+
+  // Verify default state matches 100% of the 702-stock universe
+  const baseMatches = runFilter(DEFAULT_ADV_FILTERS);
+  if (baseMatches.length !== stocks.length) {{
+    throw new Error("DEFAULT_ADV_FILTERS altered universe size: " + baseMatches.length + " vs " + stocks.length);
+  }}
+  if (countActiveAdvFilters(DEFAULT_ADV_FILTERS) !== 0) {{
+    throw new Error("Expected 0 active filters on DEFAULT_ADV_FILTERS");
+  }}
+  if (describeActiveFilterChips(DEFAULT_ADV_FILTERS).length !== 0) {{
+    throw new Error("Expected 0 filter chips on DEFAULT_ADV_FILTERS");
+  }}
+
+  // Group 1: Valuation & Quality
+  const g1Under = runFilter({{ valZone: "UNDERVALUED" }});
+  const g1Fair = runFilter({{ valZone: "FAIR_OR_BETTER" }});
+  const g1NotExp = runFilter({{ valZone: "NOT_EXPENSIVE" }});
+  const g1MaxPe25 = runFilter({{ maxPe: "25" }});
+  const g1MinRoce20 = runFilter({{ minRoce: "20" }});
+  const g1MaxDe05 = runFilter({{ maxDe: "0.5" }});
+  const g1MaxDe01 = runFilter({{ maxDe: "0.1" }});
+
+  for (const s of g1Under) {{
+    const z = String(s.valuation_zone || "").toLowerCase();
+    const pe = Number(s.metrics.pe_ratio ?? 0);
+    const fairPe = Number(s.metrics.fair_pe_ratio ?? s.metrics.fair_pe ?? 0);
+    if (!isProfitableWithValidPe(s)) {{
+      throw new Error("Unprofitable stock leaked into UNDERVALUED: " + s.ticker);
+    }}
+    if (!(z.includes("undervalued") || (fairPe > 0 && pe > 0 && pe < 99 && pe <= fairPe * 0.92))) {{
+      throw new Error("Invalid UNDERVALUED match: " + s.ticker);
+    }}
+  }}
+  for (const s of g1MaxPe25) {{
+    const pe = Number(s.metrics.pe_ratio ?? 0);
+    if (!isProfitableWithValidPe(s) || pe <= 0 || pe > 25 || pe >= 99) {{
+      throw new Error("Invalid maxPe=25 match on " + s.ticker + " pe=" + pe);
+    }}
+  }}
+  for (const s of g1MinRoce20) {{
+    if (effectiveRoceOrRoe(s) < 20) {{
+      throw new Error("Invalid minRoce=20 match on " + s.ticker);
+    }}
+  }}
+  for (const s of g1MaxDe05) {{
+    const de = Number(s.metrics.debt_to_equity ?? 0);
+    if (!Number.isFinite(de) || de < 0 || de > 0.5) {{
+      throw new Error("Invalid maxDe=0.5 match on " + s.ticker + " de=" + de);
+    }}
+  }}
+  if (g1MaxDe01.some((s) => Boolean(s.is_financial))) {{
+    throw new Error("Financial lender leaked into debt-free maxDe=0.1 filter");
+  }}
+
+  // Group 2: Growth & Safety
+  const g2Growth15 = runFilter({{ minGrowth: "15" }});
+  const g2ZeroFlags = runFilter({{ zeroFlags: true }});
+  const uniqueArchetypes = extractUniqueArchetypes(stocks);
+  const g2Compounders = runFilter({{ archetype: "Cash-Rich Compounder" }});
+  const g2Buybacks = runFilter({{ archetype: "buyback_compounder" }});
+
+  for (const s of g2Growth15) {{
+    const best3y = Math.max(Number(s.metrics.rev_cagr_3y_pct ?? -999), Number(s.metrics.pat_cagr_3y_pct ?? -999));
+    if (best3y < 15) {{
+      throw new Error("Invalid minGrowth=15 match on " + s.ticker + ": " + best3y);
+    }}
+  }}
+  for (const s of g2ZeroFlags) {{
+    if ((s.red_flags || []).length !== 0) {{
+      throw new Error("Red-flagged stock leaked into zeroFlags: " + s.ticker);
+    }}
+  }}
+  for (const s of g2Compounders) {{
+    if (s.plain_english.archetype_label !== "Cash-Rich Compounder") {{
+      throw new Error("Archetype label mismatch on " + s.ticker);
+    }}
+  }}
+  for (const s of g2Buybacks) {{
+    if (s.plain_english.archetype_code !== "buyback_compounder") {{
+      throw new Error("Archetype code mismatch on " + s.ticker);
+    }}
+  }}
+
+  // Group 3: Street Consensus
+  const g3Upside10 = runFilter({{ street: "UPSIDE_10" }});
+  const g3BullishRev = runFilter({{ street: "BULLISH_REV" }});
+  const g3StrongCons = runFilter({{ street: "STRONG_CONSENSUS" }});
+
+  for (const s of g3Upside10) {{
+    if (s.street.has_coverage === false || Number(s.street.target_upside_pct ?? -999) < 10) {{
+      throw new Error("Invalid UPSIDE_10 match on " + s.ticker);
+    }}
+  }}
+  for (const s of g3BullishRev) {{
+    const st = s.street || {{}};
+    const breadth = Number(st.rev_breadth_pct || 0);
+    const up = Number(st.eps_rev_up_30d || st.eps_rev_up_90d || 0);
+    const dn = Number(st.eps_rev_down_30d || st.eps_rev_down_90d || 0);
+    if (!(breadth > 0 || up > dn)) {{
+      throw new Error("Invalid BULLISH_REV match on " + s.ticker);
+    }}
+  }}
+  for (const s of g3StrongCons) {{
+    const st = s.street || {{}};
+    if (Number(st.consensus_buy_pct || 0) < 70 || Number(st.analyst_count || 0) < 3) {{
+      throw new Error("Invalid STRONG_CONSENSUS match on " + s.ticker);
+    }}
+  }}
+
+  // Group 4: Technicals & Cap Tier
+  const g4NearHigh = runFilter({{ range52w: "NEAR_HIGH" }});
+  const g4Dip1025 = runFilter({{ range52w: "DIP_10_25" }});
+  const g4DeepDip25 = runFilter({{ range52w: "DEEP_DIP_25" }});
+  const g4Above200 = runFilter({{ above200Dma: true }});
+  const g4MegaLarge = runFilter({{ capTier: "MEGA_LARGE" }});
+  const g4Mid = runFilter({{ capTier: "MID" }});
+
+  const nearSet = new Set(g4NearHigh.map((s) => s.ticker));
+  for (const s of g4NearHigh) {{
+    const d = Number(s1Map.get(s.ticker).dist_52w_high_pct);
+    if (!(d >= -10)) throw new Error("Invalid NEAR_HIGH dist on " + s.ticker + ": " + d);
+  }}
+  for (const s of g4Dip1025) {{
+    if (nearSet.has(s.ticker)) throw new Error("Overlap between NEAR_HIGH and DIP_10_25 on " + s.ticker);
+    const d = Number(s1Map.get(s.ticker).dist_52w_high_pct);
+    if (!(d < -10 && d >= -25)) throw new Error("Invalid DIP_10_25 dist on " + s.ticker + ": " + d);
+  }}
+  for (const s of g4Above200) {{
+    if (Boolean(s1Map.get(s.ticker).above_200dma) !== true) {{
+      throw new Error("Stock below 200-DMA leaked into above200Dma: " + s.ticker);
+    }}
+  }}
+  for (const s of g4MegaLarge) {{
+    const ct = String(s.cap_tier || "");
+    if (!(ct.includes("Mega") || ct.includes("Large"))) {{
+      throw new Error("Invalid MEGA_LARGE cap_tier on " + s.ticker + ": " + ct);
+    }}
+  }}
+  for (const s of g4Mid) {{
+    const ct = String(s.cap_tier || "");
+    if (!(ct.includes("Mid") || ct.includes("Small") || ct.includes("Emerging"))) {{
+      throw new Error("Invalid MID cap_tier on " + s.ticker + ": " + ct);
+    }}
+  }}
+
+  // Combined 4-Group High-Conviction Filter + countActiveAdvFilters + describeActiveFilterChips
+  const multiFilter = {{
+    valZone: "FAIR_OR_BETTER",
+    maxPe: "35",
+    minRoce: "15",
+    maxDe: "0.5",
+    minGrowth: "10",
+    archetype: "Cash-Rich Compounder",
+    zeroFlags: true,
+    street: "UPSIDE_10",
+    range52w: "NEAR_HIGH",
+    capTier: "MEGA_LARGE",
+    above200Dma: true,
+  }};
+  const multiActiveCount = countActiveAdvFilters(multiFilter);
+  const multiChips = describeActiveFilterChips(multiFilter);
+  const combinedSubset = runFilter({{
+    maxPe: "35",
+    minRoce: "15",
+    zeroFlags: true,
+    street: "UPSIDE_10",
+    above200Dma: true,
+  }});
+
+  // Deterministic Sorting: upside, roce, pe_asc
+  const sortedUpside = sortFilteredStocks(stocks, "upside", s1Map);
+  const sortedUpside2 = sortFilteredStocks(stocks, "upside", s1Map);
+  if (JSON.stringify(sortedUpside.map((s) => s.ticker)) !== JSON.stringify(sortedUpside2.map((s) => s.ticker))) {{
+    throw new Error("Non-deterministic upside sort");
+  }}
+  for (let i = 1; i < sortedUpside.length; i++) {{
+    const aSt = sortedUpside[i - 1].street || {{}};
+    const bSt = sortedUpside[i].street || {{}};
+    const aU = aSt.has_coverage === false && Number(aSt.target_upside_pct || 0) === 0 ? -9999 : Number(aSt.target_upside_pct);
+    const bU = bSt.has_coverage === false && Number(bSt.target_upside_pct || 0) === 0 ? -9999 : Number(bSt.target_upside_pct);
+    if (bU > aU + 1e-9) throw new Error("Upside sort order violated at index " + i);
+  }}
+
+  const sortedRoce = sortFilteredStocks(stocks, "roce", s1Map);
+  for (let i = 1; i < sortedRoce.length; i++) {{
+    if (effectiveRoceOrRoe(sortedRoce[i]) > effectiveRoceOrRoe(sortedRoce[i - 1]) + 1e-9) {{
+      throw new Error("ROCE/ROE sort order violated at index " + i);
+    }}
+  }}
+
+  const sortedPeAsc = sortFilteredStocks(stocks, "pe_asc", s1Map);
+  let enteredInvalidTail = false;
+  let validPeCount = 0;
+  for (let i = 0; i < sortedPeAsc.length; i++) {{
+    const valid = isProfitableWithValidPe(sortedPeAsc[i]);
+    if (!valid) {{
+      enteredInvalidTail = true;
+    }} else {{
+      validPeCount += 1;
+      if (enteredInvalidTail) {{
+        throw new Error("Valid profitable P/E stock sorted after unprofitable stock at index " + i);
+      }}
+      if (i > 0 && sortedPeAsc[i].metrics.pe_ratio + 1e-9 < sortedPeAsc[i - 1].metrics.pe_ratio) {{
+        throw new Error("pe_asc sort order violated at index " + i);
+      }}
+    }}
+  }}
+
+  print("__V50_JSON__" + JSON.stringify({{
+    total: stocks.length,
+    archetypeCount: uniqueArchetypes.length,
+    counts: {{
+      undervalued: g1Under.length,
+      fairOrBetter: g1Fair.length,
+      notExpensive: g1NotExp.length,
+      maxPe25: g1MaxPe25.length,
+      minRoce20: g1MinRoce20.length,
+      maxDe05: g1MaxDe05.length,
+      minGrowth15: g2Growth15.length,
+      zeroFlags: g2ZeroFlags.length,
+      compounders: g2Compounders.length,
+      buybacks: g2Buybacks.length,
+      upside10: g3Upside10.length,
+      bullishRev: g3BullishRev.length,
+      strongCons: g3StrongCons.length,
+      nearHigh: g4NearHigh.length,
+      dip1025: g4Dip1025.length,
+      deepDip25: g4DeepDip25.length,
+      above200: g4Above200.length,
+      megaLarge: g4MegaLarge.length,
+      mid: g4Mid.length,
+      combinedSubset: combinedSubset.length,
+      validPeCount,
+    }},
+    multiActiveCount,
+    chipKeys: multiChips.map((c) => c.key),
+    topPeTicker: sortedPeAsc[0].ticker,
+    topPeRatio: sortedPeAsc[0].metrics.pe_ratio,
+    tailInvalidPeRatio: sortedPeAsc[sortedPeAsc.length - 1].metrics.pe_ratio,
+  }}));
+}})().catch((e) => {{ print("V50_JS_ERR:" + (e && e.stack ? e.stack : e)); quit(1); }});
+"""
+    drv_path = tmp_path / "v50_filters_check.cjs"
+    drv_path.write_text(driver, encoding="utf-8")
+    runner = [str(jsc_bin), str(drv_path)] if jsc_bin.exists() else [str(node_bin), str(drv_path)]
+    proc = subprocess.run(runner, check=True, capture_output=True, text=True)
+    out = json.loads(proc.stdout.split("__V50_JSON__", 1)[1].strip())
+
+    total = out["total"]
+    assert total == 702
+    assert out["archetypeCount"] >= 6
+
+    c = out["counts"]
+    # Every single filter across all 4 groups must genuinely narrow the 702-stock universe (0 < matched < 702)
+    for k, v in c.items():
+        assert 0 < v < total, f"Expected 0 < {k} < {total}, got {v}"
+
+    assert c["undervalued"] < c["fairOrBetter"] < c["notExpensive"] < total
+    assert c["nearHigh"] + c["dip1025"] + c["deepDip25"] == total
+    assert c["buybacks"] >= 5
+
+    # Verify countActiveAdvFilters, describeActiveFilterChips, and pe_asc head/tail invariants
+    assert out["multiActiveCount"] == 11
+    assert out["chipKeys"] == [
+        "valZone",
+        "maxPe",
+        "minRoce",
+        "maxDe",
+        "minGrowth",
+        "archetype",
+        "zeroFlags",
+        "street",
+        "range52w",
+        "capTier",
+        "above200Dma",
+    ]
+    assert 0 < out["topPeRatio"] < 15
+    assert out["tailInvalidPeRatio"] >= 99 or out["tailInvalidPeRatio"] <= 0
+
+

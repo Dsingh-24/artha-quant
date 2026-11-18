@@ -10,7 +10,8 @@ const NASDAQ_BENCHMARK_TICKER = "^NDX";
 const SP500_BENCHMARK_TICKER = "^GSPC";
 const INDIA_RISK_FREE_RATE = 0.068;
 const US_RISK_FREE_RATE = 0.043;
-const USD_INR_RATE = 84.5;
+const USD_INR_TICKER = "USDINR=X";
+const USD_INR_RATE = 93.44;
 const ALLOWED_MARKETS = new Set(["ALL", "IN", "US", "NASDAQ100", "SP500"]);
 
 const MARKET_MAKER_NOISE = [
@@ -325,6 +326,16 @@ function latestValidPrice(arr) {
     }
   }
   return 0.0;
+}
+
+function resolveUsdInrRate(snapshot, overrideRate = null) {
+  if (overrideRate !== null && overrideRate !== undefined && overrideRate !== "") {
+    const ov = Number(overrideRate);
+    if (Number.isFinite(ov) && ov > 0) return roundTo(ov, 2);
+  }
+  const prices = snapshot && snapshot.prices;
+  const live = prices ? latestValidPrice(prices[USD_INR_TICKER]) : 0.0;
+  return live > 0 ? roundTo(live, 2) : USD_INR_RATE;
 }
 
 function countNonNullPrices(arr) {
@@ -2796,6 +2807,7 @@ export async function runPlannerSnapshot(payload) {
   const effMarket = ALLOWED_MARKETS.has(payload.market) ? payload.market : "ALL";
   const isUsPlan = effMarket === "US" || effMarket === "NASDAQ100" || effMarket === "SP500";
   const planCurrency = isUsPlan ? "USD" : "INR";
+  const fxRate = resolveUsdInrRate(snapshot, payload && payload.usd_inr_rate);
   const poolStocks =
     effMarket !== "ALL"
       ? rankedStocks.filter((s) => {
@@ -2808,9 +2820,9 @@ export async function runPlannerSnapshot(payload) {
     const { currency: sCcy } = resolveMarketAndIndexTag(stock);
     const nativePx = Math.max(0.01, Number(stock.price));
     if (planCurrency === "USD") {
-      return sCcy === "USD" ? nativePx : nativePx / USD_INR_RATE;
+      return sCcy === "USD" ? nativePx : nativePx / fxRate;
     }
-    return sCcy === "USD" ? nativePx * USD_INR_RATE : nativePx;
+    return sCcy === "USD" ? nativePx * fxRate : nativePx;
   }
 
   const lumpSumInr = Number(payload.lump_sum_inr || 0);
@@ -3009,7 +3021,7 @@ export async function runPlannerSnapshot(payload) {
   return {
     market: effMarket,
     plan_currency: planCurrency,
-    fx_usd_inr: USD_INR_RATE,
+    fx_usd_inr: fxRate,
     profile_label: prof.label,
     expected_cagr_pct: roundTo(prof.blended_mu * 100.0, 2),
     expected_volatility_pct: roundTo(prof.blended_sigma * 100.0, 2),

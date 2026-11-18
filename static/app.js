@@ -1,8 +1,17 @@
-// ArthaQuant V4.0 Frontend Controller — Everyday-Investor Plain-English UI,
-// Simple / Pro Ratios Toggle, AI Analyst Memo, Multi-Strategy Paper Trading & Installable PWA
+// ArthaQuant V5.0 Frontend Controller — Calm Progressive-Disclosure UI,
+// 4-Group Advanced Filters Engine, 3-Sub-Tab Deep-Dive Drawer, Paper Wallet & PWA
 // Built exclusively with safe DOM creation (createElement, createElementNS, textContent)
 // and CSS class toggling.
 
+import {
+  DEFAULT_ADV_FILTERS,
+  countActiveAdvFilters,
+  describeActiveFilterChips,
+  effectiveRoceOrRoe,
+  extractUniqueArchetypes,
+  matchesAdvancedFilters,
+  sortFilteredStocks,
+} from "/static/advanced_filters.js";
 import {
   closePaperAuthModal,
   initPaperAuthClient,
@@ -52,6 +61,8 @@ const PRESET_NAMES = {
   custom: "Custom Pillar Formula",
 };
 
+const DEFAULT_PAGE_LIMIT = 50;
+
 const state = {
   staticMode: false,
   csrfToken: null,
@@ -64,9 +75,15 @@ const state = {
   plannerMarket: "ALL",
   backtestMarket: "IN",
   ratingFilter: "ALL",
+  advFilters: Object.assign({}, DEFAULT_ADV_FILTERS),
+  advDrawerOpen: false,
+  showPodium: false,
+  pageLimit: DEFAULT_PAGE_LIMIT,
+  ddSubtab: "overview",
   stocks: [],
   visibleStocks: [],
   stage1Funnel: [],
+  stage1ByTicker: new Map(),
   marketCounts: { ALL: 0, IN: 0, US: 0, NASDAQ100: 0, SP500: 0 },
   presetWeightsMap: DEFAULT_PRESET_WEIGHTS,
   selectedTicker: null,
@@ -160,15 +177,19 @@ function displaySymbol(ticker) {
   return String(ticker || "").replace(".NS", "").replace(".BO", "");
 }
 
-function createMarketTag(item) {
+function createMarketTag(item, compact = false) {
   const tag = resolveIndexTag(item);
   if (tag === "NASDAQ100") {
-    return el("span", "tag-market tag-market-nasdaq", "US Stock · NASDAQ 100");
+    return el(
+      "span",
+      "tag-market tag-market-nasdaq",
+      compact ? "NASDAQ 100" : "US Stock · NASDAQ 100"
+    );
   }
   if (tag === "SP500") {
-    return el("span", "tag-market tag-market-sp500", "US Stock · S&P 500");
+    return el("span", "tag-market tag-market-sp500", compact ? "S&P 500" : "US Stock · S&P 500");
   }
-  return el("span", "tag-market tag-market-in", "Indian Stock · NIFTY 200");
+  return el("span", "tag-market tag-market-in", compact ? "NIFTY 200" : "Indian Stock · NIFTY 200");
 }
 
 function formatExactAmount(amount, currency = "INR") {
@@ -977,7 +998,7 @@ async function enterWorkspace() {
   document.getElementById("auth-screen").classList.add("hidden");
   document.getElementById("app-shell").classList.remove("hidden");
   document.getElementById("user-badge").textContent = state.staticMode
-    ? "Mode: Cloud Snapshot (Nifty 200 + Nasdaq 100 + S&P 500)"
+    ? "Cloud Snapshot"
     : `Advisor: ${maskUserIdentity(state.username)}`;
   await loadScreener(true);
 }
@@ -1014,6 +1035,7 @@ function updateSwitcherActiveButtons(containerId, activeMarket) {
 async function setScreenerMarket(market) {
   if (state.screenerMarket === market) return;
   state.screenerMarket = market;
+  state.pageLimit = DEFAULT_PAGE_LIMIT;
   updateSwitcherActiveButtons("screener-market-switcher", market);
 
   const searchEl = document.getElementById("screener-search");
@@ -1021,35 +1043,25 @@ async function setScreenerMarket(market) {
   const mktSub = document.getElementById("screener-market-sub");
 
   if (market === "IN") {
-    searchEl.placeholder =
-      "Search India Nifty 200 stocks (e.g. Muthoot, ICICI, Polycab, TCS, Dixon)...";
+    searchEl.placeholder = "Search Nifty 200 ticker, company, or sector...";
     secLabel.textContent = "Nifty 200 Sector";
-    mktSub.textContent =
-      "Showing Indian Stock · NIFTY 200 compounders in native ₹ INR";
+    mktSub.textContent = "Indian Stock · NIFTY 200 in ₹ INR";
   } else if (market === "NASDAQ100") {
-    searchEl.placeholder =
-      "Search US Nasdaq 100 stocks (e.g. NVDA, MSFT, AAPL, COST, META, AVGO)...";
+    searchEl.placeholder = "Search Nasdaq 100 ticker, company, or sector...";
     secLabel.textContent = "Nasdaq 100 Sector";
-    mktSub.textContent =
-      "Showing US Stock · NASDAQ 100 constituents (takes tag priority over S&P 500 overlap)";
+    mktSub.textContent = "US Stock · NASDAQ 100 (priority over S&P 500 overlap)";
   } else if (market === "SP500") {
-    searchEl.placeholder =
-      "Search US S&P 500 non-Nasdaq stocks (e.g. JPM, LLY, V, MA, WMT, GS, BRK-B)...";
+    searchEl.placeholder = "Search S&P 500 ticker, company, or sector...";
     secLabel.textContent = "S&P 500 Sector";
-    mktSub.textContent =
-      "Showing US Stock · S&P 500 non-Nasdaq stocks • Overlap mega-caps (AAPL, MSFT, NVDA) carry the NASDAQ 100 tag";
+    mktSub.textContent = "US Stock · S&P 500 (overlap mega-caps carry NASDAQ 100 tag)";
   } else if (market === "US") {
-    searchEl.placeholder =
-      "Search all US stocks — Nasdaq 100 & S&P 500 (e.g. NVDA, JPM, MSFT, LLY, V, COST)...";
+    searchEl.placeholder = "Search US ticker, company, or sector...";
     secLabel.textContent = "US Sector";
-    mktSub.textContent =
-      "Showing combined US universe (Nasdaq 100 + S&P 500) • Overlap names carry the NASDAQ 100 priority tag";
+    mktSub.textContent = "Combined US universe (Nasdaq 100 + S&P 500)";
   } else {
-    searchEl.placeholder =
-      "Search Nifty 200, Nasdaq 100 & S&P 500 stocks (e.g. NVDA, JPM, LLY, MSFT, Muthoot, ICICI)...";
-    secLabel.textContent = "Sector Filter";
-    mktSub.textContent =
-      "Index tag priority: NASDAQ 100 > S&P 500 > NIFTY 200 • Dual-listed US overlap names carry the NASDAQ 100 tag";
+    searchEl.placeholder = "Search ticker, company, or sector...";
+    secLabel.textContent = "Sector";
+    mktSub.textContent = "Index priority: NASDAQ 100 > S&P 500 > NIFTY 200";
   }
 
   document.getElementById("screener-sector").value = "ALL";
@@ -1074,23 +1086,21 @@ async function setPlannerMarket(market) {
   const navTab = document.getElementById("nav-planner-tab");
   const marketSub = document.getElementById("pl-market-sub");
 
+  navTab.textContent = "Planner";
+
   if (nowUsd) {
-    lumpLbl.textContent = "Capital to Deploy Today ($ USD)";
-    sipLbl.textContent = "Optional Monthly SIP ($ USD)";
-    targetLbl.textContent = "Target Corpus Goal ($ USD)";
+    lumpLbl.textContent = "Capital Today ($ USD)";
+    sipLbl.textContent = "Monthly SIP ($ USD)";
+    targetLbl.textContent = "Target Corpus ($ USD)";
     runBtn.textContent = "Build $ Blueprint";
-    coneTitle.textContent = "1,000-Path Wealth Projection Cone ($ USD)";
-    navTab.textContent = "$10K Investment Planner";
+    coneTitle.textContent = "Wealth Projection Cone ($ USD)";
 
     if (market === "NASDAQ100") {
-      marketSub.textContent =
-        "Deploying USD directly into whole Nasdaq 100 US compounder shares";
+      marketSub.textContent = "USD deployment across Nasdaq 100 compounder shares";
     } else if (market === "SP500") {
-      marketSub.textContent =
-        "Deploying USD into S&P 500 (non-Nasdaq) compounders • Overlap names carry the NASDAQ 100 tag";
+      marketSub.textContent = "USD deployment across S&P 500 compounders";
     } else {
-      marketSub.textContent =
-        "Deploying USD across combined US Nasdaq 100 & S&P 500 compounder shares";
+      marketSub.textContent = "USD deployment across US Nasdaq 100 & S&P 500 compounders";
     }
 
     if (!wasUsd || Number(lumpInput.value) >= 100000) {
@@ -1102,16 +1112,16 @@ async function setPlannerMarket(market) {
       targetInput.value = "26000";
     }
   } else {
-    lumpLbl.textContent = "Capital to Deploy Today (₹ INR)";
-    sipLbl.textContent = "Optional Monthly SIP (₹ INR)";
-    targetLbl.textContent = "Target Corpus Goal (₹ INR)";
+    lumpLbl.textContent = "Capital Today (₹ INR)";
+    sipLbl.textContent = "Monthly SIP (₹ INR)";
+    targetLbl.textContent = "Target Corpus (₹ INR)";
     runBtn.textContent = "Build ₹ Blueprint";
-    coneTitle.textContent = "1,000-Path Wealth Projection Cone (₹ INR)";
-    navTab.textContent = "₹5L Investment Planner";
+    coneTitle.textContent = "Wealth Projection Cone (₹ INR)";
+    const fxLabel = Number((state.currentPlan && state.currentPlan.fx_usd_inr) || 93.44).toFixed(2);
     marketSub.textContent =
       market === "IN"
-        ? "Deploying ₹ INR across audited Indian NSE Nifty 200 compounders"
-        : "Deploying ₹ INR across Global All-Market leaders (US prices sized at ₹84.5/$)";
+        ? "₹ INR deployment across audited NSE Nifty 200 compounders"
+        : `₹ INR deployment across Global leaders (US sized at ₹${fxLabel}/$)`;
 
     if (wasUsd || Number(lumpInput.value) <= 50000) {
       lumpInput.step = "50000";
@@ -1132,7 +1142,7 @@ async function setBacktestMarket(market) {
   await runBacktest();
 }
 
-// --- Tab 1: Stock Rankings, Formula Legend, Filter Cards, Podium & Leaderboard ---
+// --- Tab 1: Stock Rankings, Formula Legend, Filter Chips, Podium & Leaderboard ---
 
 function currentScreenerPayload() {
   const preset = document.getElementById("screener-preset").value;
@@ -1149,6 +1159,28 @@ function currentScreenerPayload() {
   return payload;
 }
 
+function populateArchetypeSelect(stocks) {
+  const sel = document.getElementById("af-archetype");
+  if (!sel) return;
+  const prevVal = state.advFilters.archetype || sel.value || "ALL";
+  const defaultOpt = el("option", "", "All Business Styles");
+  defaultOpt.value = "ALL";
+  sel.replaceChildren(defaultOpt);
+
+  const uniqueStyles = extractUniqueArchetypes(stocks);
+  for (const styleLbl of uniqueStyles) {
+    const opt = el("option", "", styleLbl);
+    opt.value = styleLbl;
+    sel.appendChild(opt);
+  }
+  if (prevVal !== "ALL" && uniqueStyles.includes(prevVal)) {
+    sel.value = prevVal;
+  } else {
+    sel.value = "ALL";
+    state.advFilters.archetype = "ALL";
+  }
+}
+
 async function loadScreener(populateSectors = false) {
   try {
     const payload = currentScreenerPayload();
@@ -1161,6 +1193,12 @@ async function loadScreener(populateSectors = false) {
 
     state.stocks = data.stocks || [];
     state.stage1Funnel = data.stage1_funnel || [];
+    state.stage1ByTicker = new Map();
+    for (const row of state.stage1Funnel) {
+      if (row && row.ticker) {
+        state.stage1ByTicker.set(row.ticker, row);
+      }
+    }
     if (data.preset_weights) {
       state.presetWeightsMap = data.preset_weights;
     }
@@ -1190,53 +1228,35 @@ async function loadScreener(populateSectors = false) {
     const niftyVal = Number(data.benchmark_nifty50 || 0);
     const sp500Val = Number(data.benchmark_sp500 || 0);
     const ndxVal = Number(data.benchmark_nasdaq100 || 0);
-    const niftyPart =
-      niftyVal > 0
-        ? `Nifty 50 (^NSEI): ${niftyVal.toLocaleString("en-IN", { maximumFractionDigits: 2 })}`
-        : "";
-    const sp500Part =
-      sp500Val > 0
-        ? `S&P 500 (^GSPC): ${sp500Val.toLocaleString("en-US", { maximumFractionDigits: 2 })}`
-        : "";
-    const ndxPart =
-      ndxVal > 0
-        ? `Nasdaq 100 (^NDX): ${ndxVal.toLocaleString("en-US", { maximumFractionDigits: 2 })}`
-        : "";
-    const idxJoined = [niftyPart, sp500Part, ndxPart].filter(Boolean).join("  •  ");
-    const countPart =
-      mc.SP500 > 0
-        ? `Universe: ${mc.IN} Nifty 200 + ${mc.NASDAQ100} Nasdaq 100 + ${mc.SP500} S&P 500`
-        : mc.US > 0
-        ? `Universe: ${mc.IN} Nifty 200 + ${mc.US} US`
-        : `Audited Universe: ${data.total_deep_scored} Stocks`;
-    document.getElementById("market-status-line").textContent = [
-      idxJoined,
-      countPart,
-      `As of ${data.as_of_date}`,
-    ]
-      .filter(Boolean)
-      .join("  •  ");
+    const statusParts = [`${mc.ALL || data.total_deep_scored || state.stocks.length} Ranked`];
+    if (niftyVal > 0) {
+      statusParts.push(`Nifty ${Math.round(niftyVal).toLocaleString("en-IN")}`);
+    }
+    if (sp500Val > 0) {
+      statusParts.push(`S&P ${Math.round(sp500Val).toLocaleString("en-US")}`);
+    } else if (ndxVal > 0) {
+      statusParts.push(`Nasdaq ${Math.round(ndxVal).toLocaleString("en-US")}`);
+    }
+    if (data.as_of_date) {
+      statusParts.push(`As of ${data.as_of_date}`);
+    }
+    document.getElementById("market-status-line").textContent = statusParts.join(" · ");
 
     if (state.staticMode) {
-      document.getElementById("user-badge").textContent =
-        mc.SP500 > 0
-          ? `Cloud Snapshot (${mc.IN} IN + ${mc.US} US)`
-          : mc.US > 0
-          ? `Cloud Snapshot (${mc.IN} NSE + ${mc.US} Nasdaq)`
-          : `Cloud Snapshot (${data.total_deep_scored} Audited)`;
+      document.getElementById("user-badge").textContent = "Cloud Snapshot";
     }
 
     document.getElementById("funnel-summary-note").textContent =
-      `${data.total_stage1_scanned} liquid stocks scanned → ${data.total_deep_scored} deep-scored in current market view.`;
+      `${data.total_stage1_scanned} liquid stocks scanned → ${data.total_deep_scored} deep-scored.`;
     document.getElementById("view-stage2-btn").textContent = `Audited Rankings (${data.total_deep_scored})`;
-    document.getElementById("view-stage1-btn").textContent = `Raw Stage-1 Price Scan (${state.stage1Funnel.length})`;
+    document.getElementById("view-stage1-btn").textContent = `Stage-1 Price Scan (${state.stage1Funnel.length})`;
 
     const expandBtn = document.getElementById("expand-funnel-btn");
     if (data.unscored_funnel_remaining > 0) {
       expandBtn.textContent = `+ Deep-Score Next ${Math.min(30, data.unscored_funnel_remaining)} (${data.unscored_funnel_remaining} left)`;
       expandBtn.disabled = false;
     } else {
-      expandBtn.textContent = "All Stocks Deep-Scored ✓";
+      expandBtn.textContent = "All Deep-Scored ✓";
       expandBtn.disabled = true;
     }
 
@@ -1252,7 +1272,7 @@ async function loadScreener(populateSectors = false) {
           ? "All S&P 500 Sectors"
           : state.screenerMarket === "US"
           ? "All US Sectors"
-          : "All Global Sectors";
+          : "All Sectors";
       const defaultOpt = el("option", "", allLabel);
       defaultOpt.value = "ALL";
       sel.replaceChildren(defaultOpt);
@@ -1268,6 +1288,7 @@ async function loadScreener(populateSectors = false) {
       }
     }
 
+    populateArchetypeSelect(state.stocks);
     renderFormulaBar();
     applyClientFiltersAndRender();
 
@@ -1363,98 +1384,167 @@ function matchesSearch(item, q) {
 
 function mcapSortableInrCr(stock) {
   const raw = Number(stock.market_cap_cr || 0);
-  return isUSStock(stock) ? raw * 8.45 : raw;
+  return isUSStock(stock) ? raw * 9.344 : raw;
 }
 
-function sortStocksList(list, sortBy) {
-  const copy = [...list];
-  if (sortBy === "quality") {
-    copy.sort((a, b) => Number(b.pillars.quality) - Number(a.pillars.quality));
-  } else if (sortBy === "growth") {
-    copy.sort((a, b) => Number(b.pillars.growth) - Number(a.pillars.growth));
-  } else if (sortBy === "value") {
-    copy.sort((a, b) => Number(b.pillars.value) - Number(a.pillars.value));
-  } else if (sortBy === "mcap") {
-    copy.sort((a, b) => mcapSortableInrCr(b) - mcapSortableInrCr(a));
-  } else {
-    copy.sort((a, b) => Number(b.composite_score) - Number(a.composite_score));
+function readAdvFiltersFromDom() {
+  state.advFilters = {
+    valZone: document.getElementById("af-val-zone").value || "ALL",
+    maxPe: document.getElementById("af-max-pe").value || "ALL",
+    minRoce: document.getElementById("af-min-roce").value || "0",
+    maxDe: document.getElementById("af-max-de").value || "ALL",
+    minGrowth: document.getElementById("af-min-growth").value || "0",
+    archetype: document.getElementById("af-archetype").value || "ALL",
+    zeroFlags: Boolean(document.getElementById("af-zero-flags").checked),
+    street: document.getElementById("af-street").value || "ALL",
+    range52w: document.getElementById("af-52w").value || "ALL",
+    capTier: document.getElementById("af-cap-tier").value || "ALL",
+    above200Dma: Boolean(document.getElementById("af-above-200dma").checked),
+  };
+  return state.advFilters;
+}
+
+function syncAdvFilterDomControls() {
+  const f = state.advFilters;
+  document.getElementById("af-val-zone").value = f.valZone || "ALL";
+  document.getElementById("af-max-pe").value = f.maxPe || "ALL";
+  document.getElementById("af-min-roce").value = f.minRoce || "0";
+  document.getElementById("af-max-de").value = f.maxDe || "ALL";
+  document.getElementById("af-min-growth").value = f.minGrowth || "0";
+  const archSel = document.getElementById("af-archetype");
+  if (archSel) {
+    archSel.value = f.archetype || "ALL";
+    if (archSel.value !== (f.archetype || "ALL")) {
+      archSel.value = "ALL";
+      state.advFilters.archetype = "ALL";
+    }
   }
-  return copy;
+  document.getElementById("af-zero-flags").checked = Boolean(f.zeroFlags);
+  document.getElementById("af-street").value = f.street || "ALL";
+  document.getElementById("af-52w").value = f.range52w || "ALL";
+  document.getElementById("af-cap-tier").value = f.capTier || "ALL";
+  document.getElementById("af-above-200dma").checked = Boolean(f.above200Dma);
+  document.getElementById("af-show-podium").checked = Boolean(state.showPodium);
 }
 
-function renderRatingFilterStrip(searchFilteredStocks) {
+function toggleAdvFiltersDrawer() {
+  state.advDrawerOpen = !state.advDrawerOpen;
+  const drawer = document.getElementById("adv-filters-drawer");
+  const btn = document.getElementById("toggle-adv-filters-btn");
+  drawer.classList.toggle("hidden", !state.advDrawerOpen);
+  btn.classList.toggle("active", state.advDrawerOpen);
+  btn.setAttribute("aria-expanded", state.advDrawerOpen ? "true" : "false");
+}
+
+async function resetAllScreenerFilters() {
+  state.advFilters = Object.assign({}, DEFAULT_ADV_FILTERS);
+  state.ratingFilter = "ALL";
+  state.pageLimit = DEFAULT_PAGE_LIMIT;
+  syncAdvFilterDomControls();
+  document.getElementById("screener-search").value = "";
+  document.getElementById("screener-sort").value = "composite";
+
+  const sectorSel = document.getElementById("screener-sector");
+  if (sectorSel && sectorSel.value !== "ALL") {
+    sectorSel.value = "ALL";
+    await loadScreener(false);
+    return;
+  }
+  applyClientFiltersAndRender();
+}
+
+function renderActiveFilterChipsAndBadge() {
+  const chipsBar = document.getElementById("active-filter-chips-bar");
+  const countBadge = document.getElementById("adv-filters-count-badge");
+  chipsBar.replaceChildren();
+
+  const advChips = describeActiveFilterChips(state.advFilters);
+  const sectorSel = document.getElementById("screener-sector");
+  const sectorVal = sectorSel ? sectorSel.value || "ALL" : "ALL";
+  const allChips = [...advChips];
+  if (sectorVal !== "ALL") {
+    allChips.push({
+      key: "__sector__",
+      value: sectorVal,
+      label: `Sector: ${sectorVal}`,
+    });
+  }
+
+  const activeCount = countActiveAdvFilters(state.advFilters) + (sectorVal !== "ALL" ? 1 : 0);
+  countBadge.textContent = String(activeCount);
+  countBadge.classList.toggle("hidden", activeCount === 0);
+
+  if (allChips.length === 0) {
+    chipsBar.classList.add("hidden");
+    return;
+  }
+  chipsBar.classList.remove("hidden");
+
+  for (const chip of allChips) {
+    const chipBtn = el("button", "af-chip");
+    chipBtn.type = "button";
+    chipBtn.title = `Remove filter: ${chip.label}`;
+    chipBtn.appendChild(el("span", "", chip.label));
+    chipBtn.appendChild(el("span", "af-chip-remove", "×"));
+    chipBtn.addEventListener("click", async () => {
+      state.pageLimit = DEFAULT_PAGE_LIMIT;
+      if (chip.key === "__sector__") {
+        document.getElementById("screener-sector").value = "ALL";
+        await loadScreener(false);
+        return;
+      }
+      state.advFilters[chip.key] = DEFAULT_ADV_FILTERS[chip.key];
+      syncAdvFilterDomControls();
+      applyClientFiltersAndRender();
+    });
+    chipsBar.appendChild(chipBtn);
+  }
+
+  if (allChips.length >= 2) {
+    const clearBtn = el("button", "btn btn-ghost btn-xs", "Clear All");
+    clearBtn.type = "button";
+    clearBtn.addEventListener("click", () => {
+      resetAllScreenerFilters();
+    });
+    chipsBar.appendChild(clearBtn);
+  }
+}
+
+function renderRatingFilterStrip(baseFilteredStocks) {
   const strip = document.getElementById("rating-filter-strip");
   strip.replaceChildren();
 
   const counts = {
-    ALL: searchFilteredStocks.length,
+    ALL: baseFilteredStocks.length,
     "Strong Buy": 0,
     Buy: 0,
     Hold: 0,
     Avoid: 0,
   };
-  for (const s of searchFilteredStocks) {
+  for (const s of baseFilteredStocks) {
     counts[s.rating] = (counts[s.rating] || 0) + 1;
   }
 
-  const cards = [
-    {
-      key: "ALL",
-      title: "All Ranked",
-      count: counts.ALL,
-      sub: state.proMode ? "Complete filtered universe" : "Every company in current view",
-      colorCls: "",
-    },
-    {
-      key: "Strong Buy",
-      title: "Strong Buy",
-      count: counts["Strong Buy"],
-      sub: state.proMode
-        ? "Score ≥ 68 • Zero Red Flags"
-        : "Score 68+ • Strong business & fair price",
-      colorCls: "text-pos",
-    },
-    {
-      key: "Buy",
-      title: "Buy",
-      count: counts.Buy,
-      sub: state.proMode
-        ? "Score ≥ 57 • Accumulate 3-5Y+"
-        : "Score 57+ • Good long-term candidate",
-      colorCls: "text-cyan",
-    },
-    {
-      key: "Hold",
-      title: "Hold / Buy on Dip",
-      count: counts.Hold,
-      sub: state.proMode
-        ? "Watchlist or Valuation Cap"
-        : "Wait for a better price or watch closely",
-      colorCls: "text-warn",
-    },
-    {
-      key: "Avoid",
-      title: "Avoid",
-      count: counts.Avoid,
-      sub: state.proMode
-        ? "Forensic or Balance-Sheet Caution"
-        : "Unprofitable, high risk, or overpriced",
-      colorCls: "text-neg",
-    },
+  const chips = [
+    { key: "ALL", title: "All", count: counts.ALL, toneCls: "" },
+    { key: "Strong Buy", title: "Strong Buy", count: counts["Strong Buy"], toneCls: "chip-strong-buy" },
+    { key: "Buy", title: "Buy", count: counts.Buy, toneCls: "chip-buy" },
+    { key: "Hold", title: "Hold", count: counts.Hold, toneCls: "chip-hold" },
+    { key: "Avoid", title: "Avoid", count: counts.Avoid, toneCls: "chip-avoid" },
   ];
 
-  for (const c of cards) {
+  for (const c of chips) {
+    const isActive = state.ratingFilter === c.key;
     const btn = el(
       "button",
-      `rating-filter-card ${state.ratingFilter === c.key ? "active" : ""}`.trim()
+      `rating-chip ${c.toneCls} ${isActive ? "active" : ""}`.replace(/\s+/g, " ").trim()
     );
     btn.type = "button";
-    const top = el("div", "rf-top");
-    top.appendChild(el("span", "rf-title", c.title));
-    top.appendChild(el("span", `rf-count ${c.colorCls}`.trim(), String(c.count)));
-    btn.appendChild(top);
-    btn.appendChild(el("div", "rf-sub", c.sub));
+    btn.dataset.rating = c.key;
+    btn.appendChild(el("span", "", c.title));
+    btn.appendChild(el("span", "rating-chip-count", String(c.count)));
     btn.addEventListener("click", () => {
+      state.pageLimit = DEFAULT_PAGE_LIMIT;
       state.ratingFilter = state.ratingFilter === c.key && c.key !== "ALL" ? "ALL" : c.key;
       applyClientFiltersAndRender();
     });
@@ -1467,7 +1557,7 @@ function renderTopPodium(visibleStocks) {
   const grid = document.getElementById("top-podium-grid");
   grid.replaceChildren();
 
-  if (state.funnelView !== "stage2" || visibleStocks.length === 0) {
+  if (!state.showPodium || state.funnelView !== "stage2" || visibleStocks.length === 0) {
     podiumSection.classList.add("hidden");
     return;
   }
@@ -1475,14 +1565,14 @@ function renderTopPodium(visibleStocks) {
 
   const marketTitle =
     state.screenerMarket === "IN"
-      ? "Top India · Nifty 200 Conviction Leaders"
+      ? "Top India · Nifty 200 Leaders"
       : state.screenerMarket === "NASDAQ100"
-      ? "Top US · Nasdaq 100 Conviction Leaders"
+      ? "Top US · Nasdaq 100 Leaders"
       : state.screenerMarket === "SP500"
-      ? "Top US · S&P 500 (Non-Nasdaq) Conviction Leaders"
+      ? "Top US · S&P 500 Leaders"
       : state.screenerMarket === "US"
-      ? "Top All-US (Nasdaq 100 + S&P 500) Conviction Leaders"
-      : "Top Global Conviction Leaders";
+      ? "Top US Conviction Leaders"
+      : "Top Conviction Leaders";
   document.getElementById("podium-heading").textContent = marketTitle;
 
   const top3 = visibleStocks.slice(0, 3);
@@ -1495,7 +1585,7 @@ function renderTopPodium(visibleStocks) {
 
     const badgeRow = el("div", "podium-badge-row");
     badgeRow.appendChild(el("span", `rank-medal medal-${idx + 1}`, `#${s.rank}`));
-    badgeRow.appendChild(createMarketTag(s));
+    badgeRow.appendChild(createMarketTag(s, true));
     left.appendChild(badgeRow);
 
     left.appendChild(el("div", "podium-name", s.name));
@@ -1503,7 +1593,7 @@ function renderTopPodium(visibleStocks) {
       el(
         "div",
         "podium-meta",
-        `${displaySymbol(s.ticker)} • ${s.sector} • ${formatMarketCap(
+        `${displaySymbol(s.ticker)} · ${s.sector} · ${formatMarketCap(
           s.market_cap_cr,
           s.market,
           s.currency
@@ -1512,43 +1602,15 @@ function renderTopPodium(visibleStocks) {
     );
 
     top.appendChild(left);
-    top.appendChild(createScoreRingSvg(s.composite_score, s.rating, 60));
+    top.appendChild(createScoreRingSvg(s.composite_score, s.rating, 54));
     card.appendChild(top);
-
-    if (pe.what_it_does) {
-      card.appendChild(el("div", "podium-what-sub", pe.what_it_does));
-    }
 
     const metricsRow = el("div", "podium-metrics-row");
     metricsRow.appendChild(el("span", ratingBadgeClass(s.rating), s.rating));
     metricsRow.appendChild(createArchetypePill(pe));
     metricsRow.appendChild(
-      el(
-        "span",
-        "mini-stat-pill",
-        `${state.proMode ? "CMP" : "Price"} ${formatStockPrice(s.price, stockCurrency(s))}`
-      )
+      el("span", "mini-stat-pill", formatStockPrice(s.price, stockCurrency(s)))
     );
-    if (state.proMode) {
-      metricsRow.appendChild(
-        el("span", "mini-stat-pill", `P/E ${formatPeVsFair(s.metrics)}`)
-      );
-      const medRet =
-        s.metrics.med_5y_roce_pct !== undefined ? s.metrics.med_5y_roce_pct : s.metrics.roce_pct;
-      metricsRow.appendChild(
-        el(
-          "span",
-          "mini-stat-pill",
-          `${s.is_financial ? "5Y ROE" : "5Y ROCE"} ${medRet}%`
-        )
-      );
-    } else {
-      const qualStep = pe.receipt_steps && pe.receipt_steps[0];
-      const qualRow0 = qualStep && qualStep.rows && qualStep.rows[0];
-      if (qualRow0 && qualRow0.simple_value) {
-        metricsRow.appendChild(el("span", "mini-stat-pill", qualRow0.simple_value));
-      }
-    }
     card.appendChild(metricsRow);
 
     const verdictToneCls =
@@ -1566,17 +1628,13 @@ function renderTopPodium(visibleStocks) {
     const footer = el("div", "podium-footer");
     footer.appendChild(createFriendlyValZonePill(s, state.proMode));
     const ctaWrap = el("div", "inline-group wrap-group");
-    const ptBtn = el("button", "btn-paper-trade-xs", "Paper Trade");
+    const ptBtn = el("button", "btn-paper-trade-xs", "Trade");
     ptBtn.type = "button";
     ptBtn.addEventListener("click", (ev) => {
       ev.stopPropagation();
       openPaperOrderTicket(s, { side: "BUY", orderType: "LIMIT" });
     });
-    const btn = el(
-      "button",
-      "btn-deep-dive",
-      state.proMode ? "Score Math →" : "Breakdown →"
-    );
+    const btn = el("button", "btn-deep-dive", "Details →");
     btn.type = "button";
     btn.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -1602,23 +1660,67 @@ function setTableHeaders(cols) {
   thead.appendChild(tr);
 }
 
+function renderScreenerPaginationBar(totalMatched, shownCount) {
+  const bar = document.getElementById("screener-pagination-bar");
+  bar.replaceChildren();
+
+  if (state.funnelView !== "stage2" || totalMatched <= state.pageLimit) {
+    bar.classList.add("hidden");
+    return;
+  }
+  bar.classList.remove("hidden");
+
+  bar.appendChild(el("span", "muted-note", `Showing ${shownCount} of ${totalMatched}`));
+
+  const actions = el("div", "pagination-actions");
+  const moreBtn = el("button", "btn btn-secondary btn-sm", "Show 50 More");
+  moreBtn.type = "button";
+  moreBtn.addEventListener("click", () => {
+    state.pageLimit += DEFAULT_PAGE_LIMIT;
+    renderStage2Table(state.visibleStocks);
+  });
+
+  const allBtn = el("button", "btn btn-ghost btn-sm", "Show All");
+  allBtn.type = "button";
+  allBtn.addEventListener("click", () => {
+    state.pageLimit = totalMatched + DEFAULT_PAGE_LIMIT;
+    renderStage2Table(state.visibleStocks);
+  });
+
+  actions.appendChild(moreBtn);
+  actions.appendChild(allBtn);
+  bar.appendChild(actions);
+}
+
 function applyClientFiltersAndRender() {
   const q = document.getElementById("screener-search").value.trim().toLowerCase();
   const sortBy = document.getElementById("screener-sort").value;
 
-  const searchFiltered = state.stocks.filter((s) => matchesSearch(s, q));
-  renderRatingFilterStrip(searchFiltered);
+  renderActiveFilterChipsAndBadge();
+
+  const searchAndAdvFiltered = state.stocks.filter(
+    (s) =>
+      matchesSearch(s, q) &&
+      matchesAdvancedFilters(s, state.advFilters, state.stage1ByTicker)
+  );
+  renderRatingFilterStrip(searchAndAdvFiltered);
 
   const tierFiltered =
     state.ratingFilter === "ALL"
-      ? searchFiltered
-      : searchFiltered.filter((s) => s.rating === state.ratingFilter);
+      ? searchAndAdvFiltered
+      : searchAndAdvFiltered.filter((s) => s.rating === state.ratingFilter);
 
-  const sorted = sortStocksList(tierFiltered, sortBy);
+  const sorted = sortFilteredStocks(
+    tierFiltered,
+    sortBy,
+    state.stage1ByTicker,
+    mcapSortableInrCr
+  );
   state.visibleStocks = sorted;
 
   if (state.funnelView === "stage1") {
     document.getElementById("podium-section").classList.add("hidden");
+    document.getElementById("screener-pagination-bar").classList.add("hidden");
     const s1Filtered = state.stage1Funnel.filter((r) => matchesSearch(r, q));
     renderStage1Table(s1Filtered);
   } else {
@@ -1630,40 +1732,42 @@ function applyClientFiltersAndRender() {
 function renderStage2Table(stocks) {
   const marketHeadline =
     state.screenerMarket === "IN"
-      ? "India · Nifty 200 — Plain-English Stock Rankings"
+      ? "India · Nifty 200 Rankings"
       : state.screenerMarket === "NASDAQ100"
-      ? "US · Nasdaq 100 — Plain-English Stock Rankings"
+      ? "US · Nasdaq 100 Rankings"
       : state.screenerMarket === "SP500"
-      ? "US · S&P 500 (Non-Nasdaq) — Stock Rankings (Overlap Names Carry NASDAQ 100 Tag)"
+      ? "US · S&P 500 Rankings"
       : state.screenerMarket === "US"
-      ? "All US Stocks (Nasdaq 100 + S&P 500) — Plain-English Stock Rankings"
-      : "Global Multi-Market Stock Rankings (Nifty 200 + Nasdaq 100 + S&P 500)";
+      ? "All US Stock Rankings"
+      : "Global Multi-Market Rankings";
   document.getElementById("table-panel-title").textContent = marketHeadline;
   document.getElementById("table-panel-sub").textContent = state.proMode
-    ? "Pro Mode: Showing ROCE, CFO/EBITDA, Fair P/E, PEG & Piotroski F-Score — click any row for full score math & AI Analyst Memo"
-    : "Everyday English Mode: Showing 1-line verdicts, price fairness & business snapshots — click any stock for its 30-second breakdown & AI Analyst Memo";
+    ? "Pro Ratios active — ROCE, Fair P/E, F-Score & 52W technicals"
+    : "Select any stock for Deep Dive, AI Memo & Paper Trade";
+
+  const pageRows = stocks.slice(0, state.pageLimit);
   document.getElementById("visible-count-badge").textContent =
-    `Showing ${stocks.length} of ${state.stocks.length} Ranked`;
+    stocks.length > pageRows.length
+      ? `Showing ${pageRows.length} of ${stocks.length}`
+      : `${stocks.length} of ${state.stocks.length} Ranked`;
 
   if (state.proMode) {
     setTableHeaders([
-      "Rank",
-      "Company & Market Tag",
-      "Verdict & Plain Takeaway",
-      "Composite Score & Pillar Contribution",
-      "Price vs Fair P/E",
-      "Business Snapshot & Pro Ratios",
-      "Score Reasoning",
+      "#",
+      "Company",
+      "Score & Pillars",
+      "Verdict & Style",
+      "Pro Ratios",
+      "Valuation",
+      "Action",
     ]);
   } else {
     setTableHeaders([
-      "Rank",
-      "Company & Market",
-      "Verdict & Plain Takeaway",
-      "Score (Out of 100)",
-      "Price vs Fair Value",
-      "Business Snapshot",
-      "Why This Rank?",
+      "#",
+      "Company",
+      "Score",
+      "Verdict & Style",
+      "Price & Action",
     ]);
   }
 
@@ -1671,57 +1775,99 @@ function renderStage2Table(stocks) {
   tbody.replaceChildren();
 
   if (stocks.length === 0) {
+    renderScreenerPaginationBar(0, 0);
     const tr = document.createElement("tr");
     const td = el(
       "td",
       "empty-state-box",
-      "No ranked companies match your current search or rating tier filter."
+      "No companies match your active filters. Click Reset All to widen your view."
     );
-    td.colSpan = 7;
+    td.colSpan = state.proMode ? 7 : 5;
     tr.appendChild(td);
     tbody.appendChild(tr);
     return;
   }
 
-  for (const s of stocks) {
+  for (const s of pageRows) {
     const pe = resolvePlainEnglish(s);
+    const bd = resolveScoreBreakdown(s);
     const tr = document.createElement("tr");
     tr.dataset.ticker = s.ticker;
     if (s.ticker === state.selectedTicker && state.drawerOpen) {
       tr.classList.add("selected-row");
     }
 
-    // 1. Rank
+    // 1. #
     const rankTd = document.createElement("td");
     rankTd.appendChild(
       el("span", `rank-num ${s.rank <= 10 ? "top-rank" : ""}`.trim(), `#${s.rank}`)
     );
     tr.appendChild(rankTd);
 
-    // 2. Company & Market
+    // 2. Company
     const compTd = document.createElement("td");
     const primaryLine = el("div", "company-primary");
     primaryLine.appendChild(el("span", "", s.name));
     primaryLine.appendChild(el("span", "ticker-tag", displaySymbol(s.ticker)));
-    primaryLine.appendChild(createMarketTag(s));
+    primaryLine.appendChild(createMarketTag(s, true));
     compTd.appendChild(primaryLine);
     compTd.appendChild(
       el(
         "span",
         "sector-sub",
-        `${s.sector} • ${state.proMode ? "MCap" : "Market Size"} ${formatMarketCap(
-          s.market_cap_cr,
-          s.market,
-          s.currency
-        )}`
+        `${s.sector} · ${formatMarketCap(s.market_cap_cr, s.market, s.currency)}`
       )
     );
     tr.appendChild(compTd);
 
-    // 3. Verdict & Plain-English One-Line Takeaway
+    // 3. Score (Simple: clean score + mini 4-color bar + red-flag badge; Pro: + pillar contribution numbers)
+    const scoreTd = document.createElement("td");
+    const scoreWrap = el("div", "score-cell-wrap");
+    const topLine = el("div", "score-top-line");
+    topLine.appendChild(el("span", "score-big", s.composite_score.toFixed(1)));
+    const flagCount = Array.isArray(s.red_flags) ? s.red_flags.length : 0;
+    if (Number(bd.total_penalty || 0) > 0 || flagCount > 0) {
+      topLine.appendChild(
+        el(
+          "span",
+          "penalty-tag",
+          state.proMode
+            ? `−${Number(bd.total_penalty || 0).toFixed(1)}`
+            : `⚠ ${flagCount || 1} Flag${flagCount > 1 ? "s" : ""}`
+        )
+      );
+    } else {
+      topLine.appendChild(el("span", "muted-note", "/ 100"));
+    }
+    scoreWrap.appendChild(topLine);
+    scoreWrap.appendChild(createContributionBarSvg(bd.contributions, state.proMode ? 8 : 6));
+
+    if (state.proMode) {
+      const miniBreak = el("div", "score-mini-breakdown");
+      miniBreak.appendChild(
+        el("span", "text-pos", `Q +${Number(bd.contributions.quality).toFixed(1)}`)
+      );
+      miniBreak.appendChild(
+        el("span", "text-indigo", `G +${Number(bd.contributions.growth).toFixed(1)}`)
+      );
+      miniBreak.appendChild(
+        el("span", "text-cyan", `V +${Number(bd.contributions.value).toFixed(1)}`)
+      );
+      miniBreak.appendChild(
+        el("span", "text-warn", `H +${Number(bd.contributions.momentum).toFixed(1)}`)
+      );
+      scoreWrap.appendChild(miniBreak);
+    }
+    scoreTd.appendChild(scoreWrap);
+    tr.appendChild(scoreTd);
+
+    // 4. Verdict & Style
     const rateTd = document.createElement("td");
     const verdictWrap = el("div", "verdict-cell-wrap");
-    verdictWrap.appendChild(el("span", ratingBadgeClass(s.rating), s.rating));
+    const verdictInline = el("div", "verdict-inline-row");
+    verdictInline.appendChild(el("span", ratingBadgeClass(s.rating), s.rating));
+    verdictInline.appendChild(createArchetypePill(pe));
+    verdictWrap.appendChild(verdictInline);
     verdictWrap.appendChild(el("span", "verdict-plain-line", pe.one_line_verdict));
     if (state.proMode && s.conviction) {
       verdictWrap.appendChild(el("span", "verdict-pro-sub", s.conviction));
@@ -1729,164 +1875,115 @@ function renderStage2Table(stocks) {
     rateTd.appendChild(verdictWrap);
     tr.appendChild(rateTd);
 
-    // 4. Score & Pillar Contribution Bar
-    const bd = resolveScoreBreakdown(s);
-    const scoreTd = document.createElement("td");
-    const scoreWrap = el("div", "score-cell-wrap");
-    const topLine = el("div", "score-top-line");
-    const bigSpan = el("span", "score-big", `${s.composite_score.toFixed(1)}`);
-    topLine.appendChild(bigSpan);
-    if (Number(bd.total_penalty || 0) > 0) {
-      topLine.appendChild(
-        el(
-          "span",
-          "penalty-tag",
-          state.proMode
-            ? `−${Number(bd.total_penalty).toFixed(1)} Guardrail`
-            : `−${Number(bd.total_penalty).toFixed(1)} Red-Flag`
-        )
+    if (!state.proMode) {
+      // 5. Price & Action (Simple mode: 5th and final column)
+      const paTd = document.createElement("td");
+      const paWrap = el("div", "price-action-wrap");
+
+      const priceStack = el("div", "price-stack");
+      priceStack.appendChild(
+        el("span", "price-main", formatStockPrice(s.price, stockCurrency(s)))
       );
+      priceStack.appendChild(createFriendlyValZonePill(s, false));
+      paWrap.appendChild(priceStack);
+
+      const actStack = el("div", "action-cell-group");
+      const ptBtn = el("button", "btn-paper-trade-xs", "Trade");
+      ptBtn.type = "button";
+      ptBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        openPaperOrderTicket(s, { side: "BUY", orderType: "LIMIT" });
+      });
+      const ddBtn = el("button", "btn-deep-dive", "Details →");
+      ddBtn.type = "button";
+      ddBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        openDeepDive(s.ticker);
+      });
+      actStack.appendChild(ptBtn);
+      actStack.appendChild(ddBtn);
+      paWrap.appendChild(actStack);
+
+      paTd.appendChild(paWrap);
+      tr.appendChild(paTd);
     } else {
-      topLine.appendChild(el("span", "muted-note", "/ 100"));
-    }
-    scoreWrap.appendChild(topLine);
-    scoreWrap.appendChild(createContributionBarSvg(bd.contributions, 8));
-
-    const miniBreak = el("div", "score-mini-breakdown");
-    miniBreak.appendChild(
-      el(
-        "span",
-        "text-pos",
-        `${state.proMode ? "Q" : "Biz"} +${Number(bd.contributions.quality).toFixed(1)}`
-      )
-    );
-    miniBreak.appendChild(
-      el(
-        "span",
-        "text-indigo",
-        `${state.proMode ? "G" : "Grow"} +${Number(bd.contributions.growth).toFixed(1)}`
-      )
-    );
-    miniBreak.appendChild(
-      el(
-        "span",
-        "text-cyan",
-        `${state.proMode ? "V" : "Price"} +${Number(bd.contributions.value).toFixed(1)}`
-      )
-    );
-    miniBreak.appendChild(
-      el(
-        "span",
-        "text-warn",
-        `${state.proMode ? "H" : "Health"} +${Number(bd.contributions.momentum).toFixed(1)}`
-      )
-    );
-    scoreWrap.appendChild(miniBreak);
-    scoreTd.appendChild(scoreWrap);
-    tr.appendChild(scoreTd);
-
-    // 5. Price vs Fair Value
-    const valTd = document.createElement("td");
-    valTd.appendChild(
-      el("div", "company-primary", formatStockPrice(s.price, stockCurrency(s)))
-    );
-    valTd.appendChild(
-      el("span", "sector-sub", formatFriendlyPriceSub(s, pe, state.proMode))
-    );
-    valTd.appendChild(createFriendlyValZonePill(s, state.proMode));
-    tr.appendChild(valTd);
-
-    // 6. Business Snapshot (Simple View: Archetype + Plain English; Pro View: Archetype + Pro Ratios)
-    const fundTd = document.createElement("td");
-    const snapWrap = el("div", "snapshot-cell-wrap");
-    snapWrap.appendChild(createArchetypePill(pe));
-
-    if (state.proMode) {
+      // 5. Pro Ratios (Pro mode)
+      const ratiosTd = document.createElement("td");
       const fundList = el("div", "fund-snapshot-list");
-      const medRoce =
-        s.metrics.med_5y_roce_pct !== undefined
-          ? s.metrics.med_5y_roce_pct
-          : s.metrics.roce_pct;
-      const stab =
-        s.metrics.moat_stability_score !== undefined ? s.metrics.moat_stability_score : 70;
+      const medRet = effectiveRoceOrRoe(s);
       const qPat =
         s.metrics.qtr_pat_yoy_pct !== undefined
           ? s.metrics.qtr_pat_yoy_pct
           : s.metrics.pat_cagr_3y_pct;
+      const s1Row = state.stage1ByTicker.get(s.ticker);
 
       fundList.appendChild(
         el(
           "span",
-          medRoce >= (s.is_financial ? 15 : 18) ? "text-pos" : "",
-          `5Y Med ${s.is_financial ? "ROE" : "ROCE"}: ${medRoce}%`
-        )
-      );
-      fundList.appendChild(
-        el(
-          "span",
-          stab >= 68 ? "text-cyan" : stab < 45 ? "text-warn" : "",
-          s.metrics.buyback_equity
-            ? `CFO/Debt: ${s.metrics.cfo_to_debt_pct}% (Buyback Eq)`
-            : `8Y Moat Stability: ${stab}/100`
+          medRet >= (s.is_financial ? 15 : 18) ? "text-pos" : "",
+          `${s.is_financial ? "ROE" : "5Y ROCE"}: ${medRet.toFixed(1)}%`
         )
       );
       fundList.appendChild(
         el(
           "span",
           qPat >= 12 ? "text-pos" : qPat < 0 ? "text-neg" : "",
-          `2Q PAT YoY: ${fmtSigned(qPat)}% • F-Score ${s.metrics.piotroski_f_score}/9`
+          `2Q PAT ${fmtSigned(qPat)}% · F-Score ${s.metrics.piotroski_f_score}/9`
         )
       );
-      snapWrap.appendChild(fundList);
-    } else {
-      const qStep = pe.receipt_steps && pe.receipt_steps[0];
-      const gStep = pe.receipt_steps && pe.receipt_steps[1];
-      const qRow0 = qStep && qStep.rows && qStep.rows[0];
-      const gRow0 = gStep && gStep.rows && gStep.rows[0];
-      if (qRow0 && qRow0.simple_value) {
-        snapWrap.appendChild(
-          el("span", `snapshot-plain-line ${toneClass(qRow0.tone)}`.trim(), qRow0.simple_value)
+      if (s1Row && s1Row.dist_52w_high_pct !== undefined) {
+        fundList.appendChild(
+          el(
+            "span",
+            s1Row.above_200dma ? "text-cyan" : "text-warn",
+            `${fmtSigned(s1Row.dist_52w_high_pct, 1)}% vs 52W High · ${
+              s1Row.above_200dma ? "Above 200D" : "Below 200D"
+            }`
+          )
         );
       }
-      if (gRow0 && gRow0.simple_value) {
-        snapWrap.appendChild(
-          el("span", "snapshot-plain-line", `5Y Sales: ${gRow0.simple_value}`)
-        );
-      }
-    }
-    fundTd.appendChild(snapWrap);
-    tr.appendChild(fundTd);
+      ratiosTd.appendChild(fundList);
+      tr.appendChild(ratiosTd);
 
-    // 7. Breakdown / Deep Dive + Paper Trade Buttons
-    const actionTd = document.createElement("td");
-    const actStack = el("div", "action-cell-group");
-    const ddBtn = el(
-      "button",
-      "btn-deep-dive",
-      state.proMode ? "Deep Dive →" : "See Why →"
-    );
-    ddBtn.type = "button";
-    ddBtn.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      openDeepDive(s.ticker);
-    });
-    const ptBtn = el("button", "btn-paper-trade-xs", "Paper Trade");
-    ptBtn.type = "button";
-    ptBtn.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      openPaperOrderTicket(s, { side: "BUY", orderType: "LIMIT" });
-    });
-    actStack.appendChild(ddBtn);
-    actStack.appendChild(ptBtn);
-    actionTd.appendChild(actStack);
-    tr.appendChild(actionTd);
+      // 6. Valuation (Pro mode)
+      const valTd = document.createElement("td");
+      valTd.appendChild(
+        el("div", "price-main", formatStockPrice(s.price, stockCurrency(s)))
+      );
+      valTd.appendChild(el("span", "sector-sub", formatFriendlyPriceSub(s, pe, true)));
+      valTd.appendChild(createFriendlyValZonePill(s, true));
+      tr.appendChild(valTd);
+
+      // 7. Action (Pro mode)
+      const actionTd = document.createElement("td");
+      const actStack = el("div", "action-cell-group");
+      const ptBtn = el("button", "btn-paper-trade-xs", "Trade");
+      ptBtn.type = "button";
+      ptBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        openPaperOrderTicket(s, { side: "BUY", orderType: "LIMIT" });
+      });
+      const ddBtn = el("button", "btn-deep-dive", "Deep Dive →");
+      ddBtn.type = "button";
+      ddBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        openDeepDive(s.ticker);
+      });
+      actStack.appendChild(ptBtn);
+      actStack.appendChild(ddBtn);
+      actionTd.appendChild(actStack);
+      tr.appendChild(actionTd);
+    }
 
     tr.addEventListener("click", () => openDeepDive(s.ticker));
     tbody.appendChild(tr);
   }
+
+  renderScreenerPaginationBar(stocks.length, pageRows.length);
 }
 
 function renderStage1Table(rows) {
+  document.getElementById("screener-pagination-bar").classList.add("hidden");
   document.getElementById("table-panel-title").textContent =
     `Stage 1: Raw Price & Momentum Funnel (${rows.length} Liquid Stocks)`;
   document.getElementById("table-panel-sub").textContent =
@@ -2460,20 +2557,22 @@ function renderCompanyDetail(detail) {
   const bd = resolveScoreBreakdown(sc);
   const pe = resolvePlainEnglish(sc, comp);
   const pro = Boolean(state.proMode);
+  const activeDdTab =
+    state.ddSubtab === "score" || state.ddSubtab === "financials" ? state.ddSubtab : "overview";
 
   // =========================================================================
-  // SECTION 1 — Hero + "What This Company Does"
+  // COMPACT HERO HEADER (Visible across all 3 sub-tabs)
   // =========================================================================
   const hero = el("div", "dd-hero-card");
   const heroTop = el("div", "dd-hero-top");
 
   const heroLeft = el("div", "dd-hero-left");
-  heroLeft.appendChild(createScoreRingSvg(sc.composite_score, sc.rating, 74));
+  heroLeft.appendChild(createScoreRingSvg(sc.composite_score, sc.rating, 68));
 
   const heroMetaWrap = document.createElement("div");
   const heroBadges = el("div", "dd-hero-badges");
   heroBadges.appendChild(el("span", "ticker-tag", sc.ticker));
-  heroBadges.appendChild(createMarketTag(mergedMarketObj));
+  heroBadges.appendChild(createMarketTag(mergedMarketObj, true));
   heroBadges.appendChild(createArchetypePill(pe));
   heroBadges.appendChild(el("span", "pill", sc.sector));
   heroMetaWrap.appendChild(heroBadges);
@@ -2483,23 +2582,21 @@ function renderCompanyDetail(detail) {
     el(
       "div",
       "muted-note",
-      `${pro ? "Market Cap" : "Company Size"}: ${formatMarketCap(
-        sc.market_cap_cr,
-        mergedMarketObj.market,
-        ccy
-      )} • ${sc.cap_tier || "Large Cap"}${sc.rank ? ` • Rank #${sc.rank}` : ""}`
+      `${formatMarketCap(sc.market_cap_cr, mergedMarketObj.market, ccy)} · ${
+        sc.cap_tier || "Large Cap"
+      }${sc.rank ? ` · Rank #${sc.rank}` : ""}`
     )
   );
   heroLeft.appendChild(heroMetaWrap);
 
   const heroRight = el("div", "dd-hero-right");
   heroRight.appendChild(el("div", "dd-cmp", formatStockPrice(sc.price, ccy)));
-  const ratingWrap = el("div", "top-gap");
+  const ratingWrap = el("div", "verdict-inline-row top-gap");
   ratingWrap.appendChild(el("span", ratingBadgeClass(sc.rating), sc.rating));
+  ratingWrap.appendChild(createFriendlyValZonePill(sc, pro));
   heroRight.appendChild(ratingWrap);
-  heroRight.appendChild(createFriendlyValZonePill(sc, pro));
   const heroTradeWrap = el("div", "top-gap");
-  const heroTradeBtn = el("button", "btn btn-paper-trade btn-xs", "Paper Trade / Set Dip Limit");
+  const heroTradeBtn = el("button", "btn btn-paper-trade btn-xs", "Paper Trade");
   heroTradeBtn.type = "button";
   heroTradeBtn.addEventListener("click", () => {
     openPaperOrderTicket(sc, { side: "BUY", orderType: "LIMIT" });
@@ -2510,8 +2607,37 @@ function renderCompanyDetail(detail) {
   heroTop.appendChild(heroLeft);
   heroTop.appendChild(heroRight);
   hero.appendChild(heroTop);
+  container.appendChild(hero);
 
-  // Crisp "What This Company Does" inner panel
+  // =========================================================================
+  // 3-SUB-TAB BAR: Overview | Score & Ratios | Financials & Street
+  // =========================================================================
+  const subtabBar = el("div", "dd-subtab-bar");
+  subtabBar.setAttribute("role", "tablist");
+  subtabBar.setAttribute("aria-label", "Company Deep-Dive Sections");
+
+  const paneOverview = el(
+    "div",
+    `dd-subtab-pane ${activeDdTab === "overview" ? "" : "hidden"}`.trim()
+  );
+  const paneScore = el(
+    "div",
+    `dd-subtab-pane ${activeDdTab === "score" ? "" : "hidden"}`.trim()
+  );
+  const paneFinancials = el(
+    "div",
+    `dd-subtab-pane ${activeDdTab === "financials" ? "" : "hidden"}`.trim()
+  );
+
+  const tabDefs = [
+    { key: "overview", label: "Overview", pane: paneOverview },
+    { key: "score", label: "Score & Ratios", pane: paneScore },
+    { key: "financials", label: "Financials & Street", pane: paneFinancials },
+  ];
+
+  // =========================================================================
+  // PANE 1 — OVERVIEW: What It Does + Verdict, 3-Point Bottom Line + AI Memo, 5Y Chart
+  // =========================================================================
   const whatBox = el("div", "dd-what-box");
   const whatHeader = el("div", "dd-what-header");
   whatHeader.appendChild(el("span", "dd-what-label", "What This Company Does"));
@@ -2530,30 +2656,20 @@ function renderCompanyDetail(detail) {
       ? "banner-avoid"
       : "";
   whatBox.appendChild(
-    el("div", `dd-verdict-banner ${bannerCls}`.trim(), `Plain Verdict: ${pe.one_line_verdict}`)
+    el("div", `dd-verdict-banner ${bannerCls}`.trim(), `Verdict: ${pe.one_line_verdict}`)
   );
-  hero.appendChild(whatBox);
-  container.appendChild(hero);
+  paneOverview.appendChild(whatBox);
 
-  // =========================================================================
-  // SECTION 2 — "The Bottom Line (30-Second Plain-English Summary)" + Ask AI Analyst
-  // =========================================================================
   const blCard = el("div", "bottom-line-card");
   const blHeader = el("div", "bottom-line-header");
   const blTitleWrap = document.createElement("div");
+  blTitleWrap.appendChild(el("div", "dd-section-title", "30-Second Bottom Line"));
   blTitleWrap.appendChild(
-    el("div", "dd-section-title", "The Bottom Line (30-Second Plain-English Summary)")
-  );
-  blTitleWrap.appendChild(
-    el(
-      "div",
-      "muted-note",
-      "Why it earned this rank in plain money terms — business quality, stock price fairness & track record"
-    )
+    el("div", "muted-note", "Business strength, valuation fairness & multi-year track record")
   );
   blHeader.appendChild(blTitleWrap);
 
-  const aiBtn = el("button", "btn-ai-memo", "✨ Ask AI Analyst (Custom Deep-Dive Memo)");
+  const aiBtn = el("button", "btn-ai-memo", "✨ Ask AI Analyst");
   aiBtn.type = "button";
   aiBtn.id = "dd-ai-memo-btn";
   blHeader.appendChild(aiBtn);
@@ -2581,11 +2697,7 @@ function renderCompanyDetail(detail) {
     const loadingBox = el("div", "ai-memo-loading");
     loadingBox.appendChild(el("span", "ai-pulse-dot"));
     loadingBox.appendChild(
-      el(
-        "span",
-        "",
-        "Generating plain-English analyst memo from 8Y financials & Street consensus..."
-      )
+      el("span", "", "Generating analyst memo from audited financials & Street consensus...")
     );
     aiMemoMount.appendChild(loadingBox);
   }
@@ -2607,11 +2719,7 @@ function renderCompanyDetail(detail) {
     const loadingBox = el("div", "ai-memo-loading");
     loadingBox.appendChild(el("span", "ai-pulse-dot"));
     loadingBox.appendChild(
-      el(
-        "span",
-        "",
-        "Generating plain-English analyst memo from 8Y financials & Street consensus..."
-      )
+      el("span", "", "Generating analyst memo from audited financials & Street consensus...")
     );
     aiMemoMount.appendChild(loadingBox);
 
@@ -2628,10 +2736,60 @@ function renderCompanyDetail(detail) {
     }
   });
 
-  container.appendChild(blCard);
+  paneOverview.appendChild(blCard);
+
+  // 5-Year Stock Price Chart (rendered when Overview pane is visible)
+  const chartCard = el("div", "dd-section-card");
+  const idxChartLabel =
+    idxTag === "NASDAQ100"
+      ? "NASDAQ 100 · USD $"
+      : idxTag === "SP500"
+      ? "S&P 500 · USD $"
+      : "NIFTY 200 · INR ₹";
+  const lineHex = idxTag === "SP500" ? "#a78bfa" : idxTag === "NASDAQ100" ? "#38bdf8" : "#10b981";
+  const fillRgba =
+    idxTag === "SP500"
+      ? "rgba(167, 139, 250, 0.14)"
+      : idxTag === "NASDAQ100"
+      ? "rgba(56, 189, 248, 0.14)"
+      : "rgba(16, 185, 129, 0.12)";
+  chartCard.appendChild(
+    el("div", "dd-section-title", `5-Year Stock Price History (${idxChartLabel})`)
+  );
+  chartCard.appendChild(
+    el(
+      "div",
+      "dd-section-sub",
+      `5-year share price trend in ${ccy === "USD" ? "US Dollars ($)" : "Indian Rupees (₹)"}`
+    )
+  );
+  const chartBox = el("div", "chart-box-sm");
+  chartCard.appendChild(chartBox);
+  paneOverview.appendChild(chartCard);
+
+  const ph = detail.price_history || [];
+  let overviewChartMounted = false;
+  const mountOverviewPriceChart = () => {
+    if (overviewChartMounted && chartBox.childNodes.length > 0) return;
+    renderMultiLineChart(
+      chartBox,
+      [
+        {
+          name: sc.ticker,
+          values: ph.map((p) => p.close_price),
+          color: lineHex,
+          areaFill: fillRgba,
+        },
+      ],
+      ph.map((p) => p.trade_date),
+      (v) => formatStockPrice(v, ccy),
+      { height: 185 }
+    );
+    overviewChartMounted = true;
+  };
 
   // =========================================================================
-  // SECTION 3 — "How It Earned X / 100 (Simple Score Receipt)"
+  // PANE 2 — SCORE & RATIOS: Score Math Bar + 4 Pillar Cards
   // =========================================================================
   const receiptCard = el("div", "dd-section-card");
   receiptCard.appendChild(
@@ -2640,7 +2798,7 @@ function renderCompanyDetail(detail) {
       "dd-section-title",
       pro
         ? `How It Earned ${sc.composite_score.toFixed(1)} / 100 — Weighted Pillar Waterfall`
-        : `How It Earned ${sc.composite_score.toFixed(1)} / 100 (Simple Score Receipt)`
+        : `How It Earned ${sc.composite_score.toFixed(1)} / 100`
     )
   );
   receiptCard.appendChild(
@@ -2648,10 +2806,10 @@ function renderCompanyDetail(detail) {
       "div",
       "dd-section-sub",
       pro
-        ? `Exact weighted pillar contributions & guardrail deductions under ${
-            PRESET_NAMES[bd.preset_used] || "Active Philosophy"
-          }`
-        : "Four everyday questions add up to 100 points — minus any red-flag deductions"
+        ? `Weighted pillar contributions & guardrail deductions (${
+            PRESET_NAMES[bd.preset_used] || "Active Model"
+          })`
+        : "Four pillars add up to 100 points — minus any red-flag deductions"
     )
   );
   receiptCard.appendChild(createContributionBarSvg(bd.contributions, 10));
@@ -2669,7 +2827,11 @@ function renderCompanyDetail(detail) {
     const mainCol = el("div", "receipt-step-main");
     const titleLine = el("div", "receipt-title-line");
     titleLine.appendChild(
-      el("span", "receipt-step-title", pro ? step.pro_title || step.simple_title : step.simple_title)
+      el(
+        "span",
+        "receipt-step-title",
+        pro ? step.pro_title || step.simple_title : step.simple_title
+      )
     );
     if (step.verdict_tag) {
       titleLine.appendChild(el("span", verdictTagClass(step.verdict_tag), step.verdict_tag));
@@ -2706,7 +2868,6 @@ function renderCompanyDetail(detail) {
     receiptList.appendChild(sRow);
   }
 
-  // Red-flag deductions / clean safety check row
   const penItems = bd.penalty_items || [];
   if (penItems.length > 0) {
     for (const item of penItems) {
@@ -2768,9 +2929,9 @@ function renderCompanyDetail(detail) {
     el(
       "div",
       "receipt-plain-why",
-      `${Number(bd.raw_composite).toFixed(1)} points from 4 steps − ${Number(
+      `${Number(bd.raw_composite).toFixed(1)} pillar points − ${Number(
         bd.total_penalty || 0
-      ).toFixed(1)} red-flag deductions`
+      ).toFixed(1)} deductions`
     )
   );
   totalRow.appendChild(tMain);
@@ -2787,9 +2948,87 @@ function renderCompanyDetail(detail) {
   if (pro && bd.rating_rule) {
     receiptCard.appendChild(el("div", "rule-verdict-box", `Verdict Rule: ${bd.rating_rule}`));
   }
-  container.appendChild(receiptCard);
+  paneScore.appendChild(receiptCard);
 
-  // In Pro View, also show Institutional Bull Thesis vs Forensic Guardrail bullets
+  const stepBarHex = {
+    quality: "#10b981",
+    growth: "#818cf8",
+    value: "#38bdf8",
+    momentum: "#f59e0b",
+  };
+  const qGrid = el("div", "dd-two-col");
+
+  pe.receipt_steps.forEach((step, idx) => {
+    const qCard = el("div", "question-card");
+    const qHead = el("div", "q-card-header");
+    const qTitleWrap = el("div", "q-card-title-wrap");
+    qTitleWrap.appendChild(
+      el("span", "ev-title", pro ? step.pro_title || step.simple_title : step.simple_title)
+    );
+    if (step.verdict_tag) {
+      qTitleWrap.appendChild(el("span", verdictTagClass(step.verdict_tag), step.verdict_tag));
+    }
+    qHead.appendChild(qTitleWrap);
+
+    const scColor = stepPtsClasses[step.key] || "text-cyan";
+    const scVal = Number(step.score_100 || 0);
+    qHead.appendChild(
+      el("span", `q-card-score ${scColor}`, `${scVal.toFixed(pro ? 1 : 0)} / 100`)
+    );
+    qCard.appendChild(qHead);
+    qCard.appendChild(createProgressSvg(scVal, stepBarHex[step.key] || "#38bdf8"));
+
+    const rowsWrap = el("div", "q-metrics-list");
+    for (const row of step.rows || []) {
+      const mRow = el("div", "q-metric-row");
+      const left = el("div", "q-m-left");
+      const right = el("div", "q-m-right");
+      const tCls = toneClass(row.tone);
+
+      if (pro) {
+        left.appendChild(el("span", "q-m-label", row.pro_label || row.simple_label));
+        if (row.target_hint) {
+          left.appendChild(el("span", "q-m-sub", row.target_hint));
+        }
+        right.appendChild(
+          el("span", `q-m-val ${tCls}`.trim(), row.pro_value || row.simple_value)
+        );
+      } else {
+        left.appendChild(el("span", "q-m-label", row.simple_label));
+        if (row.target_hint) {
+          left.appendChild(el("span", "q-m-sub", row.target_hint));
+        }
+        right.appendChild(el("span", `q-m-val ${tCls}`.trim(), row.simple_value));
+      }
+
+      mRow.appendChild(left);
+      mRow.appendChild(right);
+      rowsWrap.appendChild(mRow);
+    }
+    qCard.appendChild(rowsWrap);
+
+    if (step.key === "momentum" || idx === 3) {
+      const checksToShow = pro
+        ? sc.piotroski_checks && sc.piotroski_checks.length > 0
+          ? sc.piotroski_checks
+          : pe.safety_checks_plain || []
+        : pe.safety_checks_plain && pe.safety_checks_plain.length > 0
+        ? pe.safety_checks_plain
+        : [];
+      if (checksToShow.length > 0) {
+        const checksWrap = el("div", "fscore-checks-wrap");
+        for (const chk of checksToShow) {
+          checksWrap.appendChild(el("span", "check-pill", `✓ ${chk}`));
+        }
+        qCard.appendChild(checksWrap);
+      }
+    }
+
+    qGrid.appendChild(qCard);
+  });
+
+  paneScore.appendChild(qGrid);
+
   if (pro) {
     const thesisGrid = el("div", "dd-two-col");
     const bullBox = el("div", "thesis-box");
@@ -2832,157 +3071,23 @@ function renderCompanyDetail(detail) {
     }
     flagBox.appendChild(flagList);
     thesisGrid.appendChild(flagBox);
-    container.appendChild(thesisGrid);
+    paneScore.appendChild(thesisGrid);
   }
 
   // =========================================================================
-  // SECTION 4 — 4 Plain-English Question Cards (2x2 Grid)
-  // =========================================================================
-  const stepBarHex = {
-    quality: "#10b981",
-    growth: "#818cf8",
-    value: "#38bdf8",
-    momentum: "#f59e0b",
-  };
-  const qGrid = el("div", "dd-two-col");
-
-  pe.receipt_steps.forEach((step, idx) => {
-    const qCard = el("div", "question-card");
-    const qHead = el("div", "q-card-header");
-    const qTitleWrap = el("div", "q-card-title-wrap");
-    qTitleWrap.appendChild(
-      el("span", "ev-title", pro ? step.pro_title || step.simple_title : step.simple_title)
-    );
-    if (step.verdict_tag) {
-      qTitleWrap.appendChild(el("span", verdictTagClass(step.verdict_tag), step.verdict_tag));
-    }
-    qHead.appendChild(qTitleWrap);
-
-    const scColor = stepPtsClasses[step.key] || "text-cyan";
-    const scVal = Number(step.score_100 || 0);
-    qHead.appendChild(
-      el("span", `q-card-score ${scColor}`, `${scVal.toFixed(pro ? 1 : 0)} / 100`)
-    );
-    qCard.appendChild(qHead);
-    qCard.appendChild(createProgressSvg(scVal, stepBarHex[step.key] || "#38bdf8"));
-
-    const rowsWrap = el("div", "q-metrics-list");
-    for (const row of step.rows || []) {
-      const mRow = el("div", "q-metric-row");
-      const left = el("div", "q-m-left");
-      const right = el("div", "q-m-right");
-      const tCls = toneClass(row.tone);
-
-      if (pro) {
-        left.appendChild(el("span", "q-m-label", row.pro_label || row.simple_label));
-        const subParts = [row.simple_label, row.target_hint].filter(Boolean);
-        if (subParts.length > 0) {
-          left.appendChild(el("span", "q-m-sub", subParts.join(" • ")));
-        }
-        right.appendChild(
-          el("span", `q-m-val ${tCls}`.trim(), row.pro_value || row.simple_value)
-        );
-        if (row.simple_value && row.simple_value !== row.pro_value) {
-          right.appendChild(el("span", "q-m-val-sub", row.simple_value));
-        }
-      } else {
-        left.appendChild(el("span", "q-m-label", row.simple_label));
-        if (row.target_hint) {
-          left.appendChild(el("span", "q-m-sub", row.target_hint));
-        }
-        right.appendChild(el("span", `q-m-val ${tCls}`.trim(), row.simple_value));
-      }
-
-      mRow.appendChild(left);
-      mRow.appendChild(right);
-      rowsWrap.appendChild(mRow);
-    }
-    qCard.appendChild(rowsWrap);
-
-    // Card 4: Plain-English Safety Checks in Simple View, Piotroski Checks in Pro View
-    if (step.key === "momentum" || idx === 3) {
-      const checksToShow = pro
-        ? sc.piotroski_checks && sc.piotroski_checks.length > 0
-          ? sc.piotroski_checks
-          : pe.safety_checks_plain || []
-        : pe.safety_checks_plain && pe.safety_checks_plain.length > 0
-        ? pe.safety_checks_plain
-        : [];
-      if (checksToShow.length > 0) {
-        const checksWrap = el("div", "fscore-checks-wrap");
-        for (const chk of checksToShow) {
-          checksWrap.appendChild(el("span", "check-pill", `✓ ${chk}`));
-        }
-        qCard.appendChild(checksWrap);
-      }
-    }
-
-    qGrid.appendChild(qCard);
-  });
-
-  container.appendChild(qGrid);
-
-  // =========================================================================
-  // SECTION 5 — Expert / Analyst Consensus Card + 5Y Price Chart + 6Y Financials
+  // PANE 3 — FINANCIALS & STREET: Street Consensus Card + 6Y Financials Table
   // =========================================================================
   if (sc.street && sc.street.has_coverage && Number(sc.street.analyst_count || 0) > 0) {
-    container.appendChild(buildStreetConsensusCard(sc, mergedMarketObj, ccy, pro));
+    paneFinancials.appendChild(buildStreetConsensusCard(sc, mergedMarketObj, ccy, pro));
+  } else {
+    const noStreetCard = el("div", "dd-section-card");
+    noStreetCard.appendChild(el("div", "dd-section-title", "Street Consensus"));
+    noStreetCard.appendChild(
+      el("div", "muted-note", "No active sell-side analyst coverage published for this stock.")
+    );
+    paneFinancials.appendChild(noStreetCard);
   }
 
-  // 5-Year Price Chart
-  const chartCard = el("div", "dd-section-card");
-  const idxChartLabel =
-    idxTag === "NASDAQ100"
-      ? "NASDAQ 100 · USD $"
-      : idxTag === "SP500"
-      ? "S&P 500 · USD $"
-      : "NIFTY 200 · INR ₹";
-  const lineHex = idxTag === "SP500" ? "#a78bfa" : idxTag === "NASDAQ100" ? "#38bdf8" : "#10b981";
-  const fillRgba =
-    idxTag === "SP500"
-      ? "rgba(167, 139, 250, 0.14)"
-      : idxTag === "NASDAQ100"
-      ? "rgba(56, 189, 248, 0.14)"
-      : "rgba(16, 185, 129, 0.12)";
-  chartCard.appendChild(
-    el(
-      "div",
-      "dd-section-title",
-      pro
-        ? `5-Year Historical Price Trajectory (${idxChartLabel})`
-        : `5-Year Stock Price History (${idxChartLabel})`
-    )
-  );
-  chartCard.appendChild(
-    el(
-      "div",
-      "dd-section-sub",
-      pro
-        ? "Daily adjusted close history used for point-in-time valuation & momentum"
-        : `5-year share price trend in ${ccy === "USD" ? "US Dollars ($)" : "Indian Rupees (₹)"}`
-    )
-  );
-  const chartBox = el("div", "chart-box-sm");
-  chartCard.appendChild(chartBox);
-  container.appendChild(chartCard);
-
-  const ph = detail.price_history || [];
-  renderMultiLineChart(
-    chartBox,
-    [
-      {
-        name: sc.ticker,
-        values: ph.map((p) => p.close_price),
-        color: lineHex,
-        areaFill: fillRgba,
-      },
-    ],
-    ph.map((p) => p.trade_date),
-    (v) => formatStockPrice(v, ccy),
-    { height: 185 }
-  );
-
-  // 6-Year Audited Financials Table (Clear plain-English headers in Simple View, Pro labels in Pro View)
   const finCard = el("div", "dd-section-card");
   finCard.appendChild(
     el(
@@ -3001,9 +3106,9 @@ function renderCompanyDetail(detail) {
       "dd-section-sub",
       pro
         ? us
-          ? "Official SEC EDGAR XBRL 10-K audited annual statements"
+          ? "SEC EDGAR XBRL 10-K audited annual statements"
           : "Audited consolidated NSE annual filings"
-        : "Official audited yearly company results over the last 6 financial years"
+        : "Audited yearly company results over the last 6 financial years"
     )
   );
 
@@ -3024,12 +3129,12 @@ function renderCompanyDetail(detail) {
       ]
     : [
         "Year",
-        `Annual Sales ${unitTag}`,
+        `Sales ${unitTag}`,
         `Operating Profit ${unitTag}`,
         `Net Profit ${unitTag}`,
-        sc.is_financial ? "Return on Equity" : "Return on Capital",
-        "Profit Margin",
-        sc.is_financial ? `Shareholder Equity ${unitTag}` : "Cash Conversion",
+        sc.is_financial ? "ROE" : "ROCE",
+        "Margin",
+        sc.is_financial ? `Equity ${unitTag}` : "Cash Conv.",
       ];
   for (const col of finCols) {
     htr.appendChild(el("th", "", col));
@@ -3076,7 +3181,42 @@ function renderCompanyDetail(detail) {
   fTable.appendChild(ftbody);
   fTableWrap.appendChild(fTable);
   finCard.appendChild(fTableWrap);
-  container.appendChild(finCard);
+  paneFinancials.appendChild(finCard);
+
+  // Wire sub-tab buttons & mount panes
+  const subtabButtons = [];
+  for (const tDef of tabDefs) {
+    const btn = el(
+      "button",
+      `dd-subtab-btn ${activeDdTab === tDef.key ? "active" : ""}`.trim(),
+      tDef.label
+    );
+    btn.type = "button";
+    btn.dataset.ddSubtab = tDef.key;
+    btn.addEventListener("click", () => {
+      state.ddSubtab = tDef.key;
+      for (const b of subtabButtons) {
+        b.classList.toggle("active", b.dataset.ddSubtab === tDef.key);
+      }
+      for (const d of tabDefs) {
+        d.pane.classList.toggle("hidden", d.key !== tDef.key);
+      }
+      if (tDef.key === "overview") {
+        mountOverviewPriceChart();
+      }
+    });
+    subtabButtons.push(btn);
+    subtabBar.appendChild(btn);
+  }
+
+  container.appendChild(subtabBar);
+  container.appendChild(paneOverview);
+  container.appendChild(paneScore);
+  container.appendChild(paneFinancials);
+
+  if (activeDdTab === "overview") {
+    mountOverviewPriceChart();
+  }
 }
 
 // --- Funnel Actions, Live Sync & CSV Import ---
@@ -3294,24 +3434,26 @@ function renderPlannerResults(plan) {
 
   const basketTitle = document.getElementById("pl-basket-title");
   if (state.plannerMarket === "NASDAQ100") {
-    basketTitle.textContent = "Recommended US · Nasdaq 100 Buy Basket — Where to Invest & Why";
+    basketTitle.textContent = "Recommended US · Nasdaq 100 Buy Basket";
   } else if (state.plannerMarket === "SP500") {
-    basketTitle.textContent =
-      "Recommended US · S&P 500 (Non-Nasdaq) Buy Basket — Where to Invest & Why";
+    basketTitle.textContent = "Recommended US · S&P 500 Buy Basket";
   } else if (state.plannerMarket === "US") {
-    basketTitle.textContent =
-      "Recommended All-US (Nasdaq 100 + S&P 500) Buy Basket — Where to Invest & Why";
+    basketTitle.textContent = "Recommended All-US Buy Basket";
   } else if (state.plannerMarket === "IN") {
-    basketTitle.textContent = "Recommended India · Nifty 200 Buy Basket — Where to Invest & Why";
+    basketTitle.textContent = "Recommended India · Nifty 200 Buy Basket";
   } else {
-    basketTitle.textContent = "Recommended Global Compounder Basket — Where to Invest & Why";
+    basketTitle.textContent = "Recommended Global Compounder Basket";
+    const marketSub = document.getElementById("pl-market-sub");
+    if (marketSub && plan.fx_usd_inr) {
+      marketSub.textContent = `₹ INR deployment across Global leaders (US sized at ₹${Number(plan.fx_usd_inr).toFixed(2)}/$)`;
+    }
   }
 
   kpis.appendChild(
     buildKpiCard(
-      "Equity Allocated in Shares",
+      "Equity Allocated",
       formatCurrencyCompact(d.deployed_in_shares_inr || 0, planCcy),
-      `${d.sectors_covered || 0} Sectors • Unallocated Cash: ${formatExactAmount(
+      `${d.sectors_covered || 0} Sectors · Cash Left: ${formatExactAmount(
         d.residual_cash_inr || 0,
         planCcy
       )}`,
@@ -3320,19 +3462,19 @@ function renderPlannerResults(plan) {
   );
   kpis.appendChild(
     buildKpiCard(
-      "Entry Tranche Strategy",
+      "Entry Tranche",
       `${formatCurrencyCompact(d.immediate_tranche_inr || 0, planCcy)} Now`,
       d.staggered_dip_reserve_inr > 0
-        ? `+ ${formatCurrencyCompact(d.staggered_dip_reserve_inr, planCcy)} held for 6–8% pullbacks`
-        : "100% within Fair GARP P/E band — deploy today",
+        ? `+ ${formatCurrencyCompact(d.staggered_dip_reserve_inr, planCcy)} for 6–8% pullbacks`
+        : "100% within Fair P/E band",
       "text-cyan"
     )
   );
   kpis.appendChild(
     buildKpiCard(
-      "Expected Median Corpus",
+      "Median Corpus",
       formatCurrencyCompact(g.median_corpus_inr || 0, planCcy),
-      `Bear 10th: ${formatCurrencyCompact(g.bear_10_corpus_inr || 0, planCcy)} → Bull 90th: ${formatCurrencyCompact(
+      `Bear: ${formatCurrencyCompact(g.bear_10_corpus_inr || 0, planCcy)} → Bull: ${formatCurrencyCompact(
         g.bull_90_corpus_inr || 0,
         planCcy
       )}`,
@@ -3341,16 +3483,11 @@ function renderPlannerResults(plan) {
   );
   kpis.appendChild(
     buildKpiCard(
-      "Goal Achievement Odds",
+      "Goal Odds",
       `${g.goal_probability_pct}%`,
       g.recommended_extra_sip_inr > 0
-        ? `Target ${formatCurrencyCompact(g.target_corpus_inr, planCcy)} • Add +${formatCurrencyCompact(
-            g.recommended_extra_sip_inr,
-            planCcy
-          )}/mo SIP`
-        : `On track for ${formatCurrencyCompact(g.target_corpus_inr, planCcy)} (${
-            plan.expected_cagr_pct
-          }% Est. CAGR)`,
+        ? `Add +${formatCurrencyCompact(g.recommended_extra_sip_inr, planCcy)}/mo SIP`
+        : `Target ${formatCurrencyCompact(g.target_corpus_inr, planCcy)} (${plan.expected_cagr_pct}% CAGR)`,
       g.goal_probability_pct >= 60 ? "text-pos" : "text-warn"
     )
   );
@@ -3360,35 +3497,35 @@ function renderPlannerResults(plan) {
   for (const s of plan.stock_basket || []) {
     const tr = document.createElement("tr");
 
-    // 1. Company & Portfolio Role + Market Tag
+    // 1. Company
     const nameTd = document.createElement("td");
     const line = el("div", "company-primary");
     line.appendChild(el("span", "", s.name));
     line.appendChild(el("span", "ticker-tag", displaySymbol(s.ticker)));
-    line.appendChild(createMarketTag(s));
+    line.appendChild(createMarketTag(s, true));
     nameTd.appendChild(line);
-    nameTd.appendChild(el("span", "sector-sub", `${s.sector} • ${s.role}`));
+    nameTd.appendChild(el("span", "sector-sub", `${s.sector} · ${s.role}`));
     tr.appendChild(nameTd);
 
-    // 2. Verdict
-    const rTd = document.createElement("td");
-    rTd.appendChild(el("span", ratingBadgeClass(s.rating), s.rating));
-    tr.appendChild(rTd);
-
-    // 3. Score
-    tr.appendChild(el("td", "score-big", Number(s.composite_score || 0).toFixed(1)));
-
-    // 4. CMP vs Fair P/E (native stock currency)
-    const cmpTd = document.createElement("td");
-    cmpTd.appendChild(
-      el("div", "company-primary", formatStockPrice(s.price, stockCurrency(s)))
+    // 2. Verdict & Score
+    const vsTd = document.createElement("td");
+    const vsRow = el("div", "verdict-inline-row");
+    vsRow.appendChild(el("span", ratingBadgeClass(s.rating), s.rating));
+    vsRow.appendChild(el("span", "score-big", Number(s.composite_score || 0).toFixed(1)));
+    vsTd.appendChild(vsRow);
+    vsTd.appendChild(
+      el(
+        "span",
+        "sector-sub",
+        `${formatStockPrice(s.price, stockCurrency(s))} · P/E ${formatPeVsFair({
+          pe_ratio: s.pe_ratio,
+          fair_pe: s.fair_pe,
+        })}`
+      )
     );
-    cmpTd.appendChild(
-      el("span", "sector-sub", `P/E ${formatPeVsFair({ pe_ratio: s.pe_ratio, fair_pe: s.fair_pe })}`)
-    );
-    tr.appendChild(cmpTd);
+    tr.appendChild(vsTd);
 
-    // 5. Allocation & Shares (plan currency)
+    // 3. Allocation & Shares
     const allocTd = document.createElement("td");
     allocTd.appendChild(
       el(
@@ -3399,12 +3536,12 @@ function renderPlannerResults(plan) {
     );
     const subAlloc =
       s.monthly_sip_inr > 0
-        ? `Weight ${s.equity_weight_pct}% • +${formatExactAmount(s.monthly_sip_inr, planCcy)}/mo SIP`
-        : `Portfolio Weight: ${s.equity_weight_pct}%`;
+        ? `Weight ${s.equity_weight_pct}% · +${formatExactAmount(s.monthly_sip_inr, planCcy)}/mo`
+        : `Weight ${s.equity_weight_pct}%`;
     allocTd.appendChild(el("span", "sector-sub", subAlloc));
     tr.appendChild(allocTd);
 
-    // 6. Entry Execution Plan
+    // 4. Entry Plan
     tr.appendChild(
       el(
         "td",
@@ -3413,24 +3550,16 @@ function renderPlannerResults(plan) {
       )
     );
 
-    // 7. Investment Rationale
-    const whyTd = el("td", "cell-wrap");
-    whyTd.appendChild(el("div", "", s.why_buy));
-    if (s.strength_highlight) {
-      whyTd.appendChild(el("span", "sector-sub text-pos", `✓ ${s.strength_highlight}`));
-    }
-    tr.appendChild(whyTd);
-
-    // 8. Paper Trade & Deep Dive Buttons
+    // 5. Action
     const ddTd = document.createElement("td");
     const actWrap = el("div", "action-cell-group");
-    const ptBtn = el("button", "btn-paper-trade-xs", "Paper Trade");
+    const ptBtn = el("button", "btn-paper-trade-xs", "Trade");
     ptBtn.type = "button";
     ptBtn.addEventListener("click", (ev) => {
       ev.stopPropagation();
       openPaperOrderTicket(s, { side: "BUY", orderType: "LIMIT" });
     });
-    const ddBtn = el("button", "btn-deep-dive", "Deep Dive →");
+    const ddBtn = el("button", "btn-deep-dive", "Details →");
     ddBtn.type = "button";
     ddBtn.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -3857,22 +3986,73 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("sync-ticker-btn").addEventListener("click", handleLiveTickerSync);
   document.getElementById("csv-upload-btn").addEventListener("click", handleCsvUpload);
 
-  // Screener Controls
-  document.getElementById("screener-search").addEventListener("input", applyClientFiltersAndRender);
-  document.getElementById("screener-sort").addEventListener("change", applyClientFiltersAndRender);
+  // Screener & 4-Group Advanced Filters Controls
+  document
+    .getElementById("toggle-adv-filters-btn")
+    .addEventListener("click", toggleAdvFiltersDrawer);
+  document.getElementById("af-show-podium").addEventListener("change", (ev) => {
+    state.showPodium = Boolean(ev.target.checked);
+    renderTopPodium(state.visibleStocks);
+  });
+  document.getElementById("af-reset-btn").addEventListener("click", () => {
+    resetAllScreenerFilters();
+  });
+
+  const handleAdvFilterChange = () => {
+    state.pageLimit = DEFAULT_PAGE_LIMIT;
+    readAdvFiltersFromDom();
+    applyClientFiltersAndRender();
+  };
+  document.getElementById("af-val-zone").addEventListener("change", handleAdvFilterChange);
+  document.getElementById("af-max-pe").addEventListener("change", handleAdvFilterChange);
+  document.getElementById("af-min-roce").addEventListener("change", handleAdvFilterChange);
+  document.getElementById("af-max-de").addEventListener("change", handleAdvFilterChange);
+  document.getElementById("af-min-growth").addEventListener("change", handleAdvFilterChange);
+  document.getElementById("af-archetype").addEventListener("change", handleAdvFilterChange);
+  document.getElementById("af-zero-flags").addEventListener("change", handleAdvFilterChange);
+  document.getElementById("af-street").addEventListener("change", handleAdvFilterChange);
+  document.getElementById("af-52w").addEventListener("change", handleAdvFilterChange);
+  document.getElementById("af-cap-tier").addEventListener("change", handleAdvFilterChange);
+  document.getElementById("af-above-200dma").addEventListener("change", handleAdvFilterChange);
+
+  document.getElementById("screener-search").addEventListener("input", () => {
+    state.pageLimit = DEFAULT_PAGE_LIMIT;
+    applyClientFiltersAndRender();
+  });
+  document.getElementById("screener-sort").addEventListener("change", () => {
+    state.pageLimit = DEFAULT_PAGE_LIMIT;
+    applyClientFiltersAndRender();
+  });
   document.getElementById("screener-preset").addEventListener("change", (ev) => {
     const isCustom = ev.target.value === "custom";
+    state.pageLimit = DEFAULT_PAGE_LIMIT;
     document.getElementById("custom-weights-row").classList.toggle("hidden", !isCustom);
     renderFormulaBar();
     if (!isCustom) loadScreener(false);
   });
-  document.getElementById("screener-sector").addEventListener("change", () => loadScreener(false));
+  document.getElementById("screener-sector").addEventListener("change", () => {
+    state.pageLimit = DEFAULT_PAGE_LIMIT;
+    loadScreener(false);
+  });
   document.getElementById("apply-weights-btn").addEventListener("click", () => {
+    state.pageLimit = DEFAULT_PAGE_LIMIT;
     renderFormulaBar();
     loadScreener(false);
   });
 
-  // Planner, Paper Basket Deploy & Backtest Controls
+  // Planner, Paper Basket Deploy & Backtest Controls + Progressive Disclosure Toggles
+  document.getElementById("toggle-pl-adv-btn").addEventListener("click", (ev) => {
+    const drawer = document.getElementById("pl-adv-drawer");
+    const nowOpen = drawer.classList.toggle("hidden") === false;
+    ev.currentTarget.classList.toggle("active", nowOpen);
+    ev.currentTarget.setAttribute("aria-expanded", nowOpen ? "true" : "false");
+  });
+  document.getElementById("toggle-bt-adv-btn").addEventListener("click", (ev) => {
+    const drawer = document.getElementById("bt-adv-drawer");
+    const nowOpen = drawer.classList.toggle("hidden") === false;
+    ev.currentTarget.classList.toggle("active", nowOpen);
+    ev.currentTarget.setAttribute("aria-expanded", nowOpen ? "true" : "false");
+  });
   document.getElementById("run-planner-btn").addEventListener("click", runPlanner);
   document
     .getElementById("deploy-paper-basket-btn")

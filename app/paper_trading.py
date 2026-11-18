@@ -17,6 +17,7 @@ import concurrent.futures
 import datetime as dt
 import logging
 import math
+import os
 import threading
 import time
 import urllib.parse
@@ -36,8 +37,12 @@ from app.schemas import (
 
 logger = logging.getLogger("arthaquant.paper")
 
-USD_INR_FX = 84.5
-BENCHMARK_SYMBOLS: Tuple[str, ...] = ("^NSEI", "^GSPC", "^NDX")
+FX_USD_INR_SYMBOL = "USDINR=X"
+USD_INR_FX = 93.44
+LIVE_QUOTE_STALE_SECONDS = 300
+BENCHMARK_SYMBOLS: Tuple[str, ...] = ("^NSEI", "^GSPC", "^NDX", FX_USD_INR_SYMBOL)
+ALLOWED_MARKET_SCOPES: Tuple[str, ...] = ("ALL", "IN", "US")
+UNQUOTED_AGE_SENTINEL_SECONDS = 999999
 ATTRIBUTION_RATINGS: Tuple[str, ...] = ("Strong Buy", "Buy", "Hold")
 BROWSER_UA = "Mozilla/5.0"
 
@@ -56,24 +61,228 @@ class PaperValidationError(PaperTradingError):
     """Raised when an order, ticker, or balance constraint fails validation (400)."""
 
 
-def _utc_now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def _utc_now_dt() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
 
 
-def _utc_today_str() -> str:
-    return time.strftime("%Y-%m-%d", time.gmtime())
+def _utc_now_iso(now_utc: Optional[dt.datetime] = None) -> str:
+    ts = now_utc if now_utc is not None else _utc_now_dt()
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    else:
+        ts = ts.astimezone(dt.timezone.utc)
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def compute_fx_rate(native_currency: str, portfolio_currency: str) -> float:
+def _utc_today_str(now_utc: Optional[dt.datetime] = None) -> str:
+    ts = now_utc if now_utc is not None else _utc_now_dt()
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    else:
+        ts = ts.astimezone(dt.timezone.utc)
+    return ts.strftime("%Y-%m-%d")
+
+
+def is_indian_ticker(ticker: str) -> bool:
+    """Return True if `ticker` is NSE/BSE Indian equity or `^NSEI` benchmark."""
+    tk = (ticker or "").strip().upper()
+    return tk == "^NSEI" or tk.endswith(".NS") or tk.endswith(".BO")
+
+
+def normalize_market_scope(market_scope: Optional[str]) -> str:
+    """Validate and normalize `market_scope` into `'ALL' | 'IN' | 'US'`."""
+    if market_scope is None:
+        return "ALL"
+    if not isinstance(market_scope, str):
+        raise PaperValidationError("market_scope must be 'ALL', 'IN', or 'US'.")
+    cleaned = market_scope.strip().upper()
+    if not cleaned:
+        return "ALL"
+    if cleaned not in ALLOWED_MARKET_SCOPES:
+        raise PaperValidationError("market_scope must be 'ALL', 'IN', or 'US'.")
+    return cleaned
+
+
+def matches_market_scope(ticker: str, market_scope: str) -> bool:
+    """Return True if `ticker` belongs to `market_scope` (`'ALL' | 'IN' | 'US'`)."""
+    if market_scope == "IN":
+        return is_indian_ticker(ticker)
+    if market_scope == "US":
+        return not is_indian_ticker(ticker)
+    return True
+
+
+def benchmarks_for_scope(market_scope: str) -> Tuple[str, ...]:
+    """Return benchmark index & FX symbols to refresh for `market_scope`."""
+    if market_scope == "IN":
+        return ("^NSEI", FX_USD_INR_SYMBOL)
+    if market_scope == "US":
+        return ("^GSPC", "^NDX", FX_USD_INR_SYMBOL)
+    return BENCHMARK_SYMBOLS
+
+
+def compute_market_session_status(now_utc: Optional[dt.datetime] = None) -> Dict[str, Any]:
+    """Compute UTC-based NSE & US market session windows and recommended refresh scope."""
+    ts = now_utc if now_utc is not None else _utc_now_dt()
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    else:
+        ts = ts.astimezone(dt.timezone.utc)
+
+    is_weekday = 1 <= ts.isoweekday() <= 5
+    utc_minutes = ts.hour * 60 + ts.minute
+    in_market_open = bool(is_weekday and (3 * 60 + 45) <= utc_minutes <= (10 * 60 + 15))
+    us_market_open = bool(is_weekday and (13 * 60 + 30) <= utc_minutes <= (21 * 60 + 15))
+    recommended_scope = "IN" if in_market_open else ("US" if us_market_open else "NONE")
+    return {
+        "in_market_open": in_market_open,
+        "us_market_open": us_market_open,
+        "recommended_scope": recommended_scope,
+    }
+
+
+def _parse_iso_utc(raw_ts: Optional[str]) -> Optional[dt.datetime]:
+    if not raw_ts or not isinstance(raw_ts, str):
+        return None
+    cleaned = raw_ts.strip()
+    if not cleaned:
+        return None
+    try:
+        if cleaned.endswith("Z"):
+            cleaned = cleaned[:-1] + "+00:00"
+        parsed = dt.datetime.fromisoformat(cleaned)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def compute_quotes_meta(
+    live_quotes: Dict[str, Dict[str, Any]],
+    active_tickers: Optional[Iterable[str]] = None,
+    benchmark_ticker: Optional[str] = None,
+    has_active_portfolio: bool = False,
+    now_utc: Optional[dt.datetime] = None,
+) -> Dict[str, Any]:
+    """Build `quotes_meta` payload with session status, latest timestamp, and scoped staleness age."""
+    ts_now = now_utc if now_utc is not None else _utc_now_dt()
+    if ts_now.tzinfo is None:
+        ts_now = ts_now.replace(tzinfo=dt.timezone.utc)
+    else:
+        ts_now = ts_now.astimezone(dt.timezone.utc)
+
+    session = compute_market_session_status(ts_now)
+    rec_scope = session["recommended_scope"]
+    held_and_order_tks = sorted({str(t).strip().upper() for t in (active_tickers or []) if t and str(t).strip()})
+
+    latest_dt: Optional[dt.datetime] = None
+    latest_str: Optional[str] = None
+    candidate_for_latest = list(held_and_order_tks)
+    if benchmark_ticker:
+        candidate_for_latest.append(str(benchmark_ticker).strip().upper())
+
+    if candidate_for_latest:
+        for tk in candidate_for_latest:
+            q = live_quotes.get(tk)
+            u_str = str(q.get("updated_at") or "") if isinstance(q, dict) else ""
+            u_dt = _parse_iso_utc(u_str)
+            if u_dt is not None and (latest_dt is None or u_dt > latest_dt):
+                latest_dt = u_dt
+                latest_str = u_str
+
+    if latest_str is None:
+        for q in live_quotes.values():
+            u_str = str(q.get("updated_at") or "") if isinstance(q, dict) else ""
+            u_dt = _parse_iso_utc(u_str)
+            if u_dt is not None and (latest_dt is None or u_dt > latest_dt):
+                latest_dt = u_dt
+                latest_str = u_str
+
+    relevant_age: Optional[int]
+    if rec_scope == "NONE" or not has_active_portfolio:
+        relevant_age = None
+    else:
+        scoped_tks = [tk for tk in held_and_order_tks if matches_market_scope(tk, rec_scope)]
+        if not scoped_tks:
+            scope_bm = "^NSEI" if rec_scope == "IN" else "^GSPC"
+            scoped_tks = [scope_bm]
+
+        oldest_dt: Optional[dt.datetime] = None
+        missing_quote = False
+        for tk in scoped_tks:
+            q = live_quotes.get(tk)
+            u_str = str(q.get("updated_at") or "") if isinstance(q, dict) else ""
+            u_dt = _parse_iso_utc(u_str)
+            if u_dt is None:
+                missing_quote = True
+                break
+            if oldest_dt is None or u_dt < oldest_dt:
+                oldest_dt = u_dt
+
+        if missing_quote or oldest_dt is None:
+            relevant_age = UNQUOTED_AGE_SENTINEL_SECONDS
+        else:
+            relevant_age = max(0, int(round((ts_now - oldest_dt).total_seconds())))
+
+    return {
+        "in_market_open": session["in_market_open"],
+        "us_market_open": session["us_market_open"],
+        "recommended_scope": rec_scope,
+        "latest_quote_updated_at": latest_str,
+        "relevant_quote_age_seconds": relevant_age,
+    }
+
+
+def resolve_usd_inr_rate(live_quotes: Optional[Dict[str, Dict[str, Any]]] = None) -> float:
+    """Read live `USDINR=X` rate from `paper_live_quotes`, falling back to `USD_INR_FX`."""
+    if live_quotes:
+        fx_row = live_quotes.get(FX_USD_INR_SYMBOL)
+        if isinstance(fx_row, dict):
+            try:
+                px = float(fx_row.get("close_price") or 0.0)
+                if px > 0 and not math.isnan(px):
+                    return round(px, 4)
+            except (TypeError, ValueError):
+                pass
+    return USD_INR_FX
+
+
+def _is_quote_missing_or_stale(
+    live_quotes: Dict[str, Dict[str, Any]],
+    symbol: str,
+    now_utc: dt.datetime,
+    max_age_seconds: int = LIVE_QUOTE_STALE_SECONDS,
+) -> bool:
+    row = live_quotes.get(symbol)
+    if not isinstance(row, dict) or float(row.get("close_price") or 0.0) <= 0:
+        return True
+    u_dt = _parse_iso_utc(str(row.get("updated_at") or ""))
+    if u_dt is None:
+        return True
+    ts_now = now_utc.replace(tzinfo=dt.timezone.utc) if now_utc.tzinfo is None else now_utc.astimezone(dt.timezone.utc)
+    return (ts_now - u_dt).total_seconds() > max_age_seconds
+
+
+def compute_fx_rate(
+    native_currency: str,
+    portfolio_currency: str,
+    usd_inr_rate: Optional[float] = None,
+) -> float:
     """Compute conversion multiplier from stock's native currency into portfolio currency."""
     src = (native_currency or "INR").upper()
     dst = (portfolio_currency or "INR").upper()
     if src == dst:
         return 1.0
+    eff_rate = (
+        float(usd_inr_rate)
+        if (usd_inr_rate is not None and float(usd_inr_rate) > 0 and not math.isnan(float(usd_inr_rate)))
+        else USD_INR_FX
+    )
     if src == "USD" and dst == "INR":
-        return USD_INR_FX
+        return eff_rate
     if src == "INR" and dst == "USD":
-        return 1.0 / USD_INR_FX
+        return 1.0 / eff_rate
     return 1.0
 
 
@@ -179,13 +388,18 @@ class PaperTradingService:
         db: Database,
         market_cache: Any,
         quote_fetcher: Optional[QuoteFetcher] = None,
+        now_utc_fn: Optional[Callable[[], dt.datetime]] = None,
     ) -> None:
         self.db = db
         self.market_cache = market_cache
         self.quote_fetcher: Optional[QuoteFetcher] = quote_fetcher
+        self.now_utc_fn: Optional[Callable[[], dt.datetime]] = now_utc_fn
         self._score_lock = threading.Lock()
         self._cached_companies_ref: Optional[object] = None
         self._scores_by_preset: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    def _now_utc(self) -> dt.datetime:
+        return self.now_utc_fn() if self.now_utc_fn is not None else _utc_now_dt()
 
     # --- Market Context, Allowlist & Scoring Lookups ---
 
@@ -293,6 +507,9 @@ class PaperTradingService:
         if s1 and float(s1.get("last_price") or 0.0) > 0:
             return round(float(s1["last_price"]), 2), _utc_today_str()
 
+        if ticker == FX_USD_INR_SYMBOL:
+            return USD_INR_FX, _utc_today_str()
+
         return 0.0, _utc_today_str()
 
     def _get_quote_snapshot(
@@ -351,10 +568,11 @@ class PaperTradingService:
             (pf_id,),
         ).fetchall()
 
+        usd_inr_rate = resolve_usd_inr_rate(live_quotes)
         holdings_val = 0.0
         for p in pos_rows:
             q = self._get_quote_snapshot(str(p["ticker"]), live_quotes)
-            fx = compute_fx_rate(str(p["native_currency"]), pf_ccy)
+            fx = compute_fx_rate(str(p["native_currency"]), pf_ccy, usd_inr_rate=usd_inr_rate)
             holdings_val += round(int(p["shares"]) * float(q["close_price"]) * fx, 2)
         holdings_val = round(holdings_val, 2)
 
@@ -432,11 +650,12 @@ class PaperTradingService:
         now_iso: str,
         existing_order_id: Optional[str] = None,
         released_reservation: float = 0.0,
+        usd_inr_rate: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         pf_id = str(portfolio["id"])
         pf_ccy = str(portfolio["currency"])
         fee_bps = float(portfolio["fee_bps"])
-        fx = compute_fx_rate(native_currency, pf_ccy)
+        fx = compute_fx_rate(native_currency, pf_ccy, usd_inr_rate=usd_inr_rate)
         gross, fee, net_debit = compute_buy_cost(shares, exec_price_native, fx, fee_bps)
 
         cur_cash = round(float(portfolio["cash_balance"]), 2)
@@ -608,11 +827,12 @@ class PaperTradingService:
         note: str,
         now_iso: str,
         existing_order_id: Optional[str] = None,
+        usd_inr_rate: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         pf_id = str(portfolio["id"])
         pf_ccy = str(portfolio["currency"])
         fee_bps = float(portfolio["fee_bps"])
-        fx = compute_fx_rate(native_currency, pf_ccy)
+        fx = compute_fx_rate(native_currency, pf_ccy, usd_inr_rate=usd_inr_rate)
 
         pos_row = conn.execute(
             "SELECT shares, avg_cost FROM paper_positions WHERE portfolio_id = ? AND ticker = ?",
@@ -777,11 +997,12 @@ class PaperTradingService:
         rating_val: str,
         note: str,
         now_iso: str,
+        usd_inr_rate: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         pf_id = str(portfolio["id"])
         pf_ccy = str(portfolio["currency"])
         fee_bps = float(portfolio["fee_bps"])
-        fx = compute_fx_rate(native_currency, pf_ccy)
+        fx = compute_fx_rate(native_currency, pf_ccy, usd_inr_rate=usd_inr_rate)
         _, _, reserved_amt = compute_buy_cost(shares, limit_price, fx, fee_bps)
 
         cur_cash = round(float(portfolio["cash_balance"]), 2)
@@ -848,10 +1069,16 @@ class PaperTradingService:
         user_id: str,
         username: str,
         portfolio_id: Optional[str] = None,
+        now_utc: Optional[dt.datetime] = None,
     ) -> Dict[str, Any]:
         clean_pf_id = (portfolio_id or "").strip() or None
         live_quotes = self.db.get_paper_live_quotes()
+        usd_inr_rate = resolve_usd_inr_rate(live_quotes)
+        fx_usd_inr_out = round(usd_inr_rate, 2)
         comp_meta = self._get_company_metadata_map()
+        eff_now_utc = now_utc if now_utc is not None else self._now_utc()
+        active_tracked_tks: List[str] = []
+        active_bm_tk: Optional[str] = None
 
         with self.db.connect() as conn:
             if clean_pf_id:
@@ -921,7 +1148,7 @@ class PaperTradingService:
                 holdings_val = 0.0
                 for p in pos_rows:
                     q = self._get_quote_snapshot(str(p["ticker"]), live_quotes)
-                    fx = compute_fx_rate(str(p["native_currency"]), pf_ccy)
+                    fx = compute_fx_rate(str(p["native_currency"]), pf_ccy, usd_inr_rate=usd_inr_rate)
                     holdings_val += round(int(p["shares"]) * float(q["close_price"]) * fx, 2)
                 holdings_val = round(holdings_val, 2)
 
@@ -981,7 +1208,7 @@ class PaperTradingService:
                     tk = str(p["ticker"])
                     meta = comp_meta.get(tk) or {}
                     native_ccy = str(p["native_currency"] or meta.get("currency") or "INR")
-                    fx = compute_fx_rate(native_ccy, pf_ccy)
+                    fx = compute_fx_rate(native_ccy, pf_ccy, usd_inr_rate=usd_inr_rate)
                     q = self._get_quote_snapshot(tk, live_quotes)
                     live_px = round(float(q["close_price"]), 2)
                     sh = int(p["shares"])
@@ -1172,6 +1399,9 @@ class PaperTradingService:
                         }
                     )
 
+                active_tracked_tks = [p["ticker"] for p in positions_out] + [o["ticker"] for o in open_orders_out]
+                active_bm_tk = bm_tk
+
                 active_detail = {
                     **summary_card,
                     "best_pick": best_pick,
@@ -1181,6 +1411,17 @@ class PaperTradingService:
                     "nav_history": nav_history_out,
                     "attribution_by_rating": attribution_out,
                 }
+
+        quotes_meta = compute_quotes_meta(
+            live_quotes=live_quotes,
+            active_tickers=active_tracked_tks,
+            benchmark_ticker=active_bm_tk,
+            has_active_portfolio=active_detail is not None,
+            now_utc=eff_now_utc,
+        )
+        if active_detail is not None:
+            active_detail["quotes_meta"] = quotes_meta
+            active_detail["fx_usd_inr"] = fx_usd_inr_out
 
         return {
             "authenticated": True,
@@ -1192,6 +1433,114 @@ class PaperTradingService:
             },
             "portfolios": portfolios_summary,
             "active_portfolio": active_detail,
+            "quotes_meta": quotes_meta,
+            "fx_usd_inr": fx_usd_inr_out,
+        }
+
+    def _normalize_and_upsert_symbols(
+        self,
+        symbols: List[str],
+        fetched_raw: Dict[str, Dict[str, Any]],
+        existing_live: Dict[str, Dict[str, Any]],
+        now_iso: str,
+        today_str: str,
+    ) -> int:
+        normalized: List[Dict[str, Any]] = []
+        for sym in symbols:
+            raw_q = fetched_raw.get(sym)
+            if isinstance(raw_q, dict):
+                c_raw = raw_q.get("close_price") if raw_q.get("close_price") is not None else raw_q.get("close")
+                if c_raw is not None and float(c_raw) > 0:
+                    c_px = round(float(c_raw), 2)
+                    lo_raw = raw_q.get("day_low") if raw_q.get("day_low") is not None else raw_q.get("low")
+                    hi_raw = raw_q.get("day_high") if raw_q.get("day_high") is not None else raw_q.get("high")
+                    lo_px = round(float(lo_raw), 2) if lo_raw is not None and float(lo_raw) > 0 else c_px
+                    hi_px = round(float(hi_raw), 2) if hi_raw is not None and float(hi_raw) > 0 else c_px
+                    lo_px = min(lo_px, c_px)
+                    hi_px = max(hi_px, c_px)
+                    t_date = str(raw_q.get("trade_date") or raw_q.get("date") or today_str)
+                    normalized.append(
+                        {
+                            "ticker": sym,
+                            "close_price": c_px,
+                            "day_low": lo_px,
+                            "day_high": hi_px,
+                            "trade_date": t_date,
+                            "updated_at": now_iso,
+                        }
+                    )
+                    continue
+            if sym not in existing_live:
+                base_px, base_date = self._get_baseline_price(sym)
+                if base_px > 0:
+                    normalized.append(
+                        {
+                            "ticker": sym,
+                            "close_price": base_px,
+                            "day_low": base_px,
+                            "day_high": base_px,
+                            "trade_date": base_date,
+                            "updated_at": now_iso,
+                        }
+                    )
+        return self.db.upsert_paper_live_quotes(normalized)
+
+    def get_live_ticker_quote(
+        self,
+        raw_ticker: str,
+        quote_fetcher: Optional[QuoteFetcher] = None,
+    ) -> Dict[str, Any]:
+        """Validate `raw_ticker` against universe allowlist and return fresh quote + live `USDINR=X` FX."""
+        comp = self._resolve_tradable_company(raw_ticker)
+        ticker = str(comp["ticker"])
+        native_ccy = str(comp["currency"] or "INR")
+        eff_now = self._now_utc()
+        now_iso = _utc_now_iso(eff_now)
+        today_str = _utc_today_str(eff_now)
+
+        live_quotes = self.db.get_paper_live_quotes()
+        need_tk = _is_quote_missing_or_stale(live_quotes, ticker, eff_now, LIVE_QUOTE_STALE_SECONDS)
+        need_fx = _is_quote_missing_or_stale(live_quotes, FX_USD_INR_SYMBOL, eff_now, LIVE_QUOTE_STALE_SECONDS)
+
+        if need_tk or need_fx:
+            to_fetch = sorted({ticker, FX_USD_INR_SYMBOL})
+            explicit_fetcher = quote_fetcher or self.quote_fetcher
+            active_fetcher = (
+                explicit_fetcher
+                if explicit_fetcher is not None
+                else (fetch_yahoo_chart_quotes if "PYTEST_CURRENT_TEST" not in os.environ else None)
+            )
+            fetched_raw: Dict[str, Dict[str, Any]] = {}
+            if active_fetcher is not None:
+                try:
+                    fetched_raw = active_fetcher(to_fetch) or {}
+                except Exception as exc:
+                    logger.warning("Live quote_fetcher raised %s for %s; using fallback.", type(exc).__name__, ticker)
+                    fetched_raw = {}
+            self._normalize_and_upsert_symbols(to_fetch, fetched_raw, live_quotes, now_iso, today_str)
+            live_quotes = self.db.get_paper_live_quotes()
+
+        q_snap = self._get_quote_snapshot(ticker, live_quotes)
+        close_px = round(float(q_snap["close_price"]), 2)
+        if close_px <= 0:
+            raise PaperValidationError(f"No valid market price available for {ticker}.")
+
+        live_row = live_quotes.get(ticker) or {}
+        updated_at = str(live_row.get("updated_at") or now_iso)
+        usd_inr_rate = resolve_usd_inr_rate(live_quotes)
+
+        return {
+            "ticker": ticker,
+            "name": str(comp.get("name") or ticker),
+            "close_price": close_px,
+            "live_price": close_px,
+            "current_price": close_px,
+            "day_low": round(float(q_snap["day_low"]), 2),
+            "day_high": round(float(q_snap["day_high"]), 2),
+            "trade_date": str(q_snap["trade_date"]),
+            "updated_at": updated_at,
+            "native_currency": native_ccy,
+            "fx_usd_inr": round(usd_inr_rate, 2),
         }
 
     # --- Public Mutation Methods ---
@@ -1306,6 +1655,7 @@ class PaperTradingService:
         user_id: str,
         username: str,
         payload: PaperOrderRequest,
+        quote_fetcher: Optional[QuoteFetcher] = None,
     ) -> Dict[str, Any]:
         comp = self._resolve_tradable_company(payload.ticker)
         ticker = comp["ticker"]
@@ -1314,13 +1664,51 @@ class PaperTradingService:
         if payload.order_type == "LIMIT" and (payload.limit_price is None or payload.limit_price <= 0):
             raise PaperValidationError("A positive limit_price is required for LIMIT orders.")
 
+        eff_now = self._now_utc()
+        now_iso = _utc_now_iso(eff_now)
+        today_str = _utc_today_str(eff_now)
+
+        # Verify portfolio ownership upfront (prevents IDOR probes from triggering quote fetches)
+        with self.db.connect() as conn:
+            pf_pre = conn.execute(
+                "SELECT id, currency FROM paper_portfolios WHERE id = ? AND user_id = ?",
+                (payload.portfolio_id, user_id),
+            ).fetchone()
+            if not pf_pre:
+                raise PaperNotFoundError("Paper portfolio not found.")
+            pre_pf_ccy = str(pf_pre["currency"])
+
         live_quotes = self.db.get_paper_live_quotes()
+        if payload.order_type == "MARKET":
+            is_cross_ccy = native_ccy.upper() != pre_pf_ccy.upper()
+            need_tk = _is_quote_missing_or_stale(live_quotes, ticker, eff_now, LIVE_QUOTE_STALE_SECONDS)
+            need_fx = is_cross_ccy and _is_quote_missing_or_stale(
+                live_quotes, FX_USD_INR_SYMBOL, eff_now, LIVE_QUOTE_STALE_SECONDS
+            )
+            explicit_fetcher = quote_fetcher or self.quote_fetcher
+            active_mkt_fetcher = (
+                explicit_fetcher
+                if explicit_fetcher is not None
+                else (fetch_yahoo_chart_quotes if "PYTEST_CURRENT_TEST" not in os.environ else None)
+            )
+            if (need_tk or need_fx) and active_mkt_fetcher is not None:
+                to_fetch = sorted({ticker, FX_USD_INR_SYMBOL})
+                fetched_raw: Dict[str, Dict[str, Any]] = {}
+                try:
+                    fetched_raw = active_mkt_fetcher(to_fetch) or {}
+                except Exception as exc:
+                    logger.warning("Market-order live quote refresh raised %s; using cached/DB price.", type(exc).__name__)
+                    fetched_raw = {}
+                if fetched_raw:
+                    self._normalize_and_upsert_symbols(to_fetch, fetched_raw, live_quotes, now_iso, today_str)
+                    live_quotes = self.db.get_paper_live_quotes()
+
+        usd_inr_rate = resolve_usd_inr_rate(live_quotes)
         quote = self._get_quote_snapshot(ticker, live_quotes)
         cur_price = round(float(quote["close_price"]), 2)
         if cur_price <= 0:
             raise PaperValidationError(f"No valid market price available for {ticker}.")
 
-        now_iso = _utc_now_iso()
         order_out: Dict[str, Any]
         trade_out: Optional[Dict[str, Any]] = None
 
@@ -1351,6 +1739,7 @@ class PaperTradingService:
                         rating_val=rating_val,
                         note=payload.note,
                         now_iso=now_iso,
+                        usd_inr_rate=usd_inr_rate,
                     )
                 else:
                     lim_px = round(float(payload.limit_price or 0.0), 2)
@@ -1370,6 +1759,7 @@ class PaperTradingService:
                             rating_val=rating_val,
                             note=payload.note,
                             now_iso=now_iso,
+                            usd_inr_rate=usd_inr_rate,
                         )
                     else:
                         pf, order_out = self._queue_open_limit_buy_in_tx(
@@ -1384,6 +1774,7 @@ class PaperTradingService:
                             rating_val=rating_val,
                             note=payload.note or f"Buy-on-Dip ({((lim_px - cur_price) / cur_price * 100.0):.1f}%)",
                             now_iso=now_iso,
+                            usd_inr_rate=usd_inr_rate,
                         )
             else:
                 # SELL side
@@ -1402,6 +1793,7 @@ class PaperTradingService:
                         rating_val=rating_val,
                         note=payload.note,
                         now_iso=now_iso,
+                        usd_inr_rate=usd_inr_rate,
                     )
                 else:
                     lim_px = round(float(payload.limit_price or 0.0), 2)
@@ -1421,6 +1813,7 @@ class PaperTradingService:
                             rating_val=rating_val,
                             note=payload.note,
                             now_iso=now_iso,
+                            usd_inr_rate=usd_inr_rate,
                         )
                     else:
                         # Verify unencumbered shares and queue OPEN LIMIT SELL
@@ -1560,6 +1953,7 @@ class PaperTradingService:
         ]
 
         live_quotes = self.db.get_paper_live_quotes()
+        usd_inr_rate = resolve_usd_inr_rate(live_quotes)
         now_iso = _utc_now_iso()
         executed_trades: List[Dict[str, Any]] = []
         queued_orders: List[Dict[str, Any]] = []
@@ -1599,6 +1993,7 @@ class PaperTradingService:
                         rating_val=rating_val,
                         note=item.note or "Planner Immediate Tranche",
                         now_iso=now_iso,
+                        usd_inr_rate=usd_inr_rate,
                     )
                     all_orders.append(m_ord)
                     executed_trades.append(m_trd)
@@ -1624,6 +2019,7 @@ class PaperTradingService:
                             rating_val=rating_val,
                             note=dip_note,
                             now_iso=now_iso,
+                            usd_inr_rate=usd_inr_rate,
                         )
                         all_orders.append(l_ord)
                         executed_trades.append(l_trd)
@@ -1640,6 +2036,7 @@ class PaperTradingService:
                             rating_val=rating_val,
                             note=dip_note,
                             now_iso=now_iso,
+                            usd_inr_rate=usd_inr_rate,
                         )
                         all_orders.append(l_ord)
                         queued_orders.append(l_ord)
@@ -1665,9 +2062,14 @@ class PaperTradingService:
         user_id: str,
         username: str,
         portfolio_id: Optional[str] = None,
+        market_scope: str = "ALL",
         quote_fetcher: Optional[QuoteFetcher] = None,
     ) -> Dict[str, Any]:
         clean_pf_id = (portfolio_id or "").strip() or None
+        scope = normalize_market_scope(market_scope)
+        eff_now = self._now_utc()
+        now_iso = _utc_now_iso(eff_now)
+        today_str = _utc_today_str(eff_now)
 
         with self.db.connect() as conn:
             if clean_pf_id:
@@ -1684,36 +2086,69 @@ class PaperTradingService:
             ).fetchall()
             pf_ids = [str(r["id"]) for r in user_pfs]
 
-            tracked_tickers = set(BENCHMARK_SYMBOLS)
+            if not pf_ids:
+                overview_idle = self.get_overview(
+                    user_id=user_id,
+                    username=username,
+                    portfolio_id=None,
+                    now_utc=eff_now,
+                )
+                return {
+                    **overview_idle,
+                    "status": "ok",
+                    "market_scope": scope,
+                    "quotes_updated": 0,
+                    "orders_filled": 0,
+                    "portfolios_snapshotted": 0,
+                    "filled_orders": [],
+                    "as_of_date": today_str,
+                    "skipped_idle": True,
+                    "refresh_summary": {
+                        "market_scope": scope,
+                        "quotes_updated": 0,
+                        "orders_filled": 0,
+                        "portfolios_snapshotted": 0,
+                        "filled_orders": [],
+                        "as_of_date": today_str,
+                        "skipped_idle": True,
+                    },
+                }
+
+            tracked_tickers = set(benchmarks_for_scope(scope))
             for r in user_pfs:
                 if r["benchmark_ticker"]:
-                    tracked_tickers.add(str(r["benchmark_ticker"]))
+                    bm_sym = str(r["benchmark_ticker"])
+                    if matches_market_scope(bm_sym, scope):
+                        tracked_tickers.add(bm_sym)
 
-            if pf_ids:
-                placeholders = ",".join("?" for _ in pf_ids)
-                pos_tks = conn.execute(
-                    f"SELECT DISTINCT ticker FROM paper_positions WHERE portfolio_id IN ({placeholders}) AND shares > 0",
-                    pf_ids,
-                ).fetchall()
-                ord_tks = conn.execute(
-                    "SELECT DISTINCT ticker FROM paper_orders WHERE user_id = ? AND status = 'OPEN'",
-                    (user_id,),
-                ).fetchall()
-                for row in pos_tks:
-                    tracked_tickers.add(str(row["ticker"]))
-                for row in ord_tks:
-                    tracked_tickers.add(str(row["ticker"]))
+            placeholders = ",".join("?" for _ in pf_ids)
+            pos_tks = conn.execute(
+                f"SELECT DISTINCT ticker FROM paper_positions WHERE portfolio_id IN ({placeholders}) AND shares > 0",
+                pf_ids,
+            ).fetchall()
+            ord_tks = conn.execute(
+                "SELECT DISTINCT ticker FROM paper_orders WHERE user_id = ? AND status = 'OPEN'",
+                (user_id,),
+            ).fetchall()
+            for row in pos_tks:
+                tk_sym = str(row["ticker"])
+                if matches_market_scope(tk_sym, scope):
+                    tracked_tickers.add(tk_sym)
+            for row in ord_tks:
+                tk_sym = str(row["ticker"])
+                if matches_market_scope(tk_sym, scope):
+                    tracked_tickers.add(tk_sym)
 
         sorted_tickers = sorted(tracked_tickers)
         active_fetcher = quote_fetcher or self.quote_fetcher or fetch_yahoo_chart_quotes
         fetched_raw: Dict[str, Dict[str, Any]] = {}
-        try:
-            fetched_raw = active_fetcher(sorted_tickers) or {}
-        except Exception as exc:
-            logger.warning("Custom/live quote_fetcher raised %s; using DB fallback.", type(exc).__name__)
-            fetched_raw = {}
+        if sorted_tickers:
+            try:
+                fetched_raw = active_fetcher(sorted_tickers) or {}
+            except Exception as exc:
+                logger.warning("Custom/live quote_fetcher raised %s; using DB fallback.", type(exc).__name__)
+                fetched_raw = {}
 
-        now_iso = _utc_now_iso()
         existing_live = self.db.get_paper_live_quotes()
         normalized_to_upsert: List[Dict[str, Any]] = []
 
@@ -1729,7 +2164,7 @@ class PaperTradingService:
                     hi_px = round(float(hi_raw), 2) if hi_raw is not None and float(hi_raw) > 0 else c_px
                     lo_px = min(lo_px, c_px)
                     hi_px = max(hi_px, c_px)
-                    t_date = str(raw_q.get("trade_date") or raw_q.get("date") or _utc_today_str())
+                    t_date = str(raw_q.get("trade_date") or raw_q.get("date") or today_str)
                     normalized_to_upsert.append(
                         {
                             "ticker": sym,
@@ -1759,13 +2194,15 @@ class PaperTradingService:
 
         quotes_updated = self.db.upsert_paper_live_quotes(normalized_to_upsert)
         live_quotes = self.db.get_paper_live_quotes()
+        usd_inr_rate = resolve_usd_inr_rate(live_quotes)
 
         # Determine refresh snapshot date (prefer explicitly fetched trade_date, else today UTC)
         fetched_dates = [q["trade_date"] for q in normalized_to_upsert if q.get("ticker") in fetched_raw and q.get("trade_date")]
-        refresh_snap_date = max(fetched_dates) if fetched_dates else _utc_today_str()
+        refresh_snap_date = max(fetched_dates) if fetched_dates else today_str
 
         comp_meta = self._get_company_metadata_map()
         filled_orders: List[Dict[str, Any]] = []
+        snapshotted_count = 0
 
         with self.db.atomic_transaction() as conn:
             open_orders = conn.execute(
@@ -1781,6 +2218,8 @@ class PaperTradingService:
             for ord_row in open_orders:
                 ord_d = dict(ord_row)
                 tk = str(ord_d["ticker"])
+                if not matches_market_scope(tk, scope):
+                    continue
                 lim_px = float(ord_d["limit_price"] or 0.0)
                 if lim_px <= 0:
                     continue
@@ -1825,6 +2264,7 @@ class PaperTradingService:
                         now_iso=now_iso,
                         existing_order_id=str(ord_d["id"]),
                         released_reservation=float(ord_d["reserved_amount"] or 0.0),
+                        usd_inr_rate=usd_inr_rate,
                     )
                     filled_orders.append(filled_ord)
                 elif side == "SELL" and hi_px + 1e-9 >= lim_px:
@@ -1845,6 +2285,7 @@ class PaperTradingService:
                             note=str(ord_d["note"] or ""),
                             now_iso=now_iso,
                             existing_order_id=str(ord_d["id"]),
+                            usd_inr_rate=usd_inr_rate,
                         )
                         filled_orders.append(filled_ord)
                     except PaperValidationError:
@@ -1862,19 +2303,239 @@ class PaperTradingService:
                     live_quotes=live_quotes,
                     snap_date_override=refresh_snap_date,
                 )
+                snapshotted_count += 1
 
-        overview = self.get_overview(user_id=user_id, username=username, portfolio_id=clean_pf_id)
+        overview = self.get_overview(
+            user_id=user_id,
+            username=username,
+            portfolio_id=clean_pf_id,
+            now_utc=eff_now,
+        )
         return {
             **overview,
             "status": "ok",
+            "market_scope": scope,
             "quotes_updated": quotes_updated,
             "orders_filled": len(filled_orders),
+            "portfolios_snapshotted": snapshotted_count,
             "filled_orders": filled_orders,
             "as_of_date": refresh_snap_date,
+            "skipped_idle": False,
             "refresh_summary": {
+                "market_scope": scope,
                 "quotes_updated": quotes_updated,
                 "orders_filled": len(filled_orders),
+                "portfolios_snapshotted": snapshotted_count,
                 "filled_orders": filled_orders,
                 "as_of_date": refresh_snap_date,
+                "skipped_idle": False,
             },
+        }
+
+    def run_global_daily_paper_refresh(
+        self,
+        market_scope: str = "ALL",
+        quote_fetcher: Optional[QuoteFetcher] = None,
+    ) -> Dict[str, Any]:
+        """Run global scheduled market-close quote sync, limit-order fills, and NAV snapshots."""
+        scope = normalize_market_scope(market_scope)
+        eff_now = self._now_utc()
+        now_iso = _utc_now_iso(eff_now)
+        today_str = _utc_today_str(eff_now)
+
+        with self.db.connect() as conn:
+            cnt_row = conn.execute("SELECT COUNT(*) AS cnt FROM paper_portfolios").fetchone()
+            total_portfolios = int(cnt_row["cnt"]) if cnt_row else 0
+            if total_portfolios == 0:
+                return {
+                    "quotes_updated": 0,
+                    "orders_filled": 0,
+                    "portfolios_snapshotted": 0,
+                    "market_scope": scope,
+                    "as_of_date": today_str,
+                    "skipped_idle": True,
+                }
+
+            pos_tks = conn.execute("SELECT DISTINCT ticker FROM paper_positions WHERE shares > 0").fetchall()
+            ord_tks = conn.execute("SELECT DISTINCT ticker FROM paper_orders WHERE status = 'OPEN'").fetchall()
+            bm_tks = conn.execute("SELECT DISTINCT benchmark_ticker FROM paper_portfolios").fetchall()
+
+        tracked = set(benchmarks_for_scope(scope))
+        for r in pos_tks:
+            tk = str(r["ticker"] or "")
+            if tk and matches_market_scope(tk, scope):
+                tracked.add(tk)
+        for r in ord_tks:
+            tk = str(r["ticker"] or "")
+            if tk and matches_market_scope(tk, scope):
+                tracked.add(tk)
+        for r in bm_tks:
+            tk = str(r["benchmark_ticker"] or "")
+            if tk and matches_market_scope(tk, scope):
+                tracked.add(tk)
+
+        sorted_tickers = sorted(tracked)
+        active_fetcher = quote_fetcher or self.quote_fetcher or fetch_yahoo_chart_quotes
+        fetched_raw: Dict[str, Dict[str, Any]] = {}
+        if sorted_tickers:
+            try:
+                fetched_raw = active_fetcher(sorted_tickers) or {}
+            except Exception as exc:
+                logger.warning("Global refresh quote_fetcher raised %s; using DB fallback.", type(exc).__name__)
+                fetched_raw = {}
+
+        existing_live = self.db.get_paper_live_quotes()
+        normalized_to_upsert: List[Dict[str, Any]] = []
+        for sym in sorted_tickers:
+            raw_q = fetched_raw.get(sym)
+            if isinstance(raw_q, dict):
+                c_raw = raw_q.get("close_price") if raw_q.get("close_price") is not None else raw_q.get("close")
+                if c_raw is not None and float(c_raw) > 0:
+                    c_px = round(float(c_raw), 2)
+                    lo_raw = raw_q.get("day_low") if raw_q.get("day_low") is not None else raw_q.get("low")
+                    hi_raw = raw_q.get("day_high") if raw_q.get("day_high") is not None else raw_q.get("high")
+                    lo_px = round(float(lo_raw), 2) if lo_raw is not None and float(lo_raw) > 0 else c_px
+                    hi_px = round(float(hi_raw), 2) if hi_raw is not None and float(hi_raw) > 0 else c_px
+                    lo_px = min(lo_px, c_px)
+                    hi_px = max(hi_px, c_px)
+                    t_date = str(raw_q.get("trade_date") or raw_q.get("date") or today_str)
+                    normalized_to_upsert.append(
+                        {
+                            "ticker": sym,
+                            "close_price": c_px,
+                            "day_low": lo_px,
+                            "day_high": hi_px,
+                            "trade_date": t_date,
+                            "updated_at": now_iso,
+                        }
+                    )
+                    continue
+            if sym not in existing_live:
+                base_px, base_date = self._get_baseline_price(sym)
+                if base_px > 0:
+                    normalized_to_upsert.append(
+                        {
+                            "ticker": sym,
+                            "close_price": base_px,
+                            "day_low": base_px,
+                            "day_high": base_px,
+                            "trade_date": base_date,
+                            "updated_at": now_iso,
+                        }
+                    )
+
+        quotes_updated = self.db.upsert_paper_live_quotes(normalized_to_upsert)
+        live_quotes = self.db.get_paper_live_quotes()
+        usd_inr_rate = resolve_usd_inr_rate(live_quotes)
+        fetched_dates = [q["trade_date"] for q in normalized_to_upsert if q.get("ticker") in fetched_raw and q.get("trade_date")]
+        refresh_snap_date = max(fetched_dates) if fetched_dates else today_str
+
+        comp_meta = self._get_company_metadata_map()
+        filled_count = 0
+        snapshotted_count = 0
+
+        with self.db.atomic_transaction() as conn:
+            open_orders = conn.execute(
+                """
+                SELECT *
+                FROM paper_orders
+                WHERE status = 'OPEN' AND order_type = 'LIMIT'
+                ORDER BY created_at ASC, id ASC
+                """
+            ).fetchall()
+
+            for ord_row in open_orders:
+                ord_d = dict(ord_row)
+                tk = str(ord_d["ticker"])
+                if not matches_market_scope(tk, scope):
+                    continue
+                lim_px = float(ord_d["limit_price"] or 0.0)
+                if lim_px <= 0:
+                    continue
+
+                q = self._get_quote_snapshot(tk, live_quotes)
+                c_px = float(q["close_price"])
+                lo_px = float(q["day_low"])
+                hi_px = float(q["day_high"])
+                if c_px <= 0:
+                    continue
+
+                uid = str(ord_d["user_id"])
+                pf_row = conn.execute(
+                    "SELECT * FROM paper_portfolios WHERE id = ? AND user_id = ?",
+                    (ord_d["portfolio_id"], uid),
+                ).fetchone()
+                if not pf_row:
+                    continue
+                pf = dict(pf_row)
+                meta = comp_meta.get(tk) or {}
+                native_ccy = str(meta.get("currency") or ("INR" if tk.endswith((".NS", ".BO")) else "USD"))
+                preset = str(pf.get("strategy_preset") or "qglp_compounder")
+                cur_score, cur_rating = self._get_score_and_rating(tk, preset)
+                score_val = float(ord_d["score_at_order"]) if ord_d["score_at_order"] is not None else cur_score
+                rating_val = str(ord_d["rating_at_order"] or cur_rating)
+
+                side = str(ord_d["side"])
+                if side == "BUY" and lo_px <= lim_px + 1e-9:
+                    exec_px = round(min(c_px, lim_px), 2)
+                    self._execute_buy_fill_in_tx(
+                        conn=conn,
+                        portfolio=pf,
+                        user_id=uid,
+                        ticker=tk,
+                        native_currency=native_ccy,
+                        shares=int(ord_d["shares"]),
+                        exec_price_native=exec_px,
+                        order_type="LIMIT",
+                        limit_price=lim_px,
+                        score_val=score_val,
+                        rating_val=rating_val,
+                        note=str(ord_d["note"] or ""),
+                        now_iso=now_iso,
+                        existing_order_id=str(ord_d["id"]),
+                        released_reservation=float(ord_d["reserved_amount"] or 0.0),
+                        usd_inr_rate=usd_inr_rate,
+                    )
+                    filled_count += 1
+                elif side == "SELL" and hi_px + 1e-9 >= lim_px:
+                    exec_px = round(max(c_px, lim_px), 2)
+                    try:
+                        self._execute_sell_fill_in_tx(
+                            conn=conn,
+                            portfolio=pf,
+                            user_id=uid,
+                            ticker=tk,
+                            native_currency=native_ccy,
+                            shares=int(ord_d["shares"]),
+                            exec_price_native=exec_px,
+                            order_type="LIMIT",
+                            limit_price=lim_px,
+                            score_val=score_val,
+                            rating_val=rating_val,
+                            note=str(ord_d["note"] or ""),
+                            now_iso=now_iso,
+                            existing_order_id=str(ord_d["id"]),
+                            usd_inr_rate=usd_inr_rate,
+                        )
+                        filled_count += 1
+                    except PaperValidationError:
+                        logger.warning("Skipped OPEN SELL LIMIT %s due to insufficient shares.", ord_d["id"])
+
+            all_pfs = conn.execute("SELECT * FROM paper_portfolios").fetchall()
+            for pf_r in all_pfs:
+                self._record_nav_snapshot_in_tx(
+                    conn=conn,
+                    portfolio_row=dict(pf_r),
+                    live_quotes=live_quotes,
+                    snap_date_override=refresh_snap_date,
+                )
+                snapshotted_count += 1
+
+        return {
+            "quotes_updated": quotes_updated,
+            "orders_filled": filled_count,
+            "portfolios_snapshotted": snapshotted_count,
+            "market_scope": scope,
+            "as_of_date": refresh_snap_date,
+            "skipped_idle": False,
         }

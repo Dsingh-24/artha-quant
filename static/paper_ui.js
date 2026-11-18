@@ -1,4 +1,4 @@
-// ArthaQuant V4.0 — Multi-Strategy Paper Portfolios, Buy-on-Dip Limit Order Book & Planner Basket Deployment UI
+// ArthaQuant V5.0 — Calm Sub-Tabbed Paper Wallet, Buy-on-Dip Book & Live FX UI
 // Built exclusively with safe DOM creation (createElement, textContent, replaceChildren) and CSS classes.
 
 import {
@@ -19,21 +19,29 @@ import {
   requestPaperPasswordReset,
 } from "/static/auth_client.js";
 
-const USD_INR_FX = 84.5;
+const DEFAULT_USD_INR_FX = 93.44;
+const AUTO_REFRESH_COOLDOWN_MS = 5 * 60 * 1000;
+const STALE_QUOTE_THRESHOLD_SEC = 300;
+const UNQUOTED_SENTINEL_SEC = 900000;
+const PAPER_SUBTABS = ["positions", "orders", "trades", "attribution"];
+
+export const uiState = {
+  activeSubtab: "positions",
+};
 
 const STRATEGY_LABELS = {
-  qglp_compounder: "Long-Term QGLP Compounder",
-  street_quant: "Street EPS Revisions + Quant",
-  coffee_can: "Marcellus Coffee-Can",
-  magic_formula: "Greenblatt Magic Formula",
-  artha_blend: "Balanced 4-Factor Blend",
-  value_momentum: "AQR Value + Momentum",
+  qglp_compounder: "QGLP Compounder",
+  street_quant: "Street + Quant",
+  coffee_can: "Coffee-Can",
+  magic_formula: "Magic Formula",
+  artha_blend: "4-Factor Blend",
+  value_momentum: "Value + Momentum",
 };
 
 const BENCHMARK_LABELS = {
-  "^NSEI": "Nifty 50 (^NSEI)",
-  "^GSPC": "S&P 500 (^GSPC)",
-  "^NDX": "Nasdaq 100 (^NDX)",
+  "^NSEI": "Nifty 50",
+  "^GSPC": "S&P 500",
+  "^NDX": "Nasdaq 100",
 };
 
 const WALLET_TEMPLATES = [
@@ -75,7 +83,20 @@ const paperState = {
   initialized: false,
   loading: false,
   overview: null,
+  overviewFetchedAtMs: 0,
+  currentUser: null,
   activePortfolioId: null,
+  activeSubtab: "positions",
+  lastAutoRefreshMs: new Map(),
+  autoRefreshInFlight: false,
+  manualRefreshInFlight: false,
+  sessionTickerTimerId: null,
+  liveUsdInrFx: null,
+  liveQuoteCache: new Map(),
+  ticketQuoteReqSeq: 0,
+  ticketQuoteSyncing: false,
+  ticketActiveDipPct: -7,
+  ticketSharesEditedByUser: false,
   ticketSide: "BUY",
   ticketOrderType: "LIMIT",
   ticketStock: null,
@@ -144,10 +165,22 @@ function ratingBadgeClass(rating) {
   return "badge badge-avoid";
 }
 
+function resolveUsdInrFxRate() {
+  const ov = paperState.overview;
+  const apFx = ov && ov.active_portfolio ? Number(ov.active_portfolio.fx_usd_inr) : 0;
+  if (Number.isFinite(apFx) && apFx > 1) return apFx;
+  const topFx = ov ? Number(ov.fx_usd_inr) : 0;
+  if (Number.isFinite(topFx) && topFx > 1) return topFx;
+  const cachedFx = Number(paperState.liveUsdInrFx || 0);
+  if (Number.isFinite(cachedFx) && cachedFx > 1) return cachedFx;
+  return DEFAULT_USD_INR_FX;
+}
+
 function computeFxRate(stockCurrency, walletCurrency) {
   if (stockCurrency === walletCurrency) return 1.0;
-  if (stockCurrency === "USD" && walletCurrency === "INR") return USD_INR_FX;
-  if (stockCurrency === "INR" && walletCurrency === "USD") return 1.0 / USD_INR_FX;
+  const usdInr = resolveUsdInrFxRate();
+  if (stockCurrency === "USD" && walletCurrency === "INR") return usdInr;
+  if (stockCurrency === "INR" && walletCurrency === "USD") return 1.0 / usdInr;
   return 1.0;
 }
 
@@ -156,6 +189,224 @@ function formatShortTimestamp(isoStr) {
   if (!raw) return "—";
   const clean = raw.replace("T", " ").replace("Z", "");
   return clean.length > 16 ? clean.slice(0, 16) : clean;
+}
+
+function formatUtcSyncStamp(isoStr) {
+  const raw = String(isoStr || "").trim();
+  if (!raw) return "";
+  const clean = raw
+    .replace("T", " ")
+    .replace(/\.\d+/, "")
+    .replace("Z", "")
+    .replace(/\+00:00$/, "")
+    .trim();
+  const short = clean.length > 16 ? clean.slice(0, 16) : clean;
+  return short ? `${short} UTC` : "";
+}
+
+function computeClientMarketSessionUtc(nowUtc = new Date()) {
+  const day = nowUtc.getUTCDay();
+  const isWeekday = day >= 1 && day <= 5;
+  const utcMinutes = nowUtc.getUTCHours() * 60 + nowUtc.getUTCMinutes();
+  // NSE live window: Mon-Fri 03:45-10:15 UTC (09:15-15:45 IST)
+  const inMarketOpen = isWeekday && utcMinutes >= 3 * 60 + 45 && utcMinutes <= 10 * 60 + 15;
+  // US live window: Mon-Fri 13:30-21:15 UTC (09:30 AM EDT - 04:15 PM EST)
+  const usMarketOpen = isWeekday && utcMinutes >= 13 * 60 + 30 && utcMinutes <= 21 * 60 + 15;
+  const recommendedScope = inMarketOpen ? "IN" : usMarketOpen ? "US" : "NONE";
+  return {
+    in_market_open: inMarketOpen,
+    us_market_open: usMarketOpen,
+    recommended_scope: recommendedScope,
+  };
+}
+
+function resolveEffectiveQuotesMeta(overview = paperState.overview, nowMs = Date.now()) {
+  const ap = overview && overview.active_portfolio ? overview.active_portfolio : null;
+  const raw =
+    (ap && ap.quotes_meta && typeof ap.quotes_meta === "object" ? ap.quotes_meta : null) ||
+    (overview && overview.quotes_meta && typeof overview.quotes_meta === "object"
+      ? overview.quotes_meta
+      : null);
+
+  const fallback = computeClientMarketSessionUtc(new Date(nowMs));
+  if (!raw) {
+    return {
+      in_market_open: fallback.in_market_open,
+      us_market_open: fallback.us_market_open,
+      recommended_scope: fallback.recommended_scope,
+      latest_quote_updated_at: null,
+      relevant_quote_age_seconds: null,
+    };
+  }
+
+  const elapsedSec =
+    paperState.overviewFetchedAtMs > 0
+      ? Math.max(0, Math.floor((nowMs - paperState.overviewFetchedAtMs) / 1000))
+      : 0;
+  const useClientClock = elapsedSec >= 60;
+
+  const inOpen =
+    !useClientClock && typeof raw.in_market_open === "boolean"
+      ? raw.in_market_open
+      : fallback.in_market_open;
+  const usOpen =
+    !useClientClock && typeof raw.us_market_open === "boolean"
+      ? raw.us_market_open
+      : fallback.us_market_open;
+
+  let recScope = inOpen ? "IN" : usOpen ? "US" : "NONE";
+  if (!useClientClock && typeof raw.recommended_scope === "string") {
+    const norm = raw.recommended_scope.toUpperCase();
+    if (norm === "IN" || norm === "US" || norm === "NONE") {
+      recScope = norm;
+    }
+  }
+
+  const latestUpdatedAt =
+    typeof raw.latest_quote_updated_at === "string" && raw.latest_quote_updated_at.trim()
+      ? raw.latest_quote_updated_at.trim()
+      : null;
+
+  let ageSec = null;
+  if (recScope === "IN" || recScope === "US") {
+    const rawScope =
+      typeof raw.recommended_scope === "string" ? raw.recommended_scope.toUpperCase() : "";
+    if (
+      typeof raw.relevant_quote_age_seconds === "number" &&
+      Number.isFinite(raw.relevant_quote_age_seconds) &&
+      (!useClientClock || rawScope === recScope)
+    ) {
+      ageSec = Math.max(0, Math.floor(raw.relevant_quote_age_seconds) + elapsedSec);
+    }
+  }
+
+  return {
+    in_market_open: inOpen,
+    us_market_open: usOpen,
+    recommended_scope: recScope,
+    latest_quote_updated_at: latestUpdatedAt,
+    relevant_quote_age_seconds: ageSec,
+  };
+}
+
+function formatLiveFreshnessLabel(meta, nowMs = Date.now()) {
+  const ageSec = meta.relevant_quote_age_seconds;
+  if (typeof ageSec === "number" && Number.isFinite(ageSec) && ageSec < UNQUOTED_SENTINEL_SEC) {
+    const mins = Math.max(0, Math.floor(ageSec / 60));
+    return `${mins}m ago`;
+  }
+  if (meta.latest_quote_updated_at) {
+    const parsedMs = Date.parse(meta.latest_quote_updated_at);
+    if (Number.isFinite(parsedMs)) {
+      const mins = Math.max(0, Math.floor((nowMs - parsedMs) / 60000));
+      return `${mins}m ago`;
+    }
+  }
+  return "sync pending";
+}
+
+function renderPaperSessionPill() {
+  const pill = document.getElementById("paper-session-pill");
+  if (!pill) return;
+
+  if (paperState.autoRefreshInFlight) {
+    pill.className = "paper-session-pill paper-session-syncing";
+    pill.title = "";
+    pill.replaceChildren(
+      el("span", "paper-session-spin", "↻"),
+      document.createTextNode(" "),
+      el("span", "paper-session-label", "Syncing...")
+    );
+    return;
+  }
+
+  const nowMs = Date.now();
+  const meta = resolveEffectiveQuotesMeta(paperState.overview, nowMs);
+  const syncStamp = formatUtcSyncStamp(meta.latest_quote_updated_at);
+  pill.title = syncStamp ? `Last sync ${syncStamp}` : "";
+
+  if (meta.in_market_open) {
+    pill.className = "paper-session-pill paper-session-in";
+    pill.replaceChildren(
+      el("span", "paper-session-dot dot-session-in", "●"),
+      document.createTextNode(" "),
+      el("span", "paper-session-label", `NSE Open · ${formatLiveFreshnessLabel(meta, nowMs)}`)
+    );
+    return;
+  }
+
+  if (meta.us_market_open) {
+    pill.className = "paper-session-pill paper-session-us";
+    pill.replaceChildren(
+      el("span", "paper-session-dot dot-session-us", "●"),
+      document.createTextNode(" "),
+      el("span", "paper-session-label", `US Open · ${formatLiveFreshnessLabel(meta, nowMs)}`)
+    );
+    return;
+  }
+
+  pill.className = "paper-session-pill paper-session-closed";
+  pill.replaceChildren(
+    el("span", "paper-session-dot dot-session-closed", "○"),
+    document.createTextNode(" "),
+    el("span", "paper-session-label", "Closed · Auto-settles 3:45p IST & 5p EST")
+  );
+}
+
+export function setPaperSubtab(tabKey) {
+  const nextKey = PAPER_SUBTABS.includes(tabKey) ? tabKey : "positions";
+  uiState.activeSubtab = nextKey;
+  paperState.activeSubtab = nextKey;
+
+  const btnMap = {
+    positions: document.getElementById("paper-subtab-positions"),
+    orders: document.getElementById("paper-subtab-orders"),
+    trades: document.getElementById("paper-subtab-trades"),
+    attribution: document.getElementById("paper-subtab-attribution"),
+  };
+
+  const paneMap = {
+    positions: document.getElementById("paper-pane-positions"),
+    orders: document.getElementById("paper-pane-orders"),
+    trades: document.getElementById("paper-pane-trades"),
+    attribution: document.getElementById("paper-pane-attribution"),
+  };
+
+  for (const key of PAPER_SUBTABS) {
+    const btn = btnMap[key];
+    const isActive = key === nextKey;
+    if (btn) {
+      btn.classList.toggle("active", isActive);
+      btn.setAttribute("aria-selected", isActive ? "true" : "false");
+    }
+    const pane = paneMap[key];
+    if (pane) {
+      pane.classList.toggle("hidden", !isActive);
+    }
+  }
+
+  const bar = document.getElementById("paper-subtab-bar");
+  if (bar && typeof bar.querySelectorAll === "function") {
+    const dataBtns = bar.querySelectorAll("[data-paper-subtab]");
+    for (const node of dataBtns) {
+      const k = node.getAttribute("data-paper-subtab");
+      if (k && PAPER_SUBTABS.includes(k)) {
+        const isActive = k === nextKey;
+        node.classList.toggle("active", isActive);
+        node.setAttribute("aria-selected", isActive ? "true" : "false");
+      }
+    }
+  }
+}
+
+function isPaperTabActive() {
+  const tabPaper = document.getElementById("tab-paper");
+  return Boolean(tabPaper && !tabPaper.classList.contains("hidden"));
+}
+
+function isPaperSignedInViewVisible() {
+  const signedInView = document.getElementById("paper-signed-in-view");
+  return Boolean(signedInView && !signedInView.classList.contains("hidden"));
 }
 
 async function paperApiRequest(path, options = {}) {
@@ -206,8 +457,15 @@ async function paperApiRequest(path, options = {}) {
 
 function applyOverviewEnvelope(data) {
   if (!data || typeof data !== "object") return;
+  const envFx = Number(
+    (data.active_portfolio && data.active_portfolio.fx_usd_inr) || data.fx_usd_inr || 0
+  );
+  if (Number.isFinite(envFx) && envFx > 1) {
+    paperState.liveUsdInrFx = envFx;
+  }
   if (Array.isArray(data.portfolios)) {
     paperState.overview = data;
+    paperState.overviewFetchedAtMs = Date.now();
     if (data.active_portfolio && data.active_portfolio.id) {
       paperState.activePortfolioId = data.active_portfolio.id;
     } else if (data.portfolios.length > 0 && !paperState.activePortfolioId) {
@@ -218,7 +476,75 @@ function applyOverviewEnvelope(data) {
   }
 }
 
-export async function loadPaperOverview(targetPortfolioId = null) {
+async function maybeTriggerSmartAutoRefresh() {
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+  if (!isPaperTabActive() || !isPaperSignedInViewVisible()) return;
+  if (paperState.autoRefreshInFlight || paperState.manualRefreshInFlight) return;
+
+  const ov = paperState.overview;
+  const ap = ov && ov.active_portfolio ? ov.active_portfolio : null;
+  if (!ap || !ap.id) return;
+
+  const activeId = ap.id;
+  const nowMs = Date.now();
+  const meta = resolveEffectiveQuotesMeta(ov, nowMs);
+  const recommendedScope = meta.recommended_scope;
+  if (recommendedScope !== "IN" && recommendedScope !== "US") return;
+
+  const ageSec = meta.relevant_quote_age_seconds;
+  const isStale = ageSec === null || ageSec >= STALE_QUOTE_THRESHOLD_SEC;
+  if (!isStale) return;
+
+  const cooldownKey = `${activeId}::${recommendedScope}`;
+  const prevAutoMs = paperState.lastAutoRefreshMs.get(cooldownKey) || 0;
+  if (nowMs - prevAutoMs < AUTO_REFRESH_COOLDOWN_MS) return;
+
+  paperState.autoRefreshInFlight = true;
+  paperState.lastAutoRefreshMs.set(cooldownKey, nowMs);
+  renderPaperSessionPill();
+
+  try {
+    const res = await paperApiRequest("/api/paper/refresh", {
+      method: "POST",
+      jsonBody: {
+        portfolio_id: activeId,
+        market_scope: recommendedScope,
+      },
+    });
+    paperState.lastAutoRefreshMs.set(cooldownKey, Date.now());
+
+    if (!paperState.activePortfolioId || paperState.activePortfolioId === activeId) {
+      if (res && Array.isArray(res.portfolios)) {
+        applyOverviewEnvelope(res);
+      } else {
+        await loadPaperOverview(activeId, { skipAutoRefresh: true });
+      }
+    } else {
+      await loadPaperOverview(paperState.activePortfolioId, { skipAutoRefresh: true });
+    }
+
+    const summary = (res && res.refresh_summary) || res || {};
+    const ordersFilled = Number(summary.orders_filled ?? 0);
+    if (ordersFilled > 0) {
+      paperState.showToast(
+        ordersFilled === 1
+          ? "Auto-filled 1 Buy-on-Dip order!"
+          : `Auto-filled ${ordersFilled} Buy-on-Dip orders!`
+      );
+    }
+  } catch (_bgErr) {
+    // Silent background sync fallback — keep cached quotes without interrupting user actions
+  } finally {
+    paperState.autoRefreshInFlight = false;
+    if (isPaperSignedInViewVisible()) {
+      renderPaperArena(paperState.currentUser);
+    } else {
+      renderPaperSessionPill();
+    }
+  }
+}
+
+export async function loadPaperOverview(targetPortfolioId = null, options = {}) {
   const signedOutView = document.getElementById("paper-signed-out-view");
   const signedInView = document.getElementById("paper-signed-in-view");
   const serviceBanner = document.getElementById("paper-service-banner");
@@ -231,6 +557,7 @@ export async function loadPaperOverview(targetPortfolioId = null) {
 
   const user = await getPaperUser();
   if (!user) {
+    paperState.currentUser = null;
     signedOutView.classList.remove("hidden");
     signedInView.classList.add("hidden");
     renderDynamicOAuthButtons("paper-oauth-wrap", "paper-oauth-buttons");
@@ -242,6 +569,7 @@ export async function loadPaperOverview(targetPortfolioId = null) {
     return null;
   }
 
+  paperState.currentUser = user;
   const pid = targetPortfolioId !== null ? targetPortfolioId : paperState.activePortfolioId;
   const query = pid ? `?portfolio_id=${encodeURIComponent(pid)}` : "";
 
@@ -252,9 +580,13 @@ export async function loadPaperOverview(targetPortfolioId = null) {
     signedOutView.classList.add("hidden");
     signedInView.classList.remove("hidden");
     renderPaperArena(user);
+    if (!options.skipAutoRefresh) {
+      void maybeTriggerSmartAutoRefresh();
+    }
     return data;
   } catch (err) {
     if (err && err.status === 401) {
+      paperState.currentUser = null;
       signedOutView.classList.remove("hidden");
       signedInView.classList.add("hidden");
       renderDynamicOAuthButtons("paper-oauth-wrap", "paper-oauth-buttons");
@@ -293,22 +625,22 @@ function renderPaperArena(user) {
     (user && (user.maskedEmail || user.displayLabel)) ||
     "Advisor";
   if (userPill) {
-    userPill.textContent = `Signed In: ${maskUserIdentity(serverUserLabel)}`;
+    userPill.textContent = maskUserIdentity(serverUserLabel);
   }
 
   const stratPill = document.getElementById("paper-active-strategy-pill");
   if (stratPill) {
     if (ap) {
       const sName = STRATEGY_LABELS[ap.strategy_preset] || ap.strategy_preset || "QGLP Compounder";
-      const bName = BENCHMARK_LABELS[ap.benchmark_ticker] || ap.benchmark_ticker || "^NSEI";
-      stratPill.textContent = `${ap.currency === "USD" ? "$ USD" : "₹ INR"} • ${sName} • Benchmark: ${bName} • ${Number(
-        ap.fee_bps ?? 25
-      )} bps Fee`;
+      const bName = BENCHMARK_LABELS[ap.benchmark_ticker] || ap.benchmark_ticker || "Nifty 50";
+      stratPill.textContent = `${ap.currency} · ${sName} · vs ${bName}`;
       stratPill.classList.remove("hidden");
     } else {
       stratPill.classList.add("hidden");
     }
   }
+
+  renderPaperSessionPill();
 
   const depositBtn = document.getElementById("paper-open-deposit-btn");
   const quickOrderBtn = document.getElementById("paper-quick-order-btn");
@@ -395,15 +727,15 @@ function renderPaperArena(user) {
   const openOrders = Array.isArray(ap.open_orders) ? ap.open_orders : [];
   const recentTrades = Array.isArray(ap.recent_trades) ? ap.recent_trades : [];
 
-  // 1. Render 5 Portfolio KPI Cards
+  // 1. Render 5 Calm Portfolio KPI Cards
   const kpiStrip = document.getElementById("paper-kpi-strip");
   if (kpiStrip) {
     kpiStrip.replaceChildren();
     kpiStrip.appendChild(
       buildPaperKpiCard(
-        "Total Portfolio Value (NAV)",
+        "Portfolio NAV",
         formatExactCurrency(totalNav, ccy, ccy === "USD" ? 2 : 0),
-        `Holdings: ${formatCurrencyCompact(holdingsVal, ccy)} • Principal: ${formatCurrencyCompact(
+        `Holdings ${formatCurrencyCompact(holdingsVal, ccy)} · Principal ${formatCurrencyCompact(
           totalDeposited,
           ccy
         )}`,
@@ -412,31 +744,33 @@ function renderPaperArena(user) {
     );
     kpiStrip.appendChild(
       buildPaperKpiCard(
-        `Total Net Return (vs ${bmShort})`,
+        "Net Return",
         `${netRetAmt >= 0 ? "+" : ""}${formatExactCurrency(
           netRetAmt,
           ccy,
           ccy === "USD" ? 2 : 0
         )} (${fmtSigned(retPct, 2)}%)`,
-        `${bmShort}: ${fmtSigned(bmRetPct, 2)}% • Excess Alpha: ${fmtSigned(alphaPct, 2)}%`,
+        `vs ${bmShort} ${fmtSigned(bmRetPct, 2)}% · Alpha ${fmtSigned(alphaPct, 2)}%`,
         netRetAmt > 0 ? "text-pos" : netRetAmt < 0 ? "text-neg" : "text-cyan"
       )
     );
     kpiStrip.appendChild(
       buildPaperKpiCard(
-        "Available Free Cash",
+        "Available Cash",
         formatExactCurrency(availCash, ccy, ccy === "USD" ? 2 : 0),
-        `Reserved for Dip Orders: ${formatExactCurrency(reservedCash, ccy, ccy === "USD" ? 2 : 0)}`,
+        reservedCash > 0
+          ? `Reserved ${formatCurrencyCompact(reservedCash, ccy)}`
+          : "Ready to deploy",
         "text-pos"
       )
     );
     kpiStrip.appendChild(
       buildPaperKpiCard(
-        "Open Buy-on-Dip Orders",
-        `${openOrders.length} Active`,
+        "Dip Orders",
+        `${openOrders.length} Open`,
         openOrders.length > 0
-          ? `${formatExactCurrency(reservedCash, ccy)} locked • Checked daily vs Yahoo Low`
-          : "Place a -5% / -7% / -10% Dip Limit order on any stock",
+          ? `${formatCurrencyCompact(reservedCash, ccy)} locked`
+          : "No active limit orders",
         openOrders.length > 0 ? "text-warn" : ""
       )
     );
@@ -452,42 +786,37 @@ function renderPaperArena(user) {
       const bpAmt = Number(bestPick.unrealized_pnl || 0);
       kpiStrip.appendChild(
         buildPaperKpiCard(
-          "Best Performing Strategy Pick",
+          "Top Holding",
           `${displaySymbol(bestPick.ticker)} (${fmtSigned(bpPct, 2)}%)`,
-          `${bestPick.name || bestPick.ticker} • ${bpAmt >= 0 ? "+" : ""}${formatExactCurrency(
+          `${bpAmt >= 0 ? "+" : ""}${formatExactCurrency(
             bpAmt,
             ccy,
             ccy === "USD" ? 2 : 0
-          )}`,
+          )} unrealized`,
           bpPct >= 0 ? "text-pos" : "text-neg"
         )
       );
     } else {
       kpiStrip.appendChild(
         buildPaperKpiCard(
-          "Best Performing Strategy Pick",
-          "No Holdings Yet",
-          "Deploy a Planner Basket or click Paper Trade on any stock",
+          "Top Holding",
+          "—",
+          "No open positions",
           ""
         )
       );
     }
   }
 
-  // 2. Render Daily Portfolio NAV vs. Benchmark Chart
+  // 2. Render Portfolio NAV vs. Benchmark Chart
   renderPaperNavChart(ap, ccy, bmShort, totalDeposited, totalNav, bmRetPct);
 
-  // 3. Render Model Attribution Scorecard ("How Our Ratings Performed in Your Wallet")
-  renderPaperAttribution(ap, positions, ccy);
-
-  // 4. Render Open Positions Table
+  // 3. Render 4 Sub-Tab Panes & Sync Active Sub-Tab
   renderPaperPositionsTable(positions, ccy);
-
-  // 5. Render Open Buy-on-Dip Limit Orders Book
   renderPaperOpenOrdersTable(openOrders, ccy);
-
-  // 6. Render Immutable Trade Execution History Ledger
   renderPaperTradesTable(recentTrades, ccy);
+  renderPaperAttribution(ap, positions, ccy);
+  setPaperSubtab(uiState.activeSubtab);
 }
 
 function renderPaperNavChart(ap, ccy, bmShort, totalDeposited, totalNav, bmRetPct) {
@@ -497,10 +826,10 @@ function renderPaperNavChart(ap, ccy, bmShort, totalDeposited, totalNav, bmRetPc
   if (!chartBox) return;
 
   if (titleEl) {
-    titleEl.textContent = `Daily Portfolio NAV vs. ${bmShort} (${ccy === "USD" ? "$ USD" : "₹ INR"})`;
+    titleEl.textContent = `Portfolio NAV vs ${bmShort}`;
   }
   if (bmLegendEl) {
-    bmLegendEl.textContent = `${bmShort} Equivalent`;
+    bmLegendEl.textContent = bmShort;
   }
 
   const rawHist = Array.isArray(ap.nav_history) ? ap.nav_history : [];
@@ -592,8 +921,8 @@ function renderPaperAttribution(ap, positions, ccy) {
   if (subEl) {
     subEl.textContent =
       positions.length > 0
-        ? "Live paper return % grouped by ArthaQuant model rating at the moment you bought"
-        : "Buy stocks across Strong Buy, Buy, or Hold tiers to track live rating attribution";
+        ? "Return % grouped by model rating at entry"
+        : "Buy stocks to track performance by model rating";
   }
 
   const listWrap = el("div", "attribution-tier-list");
@@ -625,7 +954,7 @@ function renderPaperAttribution(ap, positions, ccy) {
     const left = el("div", "inline-group wrap-group");
     left.appendChild(el("span", ratingBadgeClass(tier), tier));
     left.appendChild(
-      el("span", "muted-note", count === 1 ? "1 Open Position" : `${count} Open Positions`)
+      el("span", "muted-note", count === 1 ? "1 position" : `${count} positions`)
     );
     top.appendChild(left);
 
@@ -634,7 +963,7 @@ function renderPaperAttribution(ap, positions, ccy) {
       `attr-ret-val ${
         count === 0 ? "muted-note" : retPct > 0 ? "text-pos" : retPct < 0 ? "text-neg" : "text-cyan"
       }`,
-      count === 0 ? "0.00% (No Picks)" : `${fmtSigned(retPct, 2)}% (${pnl >= 0 ? "+" : ""}${formatExactCurrency(pnl, ccy)})`
+      count === 0 ? "—" : `${fmtSigned(retPct, 2)}% (${pnl >= 0 ? "+" : ""}${formatExactCurrency(pnl, ccy)})`
     );
     top.appendChild(right);
     card.appendChild(top);
@@ -643,8 +972,8 @@ function renderPaperAttribution(ap, positions, ccy) {
     card.appendChild(createProgressSvg(barFillPct, tierColors[tier] || "#38bdf8", 6));
 
     const meta = el("div", "attr-row-meta");
-    meta.appendChild(el("span", "", `Cost Basis: ${formatExactCurrency(inv, ccy)}`));
-    meta.appendChild(el("span", "", `Current Value: ${formatExactCurrency(curVal, ccy)}`));
+    meta.appendChild(el("span", "", `Cost ${formatExactCurrency(inv, ccy)}`));
+    meta.appendChild(el("span", "", `Value ${formatExactCurrency(curVal, ccy)}`));
     card.appendChild(meta);
 
     listWrap.appendChild(card);
@@ -656,8 +985,8 @@ function renderPaperAttribution(ap, positions, ccy) {
 function renderPaperPositionsTable(positions, walletCcy) {
   const pill = document.getElementById("paper-positions-count-pill");
   const tbody = document.getElementById("paper-positions-tbody");
+  if (pill) pill.textContent = `${positions.length}`;
   if (!tbody) return;
-  if (pill) pill.textContent = `${positions.length} Holdings`;
   tbody.replaceChildren();
 
   if (positions.length === 0) {
@@ -665,7 +994,7 @@ function renderPaperPositionsTable(positions, walletCcy) {
     const td = el(
       "td",
       "empty-state-box",
-      "No open stock positions in this wallet yet. Click '+ Place Stock / Dip Order' above, or deploy a full basket from Tab 2 (Investment Planner)."
+      "No open positions yet. Click + Place Order or deploy a Planner basket."
     );
     td.colSpan = 8;
     tr.appendChild(td);
@@ -702,7 +1031,7 @@ function renderPaperPositionsTable(positions, walletCcy) {
     shTd.appendChild(el("div", "company-primary", `${pos.shares} sh`));
     if (pos.sellable_shares !== undefined && Number(pos.sellable_shares) < Number(pos.shares)) {
       shTd.appendChild(
-        el("span", "sector-sub text-warn", `${pos.sellable_shares} sh free (${pos.shares - pos.sellable_shares} in limit sell)`)
+        el("span", "sector-sub text-warn", `${pos.sellable_shares} sh free`)
       );
     }
     tr.appendChild(shTd);
@@ -719,7 +1048,7 @@ function renderPaperPositionsTable(positions, walletCcy) {
       el("div", "company-primary", formatExactCurrency(mktVal, walletCcy, walletCcy === "USD" ? 2 : 0))
     );
     if (pos.weight_pct !== undefined) {
-      mvTd.appendChild(el("span", "sector-sub", `${Number(pos.weight_pct).toFixed(1)}% of NAV`));
+      mvTd.appendChild(el("span", "sector-sub", `${Number(pos.weight_pct).toFixed(1)}% NAV`));
     }
     tr.appendChild(mvTd);
 
@@ -759,11 +1088,11 @@ function renderPaperPositionsTable(positions, walletCcy) {
     );
     tr.appendChild(scTd);
 
-    // 8. Quick Actions: Buy More / Sell / Deep Dive
+    // 8. Quick Actions: Buy / Sell / Details
     const actTd = document.createElement("td");
     const actGroup = el("div", "inline-group wrap-group");
 
-    const buyBtn = el("button", "btn btn-ghost btn-xs text-pos", "+ Buy / Dip");
+    const buyBtn = el("button", "btn btn-ghost btn-xs text-pos", "+ Buy");
     buyBtn.type = "button";
     buyBtn.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -781,7 +1110,7 @@ function renderPaperPositionsTable(positions, walletCcy) {
       });
     });
 
-    const ddBtn = el("button", "btn-deep-dive", "Deep Dive →");
+    const ddBtn = el("button", "btn-deep-dive", "Details →");
     ddBtn.type = "button";
     ddBtn.addEventListener("click", (ev) => {
       ev.stopPropagation();
@@ -801,8 +1130,8 @@ function renderPaperPositionsTable(positions, walletCcy) {
 function renderPaperOpenOrdersTable(openOrders, walletCcy) {
   const pill = document.getElementById("paper-orders-count-pill");
   const tbody = document.getElementById("paper-orders-tbody");
+  if (pill) pill.textContent = `${openOrders.length}`;
   if (!tbody) return;
-  if (pill) pill.textContent = `${openOrders.length} Open Limit Orders`;
   tbody.replaceChildren();
 
   if (openOrders.length === 0) {
@@ -810,7 +1139,7 @@ function renderPaperOpenOrdersTable(openOrders, walletCcy) {
     const td = el(
       "td",
       "empty-state-box",
-      "Zero open Buy-on-Dip limit orders. Set a -5%, -7%, or -10% Dip Limit order on any high-conviction compounder to automatically buy pullbacks!"
+      "No open Dip Orders. Place a -5% or -7% limit order on any stock."
     );
     td.colSpan = 8;
     tr.appendChild(td);
@@ -837,7 +1166,7 @@ function renderPaperOpenOrdersTable(openOrders, walletCcy) {
     line.appendChild(el("span", "ticker-tag", displaySymbol(ord.ticker)));
     line.appendChild(createIndexBadge(ord));
     compTd.appendChild(line);
-    compTd.appendChild(el("span", "sector-sub", `Placed ${formatShortTimestamp(ord.created_at)}`));
+    compTd.appendChild(el("span", "sector-sub", formatShortTimestamp(ord.created_at)));
     tr.appendChild(compTd);
 
     // 2. Side & Order Type
@@ -858,10 +1187,10 @@ function renderPaperOpenOrdersTable(openOrders, walletCcy) {
     // 4. Target Dip Price vs Current Price
     const pxTd = document.createElement("td");
     pxTd.appendChild(
-      el("div", "company-primary text-cyan", `Target ${formatStockPrice(limPx, nativeCcy)}`)
+      el("div", "company-primary text-cyan", formatStockPrice(limPx, nativeCcy))
     );
     pxTd.appendChild(
-      el("span", "sector-sub", `Live Price: ${formatStockPrice(livePx, nativeCcy)}`)
+      el("span", "sector-sub", `Live ${formatStockPrice(livePx, nativeCcy)}`)
     );
     tr.appendChild(pxTd);
 
@@ -876,7 +1205,7 @@ function renderPaperOpenOrdersTable(openOrders, walletCcy) {
       )
     );
     distTd.appendChild(
-      el("span", "sector-sub", nearTrigger ? "Close to trigger!" : "Awaiting pullback")
+      el("span", "sector-sub", nearTrigger ? "Near trigger" : "Watching low")
     );
     tr.appendChild(distTd);
 
@@ -893,12 +1222,12 @@ function renderPaperOpenOrdersTable(openOrders, walletCcy) {
 
     // 7. Strategy Note
     tr.appendChild(
-      el("td", "muted-note cell-wrap", ord.note || "Buy-on-Dip Automated Limit")
+      el("td", "muted-note cell-wrap", ord.note || "Buy-on-Dip Limit")
     );
 
     // 8. Cancel Order Button
     const cancelTd = document.createElement("td");
-    const cancelBtn = el("button", "btn btn-ghost btn-xs text-neg", "Cancel Order");
+    const cancelBtn = el("button", "btn btn-ghost btn-xs text-neg", "Cancel");
     cancelBtn.type = "button";
     cancelBtn.addEventListener("click", async () => {
       cancelBtn.disabled = true;
@@ -911,12 +1240,12 @@ function renderPaperOpenOrdersTable(openOrders, walletCcy) {
         applyOverviewEnvelope(res);
         await loadPaperOverview(paperState.activePortfolioId);
         paperState.showToast(
-          `Cancelled ${ord.side} LIMIT order on ${displaySymbol(ord.ticker)} — reserved cash released.`
+          `Cancelled ${displaySymbol(ord.ticker)} limit order — cash released.`
         );
       } catch (err) {
         paperState.showToast(err.message, true);
         cancelBtn.disabled = false;
-        cancelBtn.textContent = "Cancel Order";
+        cancelBtn.textContent = "Cancel";
       }
     });
     cancelTd.appendChild(cancelBtn);
@@ -929,13 +1258,13 @@ function renderPaperOpenOrdersTable(openOrders, walletCcy) {
 function renderPaperTradesTable(trades, walletCcy) {
   const pill = document.getElementById("paper-trades-count-pill");
   const tbody = document.getElementById("paper-trades-tbody");
+  if (pill) pill.textContent = `${trades.length}`;
   if (!tbody) return;
-  if (pill) pill.textContent = `${trades.length} Executions`;
   tbody.replaceChildren();
 
   if (trades.length === 0) {
     const tr = document.createElement("tr");
-    const td = el("td", "empty-state-box", "No executed paper trades recorded in this wallet yet.");
+    const td = el("td", "empty-state-box", "No executed trades yet.");
     td.colSpan = 8;
     tr.appendChild(td);
     tbody.appendChild(tr);
@@ -963,8 +1292,8 @@ function renderPaperTradesTable(trades, walletCcy) {
         el(
           "span",
           "sector-sub",
-          `Entry Verdict: ${t.rating_at_trade}${
-            t.score_at_trade ? ` (${Number(t.score_at_trade).toFixed(1)})` : ""
+          `Rated ${t.rating_at_trade}${
+            t.score_at_trade ? ` · ${Number(t.score_at_trade).toFixed(1)}` : ""
           }`
         )
       );
@@ -1015,7 +1344,7 @@ function renderPaperTradesTable(trades, walletCcy) {
 
     // 8. Realized P&L
     if (isBuy) {
-      tr.appendChild(el("td", "muted-note", "— (Entry)"));
+      tr.appendChild(el("td", "muted-note", "—"));
     } else {
       tr.appendChild(
         el(
@@ -1295,14 +1624,29 @@ function getSelectedTicketWallet() {
   return portfolios[0];
 }
 
+function applyCachedLiveQuote(stockObj) {
+  if (!stockObj || !stockObj.ticker) return stockObj;
+  const cached = paperState.liveQuoteCache.get(String(stockObj.ticker).toUpperCase());
+  if (!cached) return { ...stockObj };
+  const px = Number(cached.close_price ?? cached.live_price ?? cached.price ?? 0);
+  if (!Number.isFinite(px) || px <= 0) return { ...stockObj };
+  return {
+    ...stockObj,
+    price: px,
+    live_price: px,
+    current_price: px,
+    native_currency: cached.native_currency || resolveStockCurrency(stockObj),
+  };
+}
+
 function resolveTicketStockObject(rawTickerOrObj) {
   if (rawTickerOrObj && typeof rawTickerOrObj === "object" && rawTickerOrObj.ticker) {
-    return rawTickerOrObj;
+    return applyCachedLiveQuote(rawTickerOrObj);
   }
   const sym = String(rawTickerOrObj || "").trim().toUpperCase();
   if (!sym) return null;
   const fromScreener = paperState.findStockByTicker(sym);
-  if (fromScreener) return fromScreener;
+  if (fromScreener) return applyCachedLiveQuote(fromScreener);
   // Also check active portfolio positions
   const ap = paperState.overview && paperState.overview.active_portfolio;
   if (ap && Array.isArray(ap.positions)) {
@@ -1310,7 +1654,7 @@ function resolveTicketStockObject(rawTickerOrObj) {
       (p) => p.ticker.toUpperCase() === sym || displaySymbol(p.ticker).toUpperCase() === sym
     );
     if (posMatch) {
-      return {
+      return applyCachedLiveQuote({
         ticker: posMatch.ticker,
         name: posMatch.name || posMatch.ticker,
         sector: posMatch.sector || "",
@@ -1319,10 +1663,102 @@ function resolveTicketStockObject(rawTickerOrObj) {
         price: Number(posMatch.live_price ?? posMatch.current_price ?? posMatch.avg_cost ?? 0),
         composite_score: Number(posMatch.current_score ?? posMatch.entry_score ?? 0),
         rating: posMatch.current_rating || posMatch.entry_rating || "Buy",
-      };
+      });
     }
   }
   return null;
+}
+
+function isOrderTicketModalOpen() {
+  const modal = document.getElementById("paper-order-modal");
+  return Boolean(modal && !modal.classList.contains("hidden"));
+}
+
+function recomputeTicketAutoShares() {
+  if (paperState.ticketSharesEditedByUser) return;
+  const st = paperState.ticketStock;
+  if (!st) return;
+  const sharesInput = document.getElementById("paper-order-shares");
+  if (!sharesInput) return;
+  const chosenW = getSelectedTicketWallet();
+  const wCcy = (chosenW && chosenW.currency) || "INR";
+  const sCcy = resolveStockCurrency(st);
+  const fx = computeFxRate(sCcy, wCcy);
+  const livePx = Number(st.price || st.live_price || st.current_price || 100);
+  const avail = chosenW
+    ? Number(chosenW.available_cash ?? Number(chosenW.cash_balance || 0) - Number(chosenW.reserved_cash || 0))
+    : 100000;
+  const autoSh = Math.max(1, Math.floor((avail * 0.1) / Math.max(0.01, livePx * fx)));
+  sharesInput.value = String(Math.min(autoSh, 500));
+}
+
+async function syncTicketLiveQuote(ticker) {
+  const cleanSym = String(ticker || "").trim().toUpperCase();
+  if (!cleanSym) return;
+
+  const reqSeq = ++paperState.ticketQuoteReqSeq;
+  paperState.ticketQuoteSyncing = true;
+  renderTicketStockSummary();
+
+  try {
+    const quote = await paperApiRequest(
+      `/api/paper/quote?ticker=${encodeURIComponent(cleanSym)}`
+    );
+    if (reqSeq !== paperState.ticketQuoteReqSeq) return;
+
+    const liveFx = Number(quote && quote.fx_usd_inr);
+    if (Number.isFinite(liveFx) && liveFx > 1) {
+      paperState.liveUsdInrFx = liveFx;
+      if (paperState.overview) {
+        paperState.overview.fx_usd_inr = liveFx;
+        if (paperState.overview.active_portfolio) {
+          paperState.overview.active_portfolio.fx_usd_inr = liveFx;
+        }
+      }
+    }
+
+    const livePx = Number(
+      quote && (quote.close_price ?? quote.live_price ?? quote.price)
+    );
+    const canonicalSym = String((quote && quote.ticker) || cleanSym).toUpperCase();
+    if (Number.isFinite(livePx) && livePx > 0) {
+      paperState.liveQuoteCache.set(canonicalSym, quote);
+      if (
+        paperState.ticketStock &&
+        String(paperState.ticketStock.ticker || "").toUpperCase() === canonicalSym
+      ) {
+        paperState.ticketStock = {
+          ...paperState.ticketStock,
+          price: livePx,
+          live_price: livePx,
+          current_price: livePx,
+          native_currency:
+            (quote && quote.native_currency) || resolveStockCurrency(paperState.ticketStock),
+        };
+
+        const limitInput = document.getElementById("paper-order-limit-price");
+        if (limitInput && paperState.ticketActiveDipPct !== null) {
+          const updatedLim = Math.max(
+            0.05,
+            livePx * (1 + paperState.ticketActiveDipPct / 100)
+          );
+          limitInput.value = updatedLim.toFixed(2);
+        }
+        recomputeTicketAutoShares();
+      }
+    }
+  } catch (_quoteErr) {
+    // Graceful fallback to cached/snapshot quote if offline
+  } finally {
+    if (reqSeq === paperState.ticketQuoteReqSeq) {
+      paperState.ticketQuoteSyncing = false;
+      if (isOrderTicketModalOpen()) {
+        renderTicketStockSummary();
+        renderTicketDipAndQtyChips();
+        updateOrderTicketPreview();
+      }
+    }
+  }
 }
 
 function renderTicketStockSummary() {
@@ -1350,10 +1786,11 @@ function renderTicketStockSummary() {
   }
   top.appendChild(left);
 
+  const syncSuffix = paperState.ticketQuoteSyncing ? " ↻" : "";
   const right = el(
     "div",
     "company-primary text-cyan",
-    `Live ${formatStockPrice(px, ccy)}${
+    `Live ${formatStockPrice(px, ccy)}${syncSuffix}${
       st.composite_score ? ` • Score ${Number(st.composite_score).toFixed(1)}` : ""
     }`
   );
@@ -1373,6 +1810,7 @@ function renderTicketDipAndQtyChips() {
   if (dipChips) {
     dipChips.replaceChildren();
     if (st && paperState.ticketOrderType === "LIMIT") {
+      const stockCcy = resolveStockCurrency(st);
       const livePx = Number(st.price || st.live_price || st.current_price || 0);
       const presets =
         paperState.ticketSide === "BUY"
@@ -1390,11 +1828,22 @@ function renderTicketDipAndQtyChips() {
               { label: "+20% Target", pct: 20 },
             ];
       for (const p of presets) {
-        const chip = el("button", "chip-btn", p.label);
+        const targetPx = Math.max(0.05, livePx * (1 + p.pct / 100));
+        const chipLabel =
+          livePx > 0 ? `${p.label} · ${formatStockPrice(targetPx, stockCcy)}` : p.label;
+        const chip = el("button", "chip-btn", chipLabel);
         chip.type = "button";
         chip.addEventListener("click", () => {
-          const targetPx = Math.max(0.05, livePx * (1 + p.pct / 100));
-          limitInput.value = targetPx.toFixed(2);
+          paperState.ticketActiveDipPct = p.pct;
+          const freshLivePx = Number(
+            (paperState.ticketStock &&
+              (paperState.ticketStock.price ||
+                paperState.ticketStock.live_price ||
+                paperState.ticketStock.current_price)) ||
+              livePx
+          );
+          const freshTargetPx = Math.max(0.05, freshLivePx * (1 + p.pct / 100));
+          limitInput.value = freshTargetPx.toFixed(2);
           if (noteInput && paperState.ticketSide === "BUY") {
             noteInput.value = `${p.pct}% Buy-on-Dip Limit Order`;
           }
@@ -1426,6 +1875,7 @@ function renderTicketDipAndQtyChips() {
         const chip = el("button", "chip-btn", `${allocPct}% Cash (${sh} sh)`);
         chip.type = "button";
         chip.addEventListener("click", () => {
+          paperState.ticketSharesEditedByUser = true;
           sharesInput.value = String(sh);
           updateOrderTicketPreview();
         });
@@ -1448,6 +1898,7 @@ function renderTicketDipAndQtyChips() {
           const chip = el("button", "chip-btn", `${lbl} (${sh} sh)`);
           chip.type = "button";
           chip.addEventListener("click", () => {
+            paperState.ticketSharesEditedByUser = true;
             sharesInput.value = String(sh);
             updateOrderTicketPreview();
           });
@@ -1636,10 +2087,13 @@ export async function openPaperOrderTicket(stockOrTicker = null, opts = {}) {
   errBox.textContent = "";
 
   const resolvedStock =
-    resolveTicketStockObject(stockOrTicker) || (paperState.getAllStocks() || [])[0] || null;
+    resolveTicketStockObject(stockOrTicker) ||
+    applyCachedLiveQuote((paperState.getAllStocks() || [])[0] || null);
   paperState.ticketStock = resolvedStock;
   paperState.ticketSide = opts.side || "BUY";
   paperState.ticketOrderType = opts.orderType || "MARKET";
+  paperState.ticketActiveDipPct = paperState.ticketSide === "BUY" ? -7 : 10;
+  paperState.ticketSharesEditedByUser = Boolean(opts.defaultShares);
 
   if (tkInput) {
     tkInput.value = resolvedStock ? resolvedStock.ticker : "";
@@ -1707,9 +2161,17 @@ export async function openPaperOrderTicket(stockOrTicker = null, opts = {}) {
 
   backdrop.classList.remove("hidden");
   modal.classList.remove("hidden");
+
+  if (resolvedStock && resolvedStock.ticker) {
+    void syncTicketLiveQuote(resolvedStock.ticker);
+  }
 }
 
+export const openPaperTradeModal = openPaperOrderTicket;
+
 function closePaperOrderTicket() {
+  paperState.ticketQuoteReqSeq += 1;
+  paperState.ticketQuoteSyncing = false;
   const backdrop = document.getElementById("paper-order-modal-backdrop");
   const modal = document.getElementById("paper-order-modal");
   if (backdrop) backdrop.classList.add("hidden");
@@ -1777,21 +2239,28 @@ async function handleOrderTicketSubmit(ev) {
       method: "POST",
       jsonBody: payload,
     });
+    const ordStatus = res.order && res.order.status;
     paperState.activePortfolioId = portfolioId;
     applyOverviewEnvelope(res);
     closePaperOrderTicket();
+    if (isPaperTabActive()) {
+      if (payload.order_type === "LIMIT" && ordStatus !== "FILLED") {
+        setPaperSubtab("orders");
+      } else if (payload.order_type === "MARKET" || ordStatus === "FILLED") {
+        setPaperSubtab("positions");
+      }
+    }
     await loadPaperOverview(portfolioId);
 
-    const ordStatus = res.order && res.order.status;
     if (ordStatus === "OPEN") {
       paperState.showToast(
-        `Queued ${payload.side} LIMIT (${shares} sh of ${displaySymbol(
+        `Queued ${payload.side} LIMIT (${shares} sh ${displaySymbol(
           canonicalTicker
-        )} @ ${payload.limit_price}) — cash reserved!`
+        )} @ ${payload.limit_price})`
       );
     } else {
       paperState.showToast(
-        `Filled ${payload.side} ${shares} sh of ${displaySymbol(canonicalTicker)} in Paper Wallet!`
+        `Filled ${payload.side} ${shares} sh ${displaySymbol(canonicalTicker)}.`
       );
     }
   } catch (err) {
@@ -2083,6 +2552,7 @@ async function handleDeployBlueprintSubmit(ev) {
     paperState.activePortfolioId = targetPortfolioId;
     applyOverviewEnvelope(deployRes);
     closeDeployBlueprintModal();
+    setPaperSubtab("positions");
     paperState.switchTab("paper");
     await loadPaperOverview(targetPortfolioId);
 
@@ -2096,7 +2566,7 @@ async function handleDeployBlueprintSubmit(ev) {
         : items.filter((x) => x.dip_shares > 0).length);
 
     paperState.showToast(
-      `Blueprint Deployed! Executed ${mktCount} immediate Market Buys & queued ${dipCount} automated -${dipPct}% Buy-on-Dip Limit Orders.`
+      `Deployed ${mktCount} market buys & queued ${dipCount} -${dipPct}% Dip Orders.`
     );
   } catch (err) {
     errBox.textContent = err.message;
@@ -2113,39 +2583,55 @@ async function handleDeployBlueprintSubmit(ev) {
 
 async function handleRefreshPaperQuotes() {
   const btn = document.getElementById("paper-refresh-quotes-btn");
-  if (!btn) return;
-  const prevText = btn.textContent;
+  if (!btn || paperState.manualRefreshInFlight) return;
+  paperState.manualRefreshInFlight = true;
   btn.disabled = true;
-  btn.textContent = "↻ Checking Live Quotes & Dip Triggers...";
+  btn.textContent = "Syncing...";
 
   try {
+    const activeId = paperState.activePortfolioId;
+    const reqBody = activeId
+      ? { portfolio_id: activeId, market_scope: "ALL" }
+      : { market_scope: "ALL" };
     const res = await paperApiRequest("/api/paper/refresh", {
       method: "POST",
-      jsonBody: paperState.activePortfolioId
-        ? { portfolio_id: paperState.activePortfolioId }
-        : {},
+      jsonBody: reqBody,
     });
+    const refreshedAt = Date.now();
+    if (activeId) {
+      paperState.lastAutoRefreshMs.set(`${activeId}::IN`, refreshedAt);
+      paperState.lastAutoRefreshMs.set(`${activeId}::US`, refreshedAt);
+    }
     applyOverviewEnvelope(res);
-    await loadPaperOverview(paperState.activePortfolioId);
+    await loadPaperOverview(paperState.activePortfolioId, { skipAutoRefresh: true });
 
     const summary = res.refresh_summary || res;
     const qUpdated = Number(summary.quotes_updated ?? 0);
     const oFilled = Number(summary.orders_filled ?? 0);
     if (oFilled > 0) {
       paperState.showToast(
-        `Live Refresh Complete: ${qUpdated} quotes synced & ${oFilled} Buy-on-Dip Limit Order(s) triggered and FILLED!`
+        `Synced ${qUpdated} quotes · ${oFilled} Dip Order(s) filled!`
       );
     } else {
       paperState.showToast(
-        `Live Quotes Synced (${qUpdated} tickers marked-to-market). All open dip orders checked against daily Low/High.`
+        `Synced ${qUpdated} live quotes.`
       );
     }
   } catch (err) {
     paperState.showToast(err.message, true);
   } finally {
+    paperState.manualRefreshInFlight = false;
     btn.disabled = false;
-    btn.textContent = prevText;
+    btn.textContent = "↻ Sync Quotes";
+    renderPaperSessionPill();
   }
+}
+
+function handleDocumentVisibilityChange() {
+  if (document.visibilityState !== "visible") return;
+  if (!isPaperTabActive() || !isPaperSignedInViewVisible()) return;
+  renderPaperSessionPill();
+  void maybeTriggerSmartAutoRefresh();
 }
 
 // ============================================================================
@@ -2166,13 +2652,13 @@ async function handleTabLoginSubmit(ev) {
     await loginPaperUser(emailIn.value, passIn.value);
     passIn.value = "";
     await loadPaperOverview();
-    paperState.showToast("Signed in to ArthaQuant Paper Portfolios!");
+    paperState.showToast("Signed in to Paper Wallet.");
   } catch (err) {
     errBox.textContent = err.message;
     errBox.classList.remove("hidden");
   } finally {
     btn.disabled = false;
-    btn.textContent = "Sign In to Paper Portfolios";
+    btn.textContent = "Sign In";
   }
 }
 
@@ -2182,7 +2668,7 @@ async function handleForgotPasswordClick() {
   errBox.classList.add("hidden");
   try {
     await requestPaperPasswordReset(emailVal);
-    paperState.showToast("Password recovery link sent! Check your inbox and click the reset link.");
+    paperState.showToast("Password recovery link sent! Check your inbox.");
   } catch (err) {
     errBox.textContent = err.message;
     errBox.classList.remove("hidden");
@@ -2221,6 +2707,29 @@ export function initPaperTradingUI(callbacks = {}) {
   document.getElementById("paper-refresh-quotes-btn").addEventListener("click", handleRefreshPaperQuotes);
   document.getElementById("paper-signout-btn").addEventListener("click", logoutPaperUser);
 
+  // 4-Section Wallet Sub-Tab Bar
+  const subtabBar = document.getElementById("paper-subtab-bar");
+  if (subtabBar) {
+    subtabBar.addEventListener("click", (ev) => {
+      const btn =
+        ev.target && typeof ev.target.closest === "function"
+          ? ev.target.closest("[data-paper-subtab]")
+          : null;
+      if (btn) {
+        const tabKey = btn.getAttribute("data-paper-subtab");
+        if (tabKey) setPaperSubtab(tabKey);
+      }
+    });
+  }
+  const subtabPosBtn = document.getElementById("paper-subtab-positions");
+  if (subtabPosBtn) subtabPosBtn.addEventListener("click", () => setPaperSubtab("positions"));
+  const subtabOrdBtn = document.getElementById("paper-subtab-orders");
+  if (subtabOrdBtn) subtabOrdBtn.addEventListener("click", () => setPaperSubtab("orders"));
+  const subtabTrdBtn = document.getElementById("paper-subtab-trades");
+  if (subtabTrdBtn) subtabTrdBtn.addEventListener("click", () => setPaperSubtab("trades"));
+  const subtabAttrBtn = document.getElementById("paper-subtab-attribution");
+  if (subtabAttrBtn) subtabAttrBtn.addEventListener("click", () => setPaperSubtab("attribution"));
+
   // Empty wallet 1-click onboarding
   document.getElementById("paper-quick-create-inr-btn").addEventListener("click", () =>
     createQuickWallet(WALLET_TEMPLATES[0])
@@ -2255,25 +2764,34 @@ export function initPaperTradingUI(callbacks = {}) {
   document.getElementById("paper-order-ticker-input").addEventListener("input", (ev) => {
     const match = resolveTicketStockObject(ev.target.value);
     if (match) {
+      const prevTicker =
+        paperState.ticketStock && String(paperState.ticketStock.ticker || "").toUpperCase();
       paperState.ticketStock = match;
+      paperState.ticketActiveDipPct = paperState.ticketSide === "BUY" ? -7 : 10;
       const livePx = Number(match.price || match.live_price || 100);
       document.getElementById("paper-order-limit-price").value = Math.max(
         0.05,
         paperState.ticketSide === "BUY" ? livePx * 0.93 : livePx * 1.1
       ).toFixed(2);
+      recomputeTicketAutoShares();
       renderTicketStockSummary();
       renderTicketDipAndQtyChips();
       updateOrderTicketPreview();
+      if (String(match.ticker || "").toUpperCase() !== prevTicker) {
+        void syncTicketLiveQuote(match.ticker);
+      }
     }
   });
 
   document.getElementById("paper-order-wallet-select").addEventListener("change", () => {
+    recomputeTicketAutoShares();
     renderTicketDipAndQtyChips();
     updateOrderTicketPreview();
   });
 
   document.getElementById("paper-side-buy-btn").addEventListener("click", () => {
     paperState.ticketSide = "BUY";
+    paperState.ticketActiveDipPct = -7;
     if (paperState.ticketStock) {
       const px = Number(paperState.ticketStock.price || 100);
       document.getElementById("paper-order-limit-price").value = (px * 0.93).toFixed(2);
@@ -2285,6 +2803,7 @@ export function initPaperTradingUI(callbacks = {}) {
 
   document.getElementById("paper-side-sell-btn").addEventListener("click", () => {
     paperState.ticketSide = "SELL";
+    paperState.ticketActiveDipPct = 10;
     if (paperState.ticketStock) {
       const px = Number(paperState.ticketStock.price || 100);
       document.getElementById("paper-order-limit-price").value = (px * 1.1).toFixed(2);
@@ -2308,8 +2827,14 @@ export function initPaperTradingUI(callbacks = {}) {
     updateOrderTicketPreview();
   });
 
-  document.getElementById("paper-order-limit-price").addEventListener("input", updateOrderTicketPreview);
-  document.getElementById("paper-order-shares").addEventListener("input", updateOrderTicketPreview);
+  document.getElementById("paper-order-limit-price").addEventListener("input", () => {
+    paperState.ticketActiveDipPct = null;
+    updateOrderTicketPreview();
+  });
+  document.getElementById("paper-order-shares").addEventListener("input", () => {
+    paperState.ticketSharesEditedByUser = true;
+    updateOrderTicketPreview();
+  });
 
   // Deploy Planner Blueprint modal
   document.getElementById("paper-deploy-form").addEventListener("submit", handleDeployBlueprintSubmit);
@@ -2320,4 +2845,17 @@ export function initPaperTradingUI(callbacks = {}) {
   document.getElementById("paper-deploy-new-wallet-cash").addEventListener("input", (ev) => {
     ev.target.dataset.userEdited = "1";
   });
+
+  // Market-hours-aware 5-minute auto-refresh on browser tab visibility restore + 60s pill label ticker
+  document.addEventListener("visibilitychange", handleDocumentVisibilityChange);
+  paperState.sessionTickerTimerId = window.setInterval(() => {
+    if (
+      document.visibilityState === "visible" &&
+      isPaperTabActive() &&
+      isPaperSignedInViewVisible() &&
+      !paperState.autoRefreshInFlight
+    ) {
+      renderPaperSessionPill();
+    }
+  }, 60000);
 }

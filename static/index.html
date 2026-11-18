@@ -7,7 +7,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="ArthaQuant" />
-  <title>ArthaQuant V4.0 — Plain-English Stock Rankings, AI Analyst, Wealth Planner &amp; Paper Strategy Sandbox</title>
+  <title>ArthaQuant V5.0 — Global Stock Rankings, Planner, Backtest &amp; Paper Wallet</title>
   <link rel="manifest" href="/static/manifest.webmanifest" />
   <link rel="icon" type="image/svg+xml" href="/static/icons/icon.svg" />
   <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png" />
@@ -23,25 +23,24 @@
       <div class="brand-row">
         <span class="brand-badge">AQ</span>
         <div>
-          <h1>ArthaQuant Global</h1>
-          <p class="subtitle">Nifty 200, Nasdaq 100 &amp; S&amp;P 500 Rankings, Street Consensus &amp; Paper Strategy Arena</p>
+          <h1>ArthaQuant V5.0</h1>
+          <p class="subtitle">Nifty 200, Nasdaq 100 &amp; S&amp;P 500 Rankings, Planner &amp; Paper Wallet</p>
         </div>
       </div>
       <p id="auth-subtitle" class="auth-desc"></p>
       <form id="auth-form" class="auth-form" autocomplete="off">
         <label class="field-label" for="auth-username">Advisor Username</label>
         <input id="auth-username" name="username" type="text" required minlength="3" maxlength="32" value="advisor" class="input-control" />
-        <label class="field-label" for="auth-password">Workspace Passphrase (min 8 chars, 12+ recommended)</label>
-        <input id="auth-password" name="password" type="password" required minlength="8" maxlength="128" placeholder="Enter strong passphrase..." class="input-control" />
+        <label class="field-label" for="auth-password">Workspace Passphrase (min 8 chars)</label>
+        <input id="auth-password" name="password" type="password" required minlength="8" maxlength="128" placeholder="Enter passphrase..." class="input-control" />
         <div id="auth-error" class="error-banner hidden"></div>
         <button id="auth-submit-btn" type="submit" class="btn btn-primary btn-full">Initialize Workspace</button>
       </form>
       <div class="firm-pills">
-        <span class="pill">Plain-English Scorecards</span>
-        <span class="pill">Multi-Strategy Paper Wallets</span>
-        <span class="pill">Buy-on-Dip Limit Orders</span>
-        <span class="pill">On-Demand AI Analyst Memo</span>
-        <span class="pill">Installable Mobile PWA</span>
+        <span class="pill">Plain-English Rankings</span>
+        <span class="pill">4-Group Quant Filters</span>
+        <span class="pill">Buy-on-Dip Orders</span>
+        <span class="pill">AI Analyst Memo</span>
       </div>
     </div>
   </section>
@@ -54,24 +53,25 @@
         <div>
           <div class="brand-title">
             <span>ArthaQuant</span>
+            <span class="tag-version">V5.0</span>
             <span class="tag-nse">NIFTY 200</span>
             <span class="tag-nasdaq">NASDAQ 100</span>
             <span class="tag-sp500">S&amp;P 500</span>
           </div>
-          <div id="market-status-line" class="subtitle">Loading audited Nifty 200, Nasdaq 100 &amp; S&amp;P 500 fundamentals + Street consensus...</div>
+          <div id="market-status-line" class="subtitle">ArthaQuant V5.0 · Loading global fundamentals...</div>
         </div>
       </div>
 
       <nav class="nav-tabs" role="tablist" aria-label="Primary Workspace Tabs">
-        <button type="button" class="nav-tab active" data-tab="screener">Stock Rankings &amp; Research</button>
-        <button type="button" id="nav-planner-tab" class="nav-tab" data-tab="planner">Investment Planner</button>
-        <button type="button" class="nav-tab" data-tab="backtest">5-Year Strategy Backtest</button>
-        <button type="button" id="nav-paper-tab" class="nav-tab nav-tab-paper" data-tab="paper">Paper Portfolios</button>
+        <button type="button" class="nav-tab active" data-tab="screener">Rankings</button>
+        <button type="button" id="nav-planner-tab" class="nav-tab" data-tab="planner">Planner</button>
+        <button type="button" class="nav-tab" data-tab="backtest">Backtest</button>
+        <button type="button" id="nav-paper-tab" class="nav-tab nav-tab-paper" data-tab="paper">Paper Wallet</button>
       </nav>
 
       <div class="user-bar">
         <button id="install-pwa-btn" type="button" class="btn btn-install-pwa btn-sm hidden">⬇ Install App</button>
-        <button id="toggle-data-drawer-btn" type="button" class="btn btn-ghost btn-sm">Data &amp; Live Sync</button>
+        <button id="toggle-data-drawer-btn" type="button" class="btn btn-ghost btn-sm">Data Sync</button>
         <span id="user-badge" class="user-chip"></span>
         <button id="paper-auth-top-btn" type="button" class="btn btn-ghost btn-sm hidden">Paper Sign Out</button>
         <button id="logout-btn" type="button" class="btn btn-ghost btn-sm">Sign Out</button>
@@ -83,154 +83,289 @@
       <div class="data-drawer-inner">
         <div class="data-drawer-row">
           <div>
-            <div class="drawer-heading">Universe &amp; Live Data Controls</div>
-            <div class="muted-note" id="funnel-summary-note">Nifty-200 &amp; Nasdaq-100 liquid universe deep-scored on multi-year audited financials.</div>
+            <div class="drawer-heading">Universe &amp; Live Data Sync</div>
+            <div class="muted-note" id="funnel-summary-note">Nifty 200, Nasdaq 100 &amp; S&amp;P 500 scored on multi-year audited financials.</div>
           </div>
           <div class="inline-group wrap-group">
             <button id="view-stage2-btn" type="button" class="btn btn-primary btn-sm">Audited Rankings</button>
-            <button id="view-stage1-btn" type="button" class="btn btn-ghost btn-sm">Raw Stage-1 Price Scan</button>
-            <button id="fast-prices-btn" type="button" class="btn btn-secondary btn-sm">Weekly Price Refresh (4s)</button>
-            <button id="expand-funnel-btn" type="button" class="btn btn-ghost btn-sm">+ Deep-Score Remaining</button>
-            <button id="refresh-funnel-btn" type="button" class="btn btn-ghost btn-sm">Full Funnel Sync</button>
+            <button id="view-stage1-btn" type="button" class="btn btn-ghost btn-sm">Stage-1 Price Scan</button>
+            <button id="fast-prices-btn" type="button" class="btn btn-secondary btn-sm">Refresh Prices</button>
+            <button id="expand-funnel-btn" type="button" class="btn btn-ghost btn-sm">+ Deep-Score</button>
+            <button id="refresh-funnel-btn" type="button" class="btn btn-ghost btn-sm">Full Sync</button>
           </div>
         </div>
         <div class="data-drawer-grid">
           <div class="inline-group">
-            <input id="sync-ticker-input" type="text" placeholder="Sync custom NSE symbol (e.g. ZOMATO.NS)" maxlength="24" class="input-control" />
+            <input id="sync-ticker-input" type="text" placeholder="Sync symbol (e.g. ZOMATO.NS)" maxlength="24" class="input-control input-sm" />
             <button id="sync-ticker-btn" type="button" class="btn btn-ghost btn-sm">Sync Stock</button>
           </div>
           <div class="inline-group">
             <input id="csv-file-input" type="file" accept=".csv" class="file-input" />
-            <button id="csv-upload-btn" type="button" class="btn btn-ghost btn-sm">Import Screener CSV</button>
+            <button id="csv-upload-btn" type="button" class="btn btn-ghost btn-sm">Import CSV</button>
           </div>
         </div>
       </div>
     </section>
 
     <main class="main-container">
-      <!-- TAB 1: CLEAN MULTI-MARKET STOCK RANKINGS LEADERBOARD -->
+      <!-- TAB 1: CALM MULTI-MARKET STOCK RANKINGS LEADERBOARD -->
       <section id="tab-screener" class="tab-panel">
-        <div class="control-card">
-          <!-- Market Switcher Row -->
-          <div class="market-bar-row">
-            <div class="market-bar-label">
-              <span class="drawer-heading">Equity Market &amp; Index Priority Universe</span>
-              <span id="screener-market-sub" class="muted-note">Index tag priority: NASDAQ 100 &gt; S&amp;P 500 &gt; NIFTY 200 • Dual-listed US overlap names carry the NASDAQ 100 tag</span>
-            </div>
-            <div id="screener-market-switcher" class="market-switcher" role="group" aria-label="Screener Market Filter">
-              <button type="button" class="market-btn active" data-market="ALL" title="All audited Indian Nifty 200 and US Nasdaq 100 + S&amp;P 500 stocks">
-                <span>All Global</span>
+        <div class="control-card screener-command-shell">
+          <!-- Row 1: Calm Single-Row Command Bar -->
+          <div class="screener-command-bar">
+            <div id="screener-market-switcher" class="market-switcher market-switcher-compact" role="group" aria-label="Screener Market Filter">
+              <button type="button" class="market-btn active" data-market="ALL" title="All Nifty 200, Nasdaq 100 &amp; S&amp;P 500 stocks">
+                <span>All</span>
                 <span id="mkt-count-all" class="ms-count"></span>
               </button>
-              <button type="button" class="market-btn market-btn-in" data-market="IN" title="Indian NSE Nifty 200 stocks (₹ INR)">
+              <button type="button" class="market-btn market-btn-in" data-market="IN" title="India NSE Nifty 200 (₹ INR)">
                 <span class="ms-dot ms-dot-in"></span>
-                <span>India · Nifty 200</span>
+                <span>India</span>
                 <span id="mkt-count-in" class="ms-count"></span>
               </button>
-              <button type="button" class="market-btn market-btn-us" data-market="US" title="All US stocks (Nasdaq 100 + S&amp;P 500 combined)">
+              <button type="button" class="market-btn market-btn-us" data-market="US" title="All US (Nasdaq 100 + S&amp;P 500)">
                 <span class="ms-dot ms-dot-us"></span>
-                <span>All US</span>
+                <span>US</span>
                 <span id="mkt-count-us" class="ms-count"></span>
               </button>
-              <button type="button" class="market-btn market-btn-nasdaq" data-market="NASDAQ100" title="Canonical Nasdaq 100 stocks — takes tag priority when also in S&amp;P 500">
+              <button type="button" class="market-btn market-btn-nasdaq" data-market="NASDAQ100" title="US Nasdaq 100">
                 <span class="ms-dot ms-dot-nasdaq"></span>
-                <span>US · Nasdaq 100</span>
+                <span>Nasdaq</span>
                 <span id="mkt-count-nasdaq" class="ms-count"></span>
               </button>
-              <button type="button" class="market-btn market-btn-sp500" data-market="SP500" title="S&amp;P 500 non-Nasdaq constituents — overlap mega-caps carry the NASDAQ 100 tag">
+              <button type="button" class="market-btn market-btn-sp500" data-market="SP500" title="US S&amp;P 500">
                 <span class="ms-dot ms-dot-sp500"></span>
-                <span>US · S&amp;P 500</span>
+                <span>S&amp;P</span>
                 <span id="mkt-count-sp500" class="ms-count"></span>
               </button>
             </div>
+
+            <div class="command-search-wrap">
+              <input id="screener-search" type="search" aria-label="Search stocks" placeholder="Search ticker, company, or sector..." class="input-control input-sm command-search-input" />
+            </div>
+
+            <div id="rating-filter-strip" class="rating-chip-strip" role="group" aria-label="Filter by Verdict Rating"></div>
+
+            <button id="toggle-adv-filters-btn" type="button" class="btn btn-secondary btn-sm adv-filter-toggle-btn" aria-expanded="false">
+              <span>&#9881; Filters</span>
+              <span id="adv-filters-count-badge" class="af-count-badge hidden">0</span>
+            </button>
           </div>
 
-          <div class="filter-bar-grid">
-            <div>
-              <label class="field-label" for="screener-search">Search Company, Ticker, or Sector</label>
-              <input id="screener-search" type="search" placeholder="Search Nifty 200, Nasdaq 100 &amp; S&amp;P 500 stocks (e.g. NVDA, JPM, LLY, MSFT, Muthoot, ICICI)..." class="input-control" />
-            </div>
-            <div>
-              <label class="field-label" for="screener-preset">Scoring Philosophy (Ranking Model)</label>
-              <select id="screener-preset" class="input-control">
-                <option value="qglp_compounder" selected>Long-Term QGLP Compounder (Recommended)</option>
-                <option value="street_quant">Street EPS Revisions + Quant Compounder</option>
-                <option value="coffee_can">Marcellus Coffee-Can (55% Moat + 30% Growth)</option>
-                <option value="magic_formula">Greenblatt Magic Formula (Quality + Value)</option>
-                <option value="artha_blend">Balanced 4-Factor Blend</option>
-                <option value="value_momentum">AQR Tactical Value + Momentum</option>
-                <option value="custom">Custom Pillar Weights...</option>
-              </select>
-            </div>
-            <div>
-              <label id="screener-sector-label" class="field-label" for="screener-sector">Sector Filter</label>
-              <select id="screener-sector" class="input-control">
-                <option value="ALL">All Sectors</option>
-              </select>
-            </div>
-            <div>
-              <label class="field-label" for="screener-sort">Sort Rankings By</label>
-              <select id="screener-sort" class="input-control">
-                <option value="composite" selected>Overall Score (Highest Rank First)</option>
-                <option value="quality">Strongest &amp; Safest Business</option>
-                <option value="growth">Fastest Sales &amp; Profit Growth</option>
-                <option value="value">Best Price vs Fair Value</option>
-                <option value="mcap">Largest Company Size (Market Cap)</option>
-              </select>
-            </div>
-          </div>
+          <!-- Active Filter Chips Row -->
+          <div id="active-filter-chips-bar" class="active-filter-chips-bar hidden"></div>
 
-          <!-- Custom Weights Row (hidden unless Custom is chosen) -->
-          <div id="custom-weights-row" class="weights-row hidden">
-            <div>
-              <label class="field-label" for="w-quality">Quality &amp; Moat (%)</label>
-              <input id="w-quality" type="number" min="0" max="100" value="45" class="input-control" />
+          <!-- Expandable 4-Group Advanced Filters & Model Controls Drawer -->
+          <div id="adv-filters-drawer" class="adv-filters-drawer hidden">
+            <div class="adv-drawer-topbar">
+              <div class="adv-drawer-title-wrap">
+                <span class="drawer-heading">Advanced Filters &amp; Model Controls</span>
+                <span id="screener-market-sub" class="muted-note">Index priority: NASDAQ 100 &gt; S&amp;P 500 &gt; NIFTY 200</span>
+              </div>
+              <div class="adv-drawer-controls">
+                <div id="screener-mode-switcher" class="mode-switcher" role="group" aria-label="Leaderboard Explanation Mode">
+                  <button id="screener-mode-simple-btn" type="button" class="mode-switch-btn active">Simple</button>
+                  <button id="screener-mode-pro-btn" type="button" class="mode-switch-btn">Pro Ratios</button>
+                </div>
+                <label class="af-toggle-pill" for="af-show-podium">
+                  <input id="af-show-podium" type="checkbox" />
+                  <span>Top-3 Spotlight</span>
+                </label>
+                <button id="af-reset-btn" type="button" class="btn btn-ghost btn-xs">Reset All</button>
+              </div>
             </div>
-            <div>
-              <label class="field-label" for="w-growth">5Y + 2Q Growth (%)</label>
-              <input id="w-growth" type="number" min="0" max="100" value="25" class="input-control" />
-            </div>
-            <div>
-              <label class="field-label" for="w-value">GARP Valuation (%)</label>
-              <input id="w-value" type="number" min="0" max="100" value="20" class="input-control" />
-            </div>
-            <div>
-              <label class="field-label" for="w-momentum">Piotroski &amp; Smart Money (%)</label>
-              <input id="w-momentum" type="number" min="0" max="100" value="10" class="input-control" />
-            </div>
-            <div class="align-end">
-              <button id="apply-weights-btn" type="button" class="btn btn-primary btn-full">Apply Custom Formula</button>
-            </div>
-          </div>
 
-          <!-- Transparent Formula Legend -->
-          <div class="formula-legend-bar" id="active-formula-bar"></div>
+            <div class="adv-groups-grid">
+              <!-- Group 1: Valuation & Quality -->
+              <div class="adv-group-card">
+                <div class="adv-group-title">Valuation &amp; Quality</div>
+                <div class="adv-field">
+                  <label class="field-label" for="af-val-zone">Valuation Zone</label>
+                  <select id="af-val-zone" class="input-control input-sm">
+                    <option value="ALL" selected>Any Valuation</option>
+                    <option value="UNDERVALUED">Bargain / Below Fair Value</option>
+                    <option value="FAIR_OR_BETTER">Fairly Priced or Better</option>
+                    <option value="NOT_EXPENSIVE">Exclude Expensive</option>
+                  </select>
+                </div>
+                <div class="adv-field">
+                  <label class="field-label" for="af-max-pe">Max P/E Multiple</label>
+                  <select id="af-max-pe" class="input-control input-sm">
+                    <option value="ALL" selected>Any P/E</option>
+                    <option value="15">Max P/E &le; 15x</option>
+                    <option value="25">Max P/E &le; 25x</option>
+                    <option value="35">Max P/E &le; 35x</option>
+                    <option value="50">Max P/E &le; 50x</option>
+                  </select>
+                </div>
+                <div class="adv-field">
+                  <label class="field-label" for="af-min-roce">ROCE / ROE Floor</label>
+                  <select id="af-min-roce" class="input-control input-sm">
+                    <option value="0" selected>Any ROCE / ROE</option>
+                    <option value="12">Min 12%+</option>
+                    <option value="15">Min 15%+</option>
+                    <option value="20">Min 20%+</option>
+                    <option value="25">Min 25%+</option>
+                  </select>
+                </div>
+                <div class="adv-field">
+                  <label class="field-label" for="af-max-de">Debt / Equity Cap</label>
+                  <select id="af-max-de" class="input-control input-sm">
+                    <option value="ALL" selected>Any Debt/Equity</option>
+                    <option value="0.1">Debt-Free &le; 0.1x</option>
+                    <option value="0.5">Low Debt &le; 0.5x</option>
+                    <option value="1.0">Moderate &le; 1.0x</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- Group 2: Growth & Safety -->
+              <div class="adv-group-card">
+                <div class="adv-group-title">Growth &amp; Safety</div>
+                <div class="adv-field">
+                  <label class="field-label" for="af-min-growth">3Y Growth Floor</label>
+                  <select id="af-min-growth" class="input-control input-sm">
+                    <option value="0" selected>Any 3Y Growth</option>
+                    <option value="10">Min 10%+ CAGR</option>
+                    <option value="15">Min 15%+ CAGR</option>
+                    <option value="20">Min 20%+ CAGR</option>
+                    <option value="25">Min 25%+ CAGR</option>
+                  </select>
+                </div>
+                <div class="adv-field">
+                  <label class="field-label" for="af-archetype">Business Style</label>
+                  <select id="af-archetype" class="input-control input-sm">
+                    <option value="ALL" selected>All Business Styles</option>
+                  </select>
+                </div>
+                <div class="adv-field adv-toggle-field">
+                  <label class="af-toggle-pill af-toggle-block" for="af-zero-flags">
+                    <input id="af-zero-flags" type="checkbox" />
+                    <span>Zero Red Flags Only</span>
+                  </label>
+                </div>
+              </div>
+
+              <!-- Group 3: Street, Sector & Model -->
+              <div class="adv-group-card">
+                <div class="adv-group-title">Street, Sector &amp; Model</div>
+                <div class="adv-field">
+                  <label class="field-label" for="af-street">Analyst Consensus</label>
+                  <select id="af-street" class="input-control input-sm">
+                    <option value="ALL" selected>Any Analyst View</option>
+                    <option value="UPSIDE_10">Target Upside &ge; 10%</option>
+                    <option value="UPSIDE_20">Target Upside &ge; 20%</option>
+                    <option value="BULLISH_REV">Positive EPS Revisions</option>
+                    <option value="STRONG_CONSENSUS">&ge; 70% Analyst Buy</option>
+                  </select>
+                </div>
+                <div class="adv-field">
+                  <label id="screener-sector-label" class="field-label" for="screener-sector">Sector</label>
+                  <select id="screener-sector" class="input-control input-sm">
+                    <option value="ALL">All Sectors</option>
+                  </select>
+                </div>
+                <div class="adv-field">
+                  <label class="field-label" for="screener-sort">Sort Rankings By</label>
+                  <select id="screener-sort" class="input-control input-sm">
+                    <option value="composite" selected>Overall Score</option>
+                    <option value="quality">Business Quality</option>
+                    <option value="growth">Fastest Growth</option>
+                    <option value="value">Best Valuation</option>
+                    <option value="upside">Analyst Upside %</option>
+                    <option value="roce">Highest ROCE / ROE</option>
+                    <option value="pe_asc">Lowest P/E</option>
+                    <option value="mcap">Largest Market Cap</option>
+                  </select>
+                </div>
+                <div class="adv-field">
+                  <label class="field-label" for="screener-preset">Scoring Model</label>
+                  <select id="screener-preset" class="input-control input-sm">
+                    <option value="qglp_compounder" selected>Long-Term QGLP Compounder (Recommended)</option>
+                    <option value="street_quant">Street EPS Revisions + Quant Compounder</option>
+                    <option value="coffee_can">Marcellus Coffee-Can (55% Moat + 30% Growth)</option>
+                    <option value="magic_formula">Greenblatt Magic Formula (Quality + Value)</option>
+                    <option value="artha_blend">Balanced 4-Factor Blend</option>
+                    <option value="value_momentum">AQR Tactical Value + Momentum</option>
+                    <option value="custom">Custom Pillar Weights...</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- Group 4: Technicals & Size -->
+              <div class="adv-group-card">
+                <div class="adv-group-title">Technicals &amp; Size</div>
+                <div class="adv-field">
+                  <label class="field-label" for="af-52w">52-Week Range</label>
+                  <select id="af-52w" class="input-control input-sm">
+                    <option value="ALL" selected>Any 52W Range</option>
+                    <option value="NEAR_HIGH">Near Breakout (within 10% of 52W High)</option>
+                    <option value="DIP_10_25">Pullback 10%&ndash;25% off High</option>
+                    <option value="DEEP_DIP_25">Deep Pullback &gt;25% off High</option>
+                  </select>
+                </div>
+                <div class="adv-field">
+                  <label class="field-label" for="af-cap-tier">Market Cap Tier</label>
+                  <select id="af-cap-tier" class="input-control input-sm">
+                    <option value="ALL" selected>All Cap Sizes</option>
+                    <option value="MEGA_LARGE">Mega &amp; Large Cap</option>
+                    <option value="MID">Mid &amp; Emerging Cap</option>
+                  </select>
+                </div>
+                <div class="adv-field adv-toggle-field">
+                  <label class="af-toggle-pill af-toggle-block" for="af-above-200dma">
+                    <input id="af-above-200dma" type="checkbox" />
+                    <span>Above 200-DMA Trend</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <!-- Custom Weights Row (hidden unless Custom is chosen) -->
+            <div id="custom-weights-row" class="weights-row hidden">
+              <div>
+                <label class="field-label" for="w-quality">Quality &amp; Moat (%)</label>
+                <input id="w-quality" type="number" min="0" max="100" value="45" class="input-control input-sm" />
+              </div>
+              <div>
+                <label class="field-label" for="w-growth">5Y + 2Q Growth (%)</label>
+                <input id="w-growth" type="number" min="0" max="100" value="25" class="input-control input-sm" />
+              </div>
+              <div>
+                <label class="field-label" for="w-value">GARP Valuation (%)</label>
+                <input id="w-value" type="number" min="0" max="100" value="20" class="input-control input-sm" />
+              </div>
+              <div>
+                <label class="field-label" for="w-momentum">Piotroski &amp; Smart Money (%)</label>
+                <input id="w-momentum" type="number" min="0" max="100" value="10" class="input-control input-sm" />
+              </div>
+              <div class="align-end">
+                <button id="apply-weights-btn" type="button" class="btn btn-primary btn-sm btn-full">Apply Weights</button>
+              </div>
+            </div>
+
+            <!-- Transparent Formula Legend -->
+            <div class="formula-legend-bar" id="active-formula-bar"></div>
+          </div>
         </div>
 
-        <!-- Interactive Rating Tier Filter Cards -->
-        <div id="rating-filter-strip" class="rating-filter-grid"></div>
-
-        <!-- Top 3 Ranked Spotlight Podium -->
-        <div id="podium-section">
+        <!-- Top 3 Ranked Spotlight Podium (Hidden by default in V5.0 unless toggled on) -->
+        <div id="podium-section" class="hidden">
           <div class="section-heading-row">
             <h2 id="podium-heading">Top Conviction Leaders</h2>
-            <span class="muted-note">Plain-English business snapshot &amp; verdict — click any card for the 30-second breakdown, AI Memo &amp; Paper Trade</span>
+            <span class="muted-note">Click any leader for Deep Dive &amp; Paper Trade</span>
           </div>
           <div id="top-podium-grid" class="podium-grid"></div>
         </div>
 
         <!-- Clean Full-Width Leaderboard Table -->
         <div class="panel leaderboard-panel">
-          <div class="panel-header">
-            <div>
-              <h2 id="table-panel-title">Global Multi-Market Fundamental Rankings</h2>
-              <p class="muted-note" id="table-panel-sub">Click any company to open its Plain-English Score Receipt, Business Snapshot, AI Analyst Memo &amp; Buy-on-Dip Ticket</p>
+          <div class="panel-header leaderboard-header">
+            <div class="leaderboard-title-group">
+              <h2 id="table-panel-title">Global Multi-Market Rankings</h2>
+              <p class="muted-note" id="table-panel-sub">Select any stock for Deep Dive, AI Memo &amp; Paper Trade</p>
             </div>
             <div class="inline-group wrap-group">
-              <div id="screener-mode-switcher" class="mode-switcher" role="group" aria-label="Leaderboard Explanation Mode">
-                <button id="screener-mode-simple-btn" type="button" class="mode-switch-btn active">Simple English</button>
-                <button id="screener-mode-pro-btn" type="button" class="mode-switch-btn">Pro Ratios</button>
-              </div>
               <span id="visible-count-badge" class="pill"></span>
             </div>
           </div>
@@ -240,70 +375,75 @@
               <tbody id="screener-tbody"></tbody>
             </table>
           </div>
+          <div id="screener-pagination-bar" class="pagination-bar hidden"></div>
         </div>
       </section>
 
       <!-- TAB 2: CAPITAL DEPLOYMENT & WEALTH PLANNER -->
       <section id="tab-planner" class="tab-panel hidden">
         <div class="control-card">
-          <div class="market-bar-row">
-            <div class="market-bar-label">
-              <span class="drawer-heading">Deployment Universe &amp; Plan Currency</span>
-              <span class="muted-note" id="pl-market-sub">Select India · Nifty 200 (₹ INR), US · Nasdaq 100 / S&amp;P 500 ($ USD), or Global All-Market deployment</span>
-            </div>
-            <div id="planner-market-switcher" class="market-switcher" role="group" aria-label="Planner Market Filter">
+          <div class="calm-primary-bar">
+            <div id="planner-market-switcher" class="market-switcher market-switcher-compact" role="group" aria-label="Planner Market Filter">
               <button type="button" class="market-btn active" data-market="ALL" title="Global compounder deployment (₹ INR)">
-                <span>All Global</span>
+                <span>All</span>
               </button>
               <button type="button" class="market-btn market-btn-in" data-market="IN" title="Indian NSE Nifty 200 deployment (₹ INR)">
                 <span class="ms-dot ms-dot-in"></span>
-                <span>India · Nifty 200</span>
+                <span>India</span>
               </button>
-              <button type="button" class="market-btn market-btn-us" data-market="US" title="All US compounders — Nasdaq 100 + S&amp;P 500 ($ USD)">
+              <button type="button" class="market-btn market-btn-us" data-market="US" title="All US compounders ($ USD)">
                 <span class="ms-dot ms-dot-us"></span>
-                <span>All US</span>
+                <span>US</span>
               </button>
               <button type="button" class="market-btn market-btn-nasdaq" data-market="NASDAQ100" title="US Nasdaq 100 compounders ($ USD)">
                 <span class="ms-dot ms-dot-nasdaq"></span>
-                <span>US · Nasdaq 100</span>
+                <span>Nasdaq</span>
               </button>
-              <button type="button" class="market-btn market-btn-sp500" data-market="SP500" title="US S&amp;P 500 non-Nasdaq compounders ($ USD) — overlap names carry NASDAQ 100 tag">
+              <button type="button" class="market-btn market-btn-sp500" data-market="SP500" title="US S&amp;P 500 compounders ($ USD)">
                 <span class="ms-dot ms-dot-sp500"></span>
-                <span>US · S&amp;P 500</span>
+                <span>S&amp;P</span>
               </button>
             </div>
-          </div>
 
-          <div class="control-grid six-col">
-            <div>
-              <label id="pl-lumpsum-label" class="field-label" for="pl-lumpsum">Capital to Deploy Today (₹ INR)</label>
-              <input id="pl-lumpsum" type="number" min="0" step="50000" value="500000" class="input-control" />
+            <div class="calm-field-inline">
+              <label id="pl-lumpsum-label" class="field-label" for="pl-lumpsum">Capital Today (₹ INR)</label>
+              <input id="pl-lumpsum" type="number" min="0" step="50000" value="500000" class="input-control input-sm" />
             </div>
-            <div>
-              <label id="pl-sip-label" class="field-label" for="pl-sip">Optional Monthly SIP (₹ INR)</label>
-              <input id="pl-sip" type="number" min="0" step="5000" value="0" class="input-control" />
-            </div>
-            <div>
-              <label class="field-label" for="pl-horizon">Holding Horizon (Years)</label>
-              <input id="pl-horizon" type="number" min="1" max="40" value="7" class="input-control" />
-            </div>
-            <div>
-              <label id="pl-target-label" class="field-label" for="pl-target">Target Corpus Goal (₹ INR)</label>
-              <input id="pl-target" type="number" min="1000" step="100000" value="1300000" class="input-control" />
-            </div>
-            <div>
+
+            <div class="calm-field-inline calm-field-wide">
               <label class="field-label" for="pl-risk">Portfolio Mode</label>
-              <select id="pl-risk" class="input-control">
+              <select id="pl-risk" class="input-control input-sm">
                 <option value="equity_direct" selected>100% Direct Compounder Basket</option>
-                <option value="aggressive">Aggressive Multi-Asset (85% Eq / 10% Cash / 5% Gold)</option>
-                <option value="moderate">Moderate Multi-Asset (70% Eq / 20% Debt / 10% Gold)</option>
+                <option value="aggressive">Aggressive (85% Eq / 10% Cash / 5% Gold)</option>
+                <option value="moderate">Moderate (70% Eq / 20% Debt / 10% Gold)</option>
                 <option value="conservative">Conservative (45% Eq / 40% Debt / 15% Gold)</option>
               </select>
             </div>
-            <div class="align-end planner-cta-group">
-              <button id="run-planner-btn" type="button" class="btn btn-primary btn-full">Build ₹ Blueprint</button>
-              <button id="deploy-paper-basket-btn" type="button" class="btn btn-paper-deploy btn-full">🚀 Deploy Blueprint to Paper Wallet</button>
+
+            <div class="calm-actions-inline">
+              <button id="toggle-pl-adv-btn" type="button" class="btn btn-ghost btn-sm" aria-expanded="false">&#9881; Assumptions</button>
+              <button id="run-planner-btn" type="button" class="btn btn-primary btn-sm">Build Blueprint</button>
+              <button id="deploy-paper-basket-btn" type="button" class="btn btn-paper-deploy btn-sm">&#128640; Deploy to Paper</button>
             </div>
+          </div>
+
+          <!-- Progressive Disclosure: Planner Assumptions -->
+          <div id="pl-adv-drawer" class="sub-adv-drawer hidden">
+            <div class="sub-adv-grid">
+              <div>
+                <label id="pl-sip-label" class="field-label" for="pl-sip">Monthly SIP (₹ INR)</label>
+                <input id="pl-sip" type="number" min="0" step="5000" value="0" class="input-control input-sm" />
+              </div>
+              <div>
+                <label class="field-label" for="pl-horizon">Horizon (Years)</label>
+                <input id="pl-horizon" type="number" min="1" max="40" value="7" class="input-control input-sm" />
+              </div>
+              <div>
+                <label id="pl-target-label" class="field-label" for="pl-target">Target Corpus (₹ INR)</label>
+                <input id="pl-target" type="number" min="1000" step="100000" value="1300000" class="input-control input-sm" />
+              </div>
+            </div>
+            <div class="muted-note top-gap" id="pl-market-sub">India plans in ₹ INR • US plans in $ USD • Max 2 stocks per sector</div>
           </div>
         </div>
 
@@ -312,23 +452,20 @@
         <div class="panel">
           <div class="panel-header">
             <div>
-              <h2 id="pl-basket-title">Recommended Buy Basket — Where to Invest &amp; Why</h2>
-              <p class="muted-note" id="pl-basket-sub">Max 2 stocks per sector • Non-cyclical compounders prioritized • Click 🚀 Deploy Blueprint to execute immediate buys &amp; queue -7% Dip Limit Orders</p>
+              <h2 id="pl-basket-title">Recommended Buy Basket</h2>
+              <p class="muted-note" id="pl-basket-sub">Sector-capped compounders with immediate &amp; -7% Buy-on-Dip tranches</p>
             </div>
-            <button id="deploy-paper-basket-header-btn" type="button" class="btn btn-paper-deploy btn-sm">🚀 Deploy Blueprint to Paper Wallet</button>
+            <button id="deploy-paper-basket-header-btn" type="button" class="btn btn-paper-deploy btn-sm">&#128640; Deploy to Paper</button>
           </div>
           <div class="table-scroll">
             <table class="quant-table leaderboard-table">
               <thead>
                 <tr>
-                  <th>Company &amp; Portfolio Role</th>
-                  <th>Verdict</th>
-                  <th>Score</th>
-                  <th>CMP vs Fair P/E</th>
+                  <th>Company</th>
+                  <th>Verdict &amp; Score</th>
                   <th>Allocation &amp; Shares</th>
-                  <th>Entry Execution Plan</th>
-                  <th>Investment Rationale</th>
-                  <th>Actions</th>
+                  <th>Entry Plan</th>
+                  <th>Action</th>
                 </tr>
               </thead>
               <tbody id="pl-basket-tbody"></tbody>
@@ -339,7 +476,7 @@
         <div class="charts-two-col">
           <div class="panel">
             <div class="panel-header">
-              <h2 id="pl-cone-title">1,000-Path Wealth Projection Cone (₹)</h2>
+              <h2 id="pl-cone-title">Wealth Projection Cone (₹)</h2>
               <div class="legend-inline">
                 <span class="legend-dot dot-cyan"></span><span>90th Bull</span>
                 <span class="legend-dot dot-emerald"></span><span>50th Median</span>
@@ -351,12 +488,12 @@
 
           <div class="panel">
             <div class="panel-header">
-              <h2>Asset Allocation &amp; Hold Discipline</h2>
+              <h2>Allocation &amp; Hold Rules</h2>
               <span id="pl-profile-label" class="muted-note"></span>
             </div>
             <div id="pl-asset-bars" class="asset-bars"></div>
             <div class="discipline-box">
-              <div class="drawer-heading">Low-Churn Long-Term Hold Rules</div>
+              <div class="drawer-heading">Long-Term Hold Discipline</div>
               <ul id="pl-monitoring-list" class="thesis-list"></ul>
             </div>
           </div>
@@ -366,38 +503,32 @@
       <!-- TAB 3: POINT-IN-TIME BACKTESTER -->
       <section id="tab-backtest" class="tab-panel hidden">
         <div class="control-card">
-          <div class="market-bar-row">
-            <div class="market-bar-label">
-              <span class="drawer-heading">Backtest Market &amp; Benchmark Index</span>
-              <span class="muted-note">Simulates point-in-time portfolios vs. Nifty 50 (^NSEI), S&amp;P 500 (^GSPC), or Nasdaq 100 (^NDX)</span>
-            </div>
-            <div id="bt-market-switcher" class="market-switcher" role="group" aria-label="Backtest Market Filter">
+          <div class="calm-primary-bar">
+            <div id="bt-market-switcher" class="market-switcher market-switcher-compact" role="group" aria-label="Backtest Market Filter">
               <button type="button" class="market-btn" data-market="ALL" title="Global universe vs. Nifty 50 (^NSEI)">
-                <span>All Global</span>
+                <span>All</span>
               </button>
               <button type="button" class="market-btn market-btn-in active" data-market="IN" title="India Nifty 200 vs. Nifty 50 (^NSEI)">
                 <span class="ms-dot ms-dot-in"></span>
-                <span>India · Nifty 200</span>
+                <span>India</span>
               </button>
-              <button type="button" class="market-btn market-btn-us" data-market="US" title="All US (Nasdaq 100 + S&amp;P 500) vs. S&amp;P 500 (^GSPC)">
+              <button type="button" class="market-btn market-btn-us" data-market="US" title="All US vs. S&amp;P 500 (^GSPC)">
                 <span class="ms-dot ms-dot-us"></span>
-                <span>All US</span>
+                <span>US</span>
               </button>
               <button type="button" class="market-btn market-btn-nasdaq" data-market="NASDAQ100" title="US Nasdaq 100 vs. Nasdaq 100 (^NDX)">
                 <span class="ms-dot ms-dot-nasdaq"></span>
-                <span>US · Nasdaq 100</span>
+                <span>Nasdaq</span>
               </button>
-              <button type="button" class="market-btn market-btn-sp500" data-market="SP500" title="US S&amp;P 500 non-Nasdaq stocks vs. S&amp;P 500 (^GSPC) — overlap names carry NASDAQ 100 tag">
+              <button type="button" class="market-btn market-btn-sp500" data-market="SP500" title="US S&amp;P 500 vs. S&amp;P 500 (^GSPC)">
                 <span class="ms-dot ms-dot-sp500"></span>
-                <span>US · S&amp;P 500</span>
+                <span>S&amp;P</span>
               </button>
             </div>
-          </div>
 
-          <div class="control-grid six-col">
-            <div>
+            <div class="calm-field-inline calm-field-wide">
               <label class="field-label" for="bt-preset">Strategy Model</label>
-              <select id="bt-preset" class="input-control">
+              <select id="bt-preset" class="input-control input-sm">
                 <option value="qglp_compounder" selected>Long-Term QGLP Compounder</option>
                 <option value="street_quant">Street EPS Revisions + Quant Compounder</option>
                 <option value="coffee_can">Marcellus Coffee-Can</option>
@@ -406,46 +537,55 @@
                 <option value="value_momentum">AQR Value + Momentum</option>
               </select>
             </div>
-            <div>
-              <label class="field-label" for="bt-years">Horizon (Years)</label>
-              <select id="bt-years" class="input-control">
+
+            <div class="calm-field-inline">
+              <label class="field-label" for="bt-years">Horizon</label>
+              <select id="bt-years" class="input-control input-sm">
                 <option value="5" selected>5 Years</option>
                 <option value="4">4 Years</option>
                 <option value="3">3 Years</option>
                 <option value="2">2 Years</option>
               </select>
             </div>
-            <div>
-              <label class="field-label" for="bt-topn">Portfolio Concentration</label>
-              <select id="bt-topn" class="input-control">
-                <option value="5">Top 5 High-Conviction</option>
-                <option value="8" selected>Top 8 Concentrated</option>
-                <option value="10">Top 10 Balanced</option>
-                <option value="15">Top 15 Diversified</option>
-              </select>
-            </div>
-            <div>
-              <label class="field-label" for="bt-rebal">Rebalance Frequency</label>
-              <select id="bt-rebal" class="input-control">
-                <option value="annual" selected>Annual Buy &amp; Hold (252d)</option>
-                <option value="semiannual">Semi-Annual (126d)</option>
-                <option value="quarterly">Quarterly (63d)</option>
-              </select>
-            </div>
-            <div>
-              <label class="field-label" for="bt-weight">Position Sizing</label>
-              <select id="bt-weight" class="input-control">
-                <option value="equal" selected>Equal Weight (1/N)</option>
-                <option value="score">Conviction Score Tilt</option>
-                <option value="inv_vol">Inverse-Volatility</option>
-              </select>
-            </div>
-            <div class="align-end">
-              <button id="run-backtest-btn" type="button" class="btn btn-primary btn-full">Run Backtest</button>
+
+            <div class="calm-actions-inline">
+              <button id="toggle-bt-adv-btn" type="button" class="btn btn-ghost btn-sm" aria-expanded="false">&#9881; Parameters</button>
+              <button id="run-backtest-btn" type="button" class="btn btn-primary btn-sm">Run Backtest</button>
             </div>
           </div>
-          <div id="bt-guardrail-note" class="muted-note top-gap">
-            Bias Guardrails Active: 60-day SEBI LODR reporting lag enforced on annual statements • 25 bps Indian delivery STT/brokerage/slippage per turnover • 6.8% India 10Y G-Sec Sharpe risk-free rate.
+
+          <!-- Progressive Disclosure: Backtest Parameters -->
+          <div id="bt-adv-drawer" class="sub-adv-drawer hidden">
+            <div class="sub-adv-grid">
+              <div>
+                <label class="field-label" for="bt-topn">Concentration</label>
+                <select id="bt-topn" class="input-control input-sm">
+                  <option value="5">Top 5 High-Conviction</option>
+                  <option value="8" selected>Top 8 Concentrated</option>
+                  <option value="10">Top 10 Balanced</option>
+                  <option value="15">Top 15 Diversified</option>
+                </select>
+              </div>
+              <div>
+                <label class="field-label" for="bt-rebal">Rebalance Cadence</label>
+                <select id="bt-rebal" class="input-control input-sm">
+                  <option value="annual" selected>Annual Buy &amp; Hold (252d)</option>
+                  <option value="semiannual">Semi-Annual (126d)</option>
+                  <option value="quarterly">Quarterly (63d)</option>
+                </select>
+              </div>
+              <div>
+                <label class="field-label" for="bt-weight">Position Sizing</label>
+                <select id="bt-weight" class="input-control input-sm">
+                  <option value="equal" selected>Equal Weight (1/N)</option>
+                  <option value="score">Conviction Score Tilt</option>
+                  <option value="inv_vol">Inverse-Volatility</option>
+                </select>
+              </div>
+            </div>
+            <div id="bt-guardrail-note" class="muted-note top-gap">
+              Point-in-time guardrails: 60-day reporting lag • 25 bps slippage &amp; brokerage per turnover.
+            </div>
           </div>
         </div>
 
@@ -465,8 +605,8 @@
 
           <div class="panel">
             <div class="panel-header">
-              <h2>Underwater Drawdown Profile (%)</h2>
-              <span class="muted-note">Peak-to-trough downside resilience</span>
+              <h2>Drawdown Profile (%)</h2>
+              <span class="muted-note">Peak-to-trough resilience</span>
             </div>
             <div id="bt-dd-chart" class="chart-box"></div>
           </div>
@@ -475,8 +615,8 @@
         <div class="charts-two-col">
           <div class="panel">
             <div class="panel-header">
-              <h2>Current Model Portfolio Holdings</h2>
-              <span class="muted-note">Click any holding to inspect its Score Reasoning</span>
+              <h2>Current Model Holdings</h2>
+              <span class="muted-note">Select any stock for Deep Dive</span>
             </div>
             <div class="table-scroll short-scroll">
               <table class="quant-table leaderboard-table">
@@ -497,15 +637,15 @@
 
           <div class="panel">
             <div class="panel-header">
-              <h2>Historical Rebalance Ledger</h2>
-              <span id="bt-ledger-sub" class="muted-note">Point-in-time period returns vs. Nifty 50</span>
+              <h2>Rebalance Ledger</h2>
+              <span id="bt-ledger-sub" class="muted-note">Period returns vs. Nifty 50</span>
             </div>
             <div class="table-scroll short-scroll">
               <table class="quant-table">
                 <thead>
                   <tr>
-                    <th>Rebalance Window</th>
-                    <th>Top Selections</th>
+                    <th>Window</th>
+                    <th>Selections</th>
                     <th>Turnover</th>
                     <th>Strategy</th>
                     <th id="bt-ledger-bm-th">Nifty 50</th>
@@ -519,38 +659,38 @@
         </div>
       </section>
 
-      <!-- TAB 4: MULTI-STRATEGY PAPER PORTFOLIOS & BUY-ON-DIP SANDBOX -->
+      <!-- TAB 4: MULTI-STRATEGY PAPER WALLET & BUY-ON-DIP SANDBOX -->
       <section id="tab-paper" class="tab-panel hidden">
-        <!-- Signed-Out View (Invite-Only Authentication Card — Zero Login Gate on Tabs 1-3!) -->
+        <!-- Signed-Out View (Invite-Only Authentication Card — Zero Login Gate on Tabs 1-3) -->
         <div id="paper-signed-out-view" class="paper-auth-gate-wrap">
           <div class="paper-auth-hero-grid">
             <div class="panel paper-pitch-card">
               <div class="inline-group wrap-group">
-                <span class="badge badge-strong-buy">Invite-Only Strategy Sandbox</span>
-                <span class="pill">₹ INR &amp; $ USD Virtual Wallets</span>
-                <span class="pill">Automated Buy-on-Dip Book</span>
+                <span class="badge badge-strong-buy">Invite-Only Sandbox</span>
+                <span class="pill">₹ INR &amp; $ USD Wallets</span>
+                <span class="pill">Buy-on-Dip Limit Book</span>
               </div>
-              <h2 class="paper-pitch-title">Test Your Conviction Strategies &amp; Automated Buy-on-Dip Orders Before Risking Real Capital</h2>
+              <h2 class="paper-pitch-title">Paper-Test Conviction Strategies &amp; Automated Buy-on-Dip Orders</h2>
               <p class="paper-pitch-desc">
-                Create multiple isolated virtual wallets (e.g. India QGLP ₹5L, US Dip Hunter $10K), deploy full Investment Planner blueprints in one click, and queue automated -5% / -7% / -10% Buy-on-Dip limit orders evaluated daily against real market highs &amp; lows.
+                Run isolated ₹ INR and $ USD virtual wallets, deploy Planner baskets in one click, and queue -5% / -7% / -10% Buy-on-Dip limit orders settled against real market highs &amp; lows.
               </p>
               <ul class="thesis-list">
-                <li class="text-pos">✓ Realistic 25 bps brokerage/STT slippage accounting &amp; locked cash reserves on open dip orders</li>
-                <li class="text-cyan">✓ Live Model Attribution Scorecard tracking how Strong Buy, Buy, and Hold picks perform in your wallet</li>
-                <li>✓ Strict multi-user data isolation — each invited investor sees only their own private strategy wallets</li>
+                <li class="text-pos">&#10003; Realistic 25 bps fee accounting &amp; locked cash reserves on open dip orders</li>
+                <li class="text-cyan">&#10003; Live Rating Scorecard tracking Strong Buy, Buy, and Hold attribution</li>
+                <li>&#10003; Private per-investor wallet isolation</li>
               </ul>
 
-              <!-- Friendly 2-Step Admin Setup Guide (shown automatically if Netlify Identity is not yet enabled) -->
+              <!-- Friendly 2-Step Admin Setup Guide -->
               <div id="paper-identity-setup-guide" class="admin-setup-guide hidden">
-                <div class="drawer-heading text-warn">Admin Setup Required: Enable Invite-Only Netlify Identity (2 Steps)</div>
+                <div class="drawer-heading text-warn">Admin Setup: Enable Invite-Only Netlify Identity</div>
                 <p class="muted-note">
-                  Netlify Identity is configured in the dashboard (never via public API). Complete these two quick steps to activate Invite-Only sign-in:
+                  Complete two quick steps in Netlify to activate Invite-Only sign-in:
                 </p>
                 <ol class="admin-steps-list">
-                  <li>Open the dashboard below → Click <strong>Enable Identity</strong> → Set Registration preferences to <strong>Invite only</strong>.</li>
-                  <li>Click <strong>Invite users</strong> to email yourself an invite link, then open that link here to set your password!</li>
+                  <li>Open Identity settings below &rarr; Click <strong>Enable Identity</strong> &rarr; Set Registration to <strong>Invite only</strong>.</li>
+                  <li>Click <strong>Invite users</strong> to email yourself an invite link and set your password.</li>
                 </ol>
-                <a href="https://app.netlify.com/projects/arthaquant-india/identity" target="_blank" rel="noopener noreferrer" class="btn btn-secondary btn-sm admin-link-btn">Open Netlify Identity Dashboard ↗</a>
+                <a href="https://app.netlify.com/projects/arthaquant-india/identity" target="_blank" rel="noopener noreferrer" class="btn btn-secondary btn-sm admin-link-btn">Open Netlify Identity Dashboard &#8599;</a>
               </div>
             </div>
 
@@ -558,29 +698,28 @@
               <div class="inline-group wrap-group">
                 <span class="brand-badge">AQ</span>
                 <div>
-                  <h2>Sign In to Paper Portfolios</h2>
-                  <p class="muted-note">Invite-Only Workspace • Tabs 1–3 remain 100% open to everyone</p>
+                  <h2>Sign In to Paper Wallet</h2>
+                  <p class="muted-note">Invite-Only • Rankings, Planner &amp; Backtest stay open</p>
                 </div>
               </div>
 
               <div class="invite-info-banner">
-                <strong>Have an email invitation?</strong> Click the invite link in your email and ArthaQuant will automatically open the password-setup prompt to activate your account.
+                <strong>Invited by email?</strong> Open your email invite link to set your password and activate access.
               </div>
 
               <form id="paper-login-form" class="auth-form" autocomplete="on">
-                <label class="field-label" for="paper-login-email">Invited Email Address</label>
+                <label class="field-label" for="paper-login-email">Invited Email</label>
                 <input id="paper-login-email" type="email" required maxlength="120" autocomplete="username" placeholder="you@domain.com" class="input-control" />
-                <label class="field-label" for="paper-login-password">Password (min 8 characters)</label>
-                <input id="paper-login-password" type="password" required minlength="8" maxlength="128" autocomplete="current-password" placeholder="Enter your account password..." class="input-control" />
+                <label class="field-label" for="paper-login-password">Password (min 8 chars)</label>
+                <input id="paper-login-password" type="password" required minlength="8" maxlength="128" autocomplete="current-password" placeholder="Enter password..." class="input-control" />
                 <div id="paper-login-error" class="error-banner hidden"></div>
-                <button id="paper-login-submit-btn" type="submit" class="btn btn-primary btn-full">Sign In to Paper Portfolios</button>
+                <button id="paper-login-submit-btn" type="submit" class="btn btn-primary btn-full">Sign In</button>
               </form>
 
               <div class="signin-aux-row">
                 <button id="paper-forgot-password-btn" type="button" class="btn-link-subtle">Forgot password? Send recovery link</button>
               </div>
 
-              <!-- Dynamically populated from getSettings() — hidden if no OAuth providers enabled -->
               <div id="paper-oauth-wrap" class="oauth-section hidden">
                 <div class="oauth-divider"><span>Or continue with invited provider</span></div>
                 <div id="paper-oauth-buttons" class="oauth-btn-stack"></div>
@@ -593,19 +732,20 @@
         <div id="paper-signed-in-view" class="hidden">
           <div id="paper-service-banner" class="error-banner hidden"></div>
 
-          <!-- Wallet Selector & Strategy Command Bar -->
+          <!-- Wallet Selector & Compact Command Bar -->
           <div class="control-card paper-command-card">
             <div class="paper-command-top">
               <div class="inline-group wrap-group">
-                <span class="drawer-heading">Multi-Strategy Virtual Wallets</span>
+                <span class="drawer-heading">Paper Wallets</span>
                 <span id="paper-user-pill" class="user-chip"></span>
                 <span id="paper-active-strategy-pill" class="pill hidden"></span>
+                <span id="paper-session-pill" class="paper-session-pill paper-session-closed" role="status" aria-live="polite">&#9675; Closed &middot; Auto-settles 3:45p IST &amp; 5p EST</span>
               </div>
               <div class="inline-group wrap-group">
-                <button id="paper-new-wallet-btn" type="button" class="btn btn-primary btn-sm">+ New Strategy Wallet</button>
-                <button id="paper-open-deposit-btn" type="button" class="btn btn-ghost btn-sm">+ Load Virtual Cash</button>
-                <button id="paper-quick-order-btn" type="button" class="btn btn-paper-trade btn-sm">+ Place Stock / Dip Order</button>
-                <button id="paper-refresh-quotes-btn" type="button" class="btn btn-secondary btn-sm">↻ Refresh Live Quotes &amp; Check Dip Orders</button>
+                <button id="paper-new-wallet-btn" type="button" class="btn btn-primary btn-sm">+ New Wallet</button>
+                <button id="paper-open-deposit-btn" type="button" class="btn btn-ghost btn-sm">+ Add Cash</button>
+                <button id="paper-quick-order-btn" type="button" class="btn btn-paper-trade btn-sm">+ Place Order</button>
+                <button id="paper-refresh-quotes-btn" type="button" class="btn btn-secondary btn-sm">&#8635; Sync Quotes</button>
                 <button id="paper-signout-btn" type="button" class="btn btn-ghost btn-sm">Sign Out</button>
               </div>
             </div>
@@ -614,127 +754,150 @@
 
           <!-- Empty Wallets Onboarding Card -->
           <div id="paper-empty-wallets-card" class="panel paper-empty-card hidden">
-            <h2>Create Your First Virtual Strategy Wallet</h2>
+            <h2>Create Your First Paper Wallet</h2>
             <p class="muted-note">
-              Start with realistic virtual capital in ₹ INR or $ USD to test QGLP compounders, Street+Quant leaders, and automated Buy-on-Dip limit orders.
+              Start with ₹ INR or $ USD virtual cash to test compounder baskets and automated Buy-on-Dip orders.
             </p>
             <div class="inline-group wrap-group paper-empty-actions">
-              <button id="paper-quick-create-inr-btn" type="button" class="btn btn-primary">Create "India QGLP ₹5L" (₹5,00,000)</button>
-              <button id="paper-quick-create-usd-btn" type="button" class="btn btn-secondary">Create "US Dip Hunter $10K" ($10,000)</button>
-              <button id="paper-empty-custom-btn" type="button" class="btn btn-ghost">Custom Wallet Setup...</button>
+              <button id="paper-quick-create-inr-btn" type="button" class="btn btn-primary">India QGLP ₹5L</button>
+              <button id="paper-quick-create-usd-btn" type="button" class="btn btn-secondary">US Dip Hunter $10K</button>
+              <button id="paper-empty-custom-btn" type="button" class="btn btn-ghost">Custom Wallet...</button>
             </div>
           </div>
 
-          <!-- Active Wallet Analytics, Order Book & Positions Workspace -->
+          <!-- Active Wallet Analytics & Sub-Tabbed Workspace -->
           <div id="paper-active-workspace" class="hidden">
             <!-- 5 Portfolio KPI Cards -->
             <div id="paper-kpi-strip" class="kpi-strip paper-kpi-five"></div>
 
-            <!-- Daily Portfolio NAV Chart + Model Rating Attribution Scorecard -->
-            <div class="charts-two-col">
-              <div class="panel">
-                <div class="panel-header">
-                  <h2 id="paper-nav-chart-title">Daily Portfolio NAV vs. Benchmark</h2>
-                  <div class="legend-inline">
-                    <span class="legend-dot dot-emerald"></span><span>Wallet NAV</span>
-                    <span class="legend-dot dot-slate"></span><span id="paper-nav-bm-legend">Benchmark</span>
-                  </div>
+            <!-- Full-Width Daily Portfolio NAV Chart -->
+            <div class="panel paper-nav-panel">
+              <div class="panel-header">
+                <h2 id="paper-nav-chart-title">Portfolio NAV vs. Benchmark</h2>
+                <div class="legend-inline">
+                  <span class="legend-dot dot-emerald"></span><span>Wallet NAV</span>
+                  <span class="legend-dot dot-slate"></span><span id="paper-nav-bm-legend">Benchmark</span>
                 </div>
-                <div id="paper-nav-chart" class="chart-box"></div>
               </div>
+              <div id="paper-nav-chart" class="chart-box"></div>
+            </div>
 
+            <!-- 4-Section Wallet Sub-Tab Bar -->
+            <div id="paper-subtab-bar" class="subtab-bar" role="tablist" aria-label="Wallet Sections">
+              <button id="paper-subtab-positions" type="button" role="tab" aria-selected="true" data-paper-subtab="positions" class="subtab-btn active">
+                <span>Positions</span>
+                <span id="paper-positions-count-pill" class="subtab-count">0</span>
+              </button>
+              <button id="paper-subtab-orders" type="button" role="tab" aria-selected="false" data-paper-subtab="orders" class="subtab-btn">
+                <span>Dip Orders</span>
+                <span id="paper-orders-count-pill" class="subtab-count">0</span>
+              </button>
+              <button id="paper-subtab-trades" type="button" role="tab" aria-selected="false" data-paper-subtab="trades" class="subtab-btn">
+                <span>Trade History</span>
+                <span id="paper-trades-count-pill" class="subtab-count">0</span>
+              </button>
+              <button id="paper-subtab-attribution" type="button" role="tab" aria-selected="false" data-paper-subtab="attribution" class="subtab-btn">
+                <span>Rating Scorecard</span>
+              </button>
+            </div>
+
+            <!-- Pane 1: Open Positions -->
+            <div id="paper-pane-positions" class="paper-subtab-pane">
               <div class="panel">
                 <div class="panel-header">
                   <div>
-                    <h2>How Our Ratings Performed in Your Wallet</h2>
-                    <p id="paper-attribution-sub" class="muted-note">Actual paper return % grouped by ArthaQuant rating at entry</p>
+                    <h2>Open Equity Positions</h2>
+                    <p class="muted-note">Live P&amp;L and score drift (Entry &rarr; Today)</p>
+                  </div>
+                </div>
+                <div class="table-scroll">
+                  <table class="quant-table leaderboard-table">
+                    <thead>
+                      <tr>
+                        <th>Company</th>
+                        <th>Shares</th>
+                        <th>Avg Cost</th>
+                        <th>Live Price</th>
+                        <th>Market Value</th>
+                        <th>Unrealized P&amp;L</th>
+                        <th>Score Drift</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody id="paper-positions-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <!-- Pane 2: Open Dip & Limit Orders -->
+            <div id="paper-pane-orders" class="paper-subtab-pane hidden">
+              <div class="panel">
+                <div class="panel-header">
+                  <div>
+                    <h2>Open Buy-on-Dip &amp; Limit Orders</h2>
+                    <p class="muted-note">Fills automatically when session Low &le; Target Dip Price</p>
+                  </div>
+                </div>
+                <div class="table-scroll">
+                  <table class="quant-table">
+                    <thead>
+                      <tr>
+                        <th>Company</th>
+                        <th>Side &amp; Type</th>
+                        <th>Shares</th>
+                        <th>Target vs Live</th>
+                        <th>Distance</th>
+                        <th>Reserved Cash</th>
+                        <th>Note</th>
+                        <th>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="paper-orders-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <!-- Pane 3: Trade Execution History -->
+            <div id="paper-pane-trades" class="paper-subtab-pane hidden">
+              <div class="panel">
+                <div class="panel-header">
+                  <div>
+                    <h2>Trade Execution History</h2>
+                    <p class="muted-note">Market &amp; dip limit fills including 25 bps fees</p>
+                  </div>
+                </div>
+                <div class="table-scroll short-scroll">
+                  <table class="quant-table">
+                    <thead>
+                      <tr>
+                        <th>Date &amp; Time</th>
+                        <th>Company</th>
+                        <th>Side &amp; Type</th>
+                        <th>Shares</th>
+                        <th>Fill Price</th>
+                        <th>Net Amount</th>
+                        <th>Fee</th>
+                        <th>Realized P&amp;L</th>
+                      </tr>
+                    </thead>
+                    <tbody id="paper-trades-tbody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <!-- Pane 4: Model Rating Attribution Scorecard -->
+            <div id="paper-pane-attribution" class="paper-subtab-pane hidden">
+              <div class="panel">
+                <div class="panel-header">
+                  <div>
+                    <h2>Rating Attribution Scorecard</h2>
+                    <p id="paper-attribution-sub" class="muted-note">Wallet return % grouped by ArthaQuant rating at entry</p>
                   </div>
                 </div>
                 <div id="paper-attribution-mount"></div>
-              </div>
-            </div>
-
-            <!-- Open Positions Table -->
-            <div class="panel">
-              <div class="panel-header">
-                <div>
-                  <h2>Open Equity Positions (Marked-to-Market)</h2>
-                  <p class="muted-note">Tracks live unrealized P&amp;L and fundamental score drift (Entry Score → Today's Score)</p>
-                </div>
-                <span id="paper-positions-count-pill" class="pill">0 Holdings</span>
-              </div>
-              <div class="table-scroll">
-                <table class="quant-table leaderboard-table">
-                  <thead>
-                    <tr>
-                      <th>Company &amp; Index Tag</th>
-                      <th>Shares</th>
-                      <th>Avg Cost</th>
-                      <th>Live Price</th>
-                      <th>Market Value</th>
-                      <th>Unrealized P&amp;L</th>
-                      <th>Score: Entry → Today</th>
-                      <th>Quick Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody id="paper-positions-tbody"></tbody>
-                </table>
-              </div>
-            </div>
-
-            <!-- Open Buy-on-Dip Limit Orders Book -->
-            <div class="panel">
-              <div class="panel-header">
-                <div>
-                  <h2>Open Buy-on-Dip &amp; Limit Orders Book</h2>
-                  <p class="muted-note">Evaluated automatically by our daily post-market cron &amp; on-demand quote refresh when daily Low ≤ Target Dip Price</p>
-                </div>
-                <span id="paper-orders-count-pill" class="pill">0 Open Limit Orders</span>
-              </div>
-              <div class="table-scroll">
-                <table class="quant-table">
-                  <thead>
-                    <tr>
-                      <th>Company &amp; Index</th>
-                      <th>Side &amp; Type</th>
-                      <th>Shares</th>
-                      <th>Target Dip vs Live Price</th>
-                      <th>Distance %</th>
-                      <th>Reserved Cash</th>
-                      <th>Strategy Note</th>
-                      <th>Action</th>
-                    </tr>
-                  </thead>
-                  <tbody id="paper-orders-tbody"></tbody>
-                </table>
-              </div>
-            </div>
-
-            <!-- Immutable Trade Execution History Ledger -->
-            <div class="panel">
-              <div class="panel-header">
-                <div>
-                  <h2>Immutable Trade Execution History Ledger</h2>
-                  <p class="muted-note">Audited record of market fills, triggered dip limit executions, 25 bps brokerage/STT fees &amp; realized P&amp;L</p>
-                </div>
-                <span id="paper-trades-count-pill" class="pill">0 Executions</span>
-              </div>
-              <div class="table-scroll short-scroll">
-                <table class="quant-table">
-                  <thead>
-                    <tr>
-                      <th>Date &amp; Time</th>
-                      <th>Company</th>
-                      <th>Side &amp; Type</th>
-                      <th>Shares</th>
-                      <th>Fill Price</th>
-                      <th>Net Amount</th>
-                      <th>Brokerage / STT</th>
-                      <th>Realized P&amp;L</th>
-                    </tr>
-                  </thead>
-                  <tbody id="paper-trades-tbody"></tbody>
-                </table>
               </div>
             </div>
           </div>
@@ -776,22 +939,22 @@
     </nav>
   </div>
 
-  <!-- SLIDE-OVER STOCK SCORE REASONING & FORENSIC DEEP DIVE DRAWER -->
+  <!-- SLIDE-OVER STOCK SCORE REASONING & DEEP DIVE DRAWER -->
   <div id="deep-dive-backdrop" class="drawer-backdrop hidden"></div>
   <aside id="deep-dive-drawer" class="deep-dive-drawer hidden" aria-label="Stock Score Deep Dive">
     <div class="drawer-sticky-bar">
       <div class="inline-group wrap-group">
-        <button id="dd-prev-btn" type="button" class="btn btn-ghost btn-sm">&larr; Prev Rank</button>
-        <button id="dd-next-btn" type="button" class="btn btn-ghost btn-sm">Next Rank &rarr;</button>
+        <button id="dd-prev-btn" type="button" class="btn btn-ghost btn-sm">&larr; Prev</button>
+        <button id="dd-next-btn" type="button" class="btn btn-ghost btn-sm">Next &rarr;</button>
         <span id="dd-nav-label" class="muted-note"></span>
       </div>
       <div class="inline-group wrap-group">
-        <button id="dd-paper-trade-btn" type="button" class="btn btn-paper-trade btn-sm">Paper Trade / Dip Limit</button>
+        <button id="dd-paper-trade-btn" type="button" class="btn btn-paper-trade btn-sm">Paper Trade</button>
         <div id="dd-mode-switcher" class="mode-switcher" role="group" aria-label="Score Explanation Mode">
-          <button id="dd-mode-simple-btn" type="button" class="mode-switch-btn active">Simple View (Plain English)</button>
-          <button id="dd-mode-pro-btn" type="button" class="mode-switch-btn">Pro View (+ Financial Ratios)</button>
+          <button id="dd-mode-simple-btn" type="button" class="mode-switch-btn active">Simple</button>
+          <button id="dd-mode-pro-btn" type="button" class="mode-switch-btn">Pro Ratios</button>
         </div>
-        <button id="dd-close-btn" type="button" class="btn btn-ghost btn-sm">Close (Esc) &times;</button>
+        <button id="dd-close-btn" type="button" class="btn btn-ghost btn-sm">Close &times;</button>
       </div>
     </div>
     <div id="company-detail-content" class="drawer-scroll-body"></div>
@@ -808,12 +971,12 @@
       <button id="paper-auth-modal-close-btn" type="button" class="btn btn-ghost btn-xs">Close &times;</button>
     </div>
     <p id="paper-auth-modal-desc" class="muted-note modal-sub">
-      Welcome to ArthaQuant! Choose a strong password (min 8 chars) to activate your invited account.
+      Choose a strong password (min 8 chars) to activate your invited account.
     </p>
     <div id="paper-auth-modal-admin-note" class="admin-setup-guide hidden">
       <span class="text-warn">Admin Note:</span> Enable Invite-Only Netlify Identity at
       <a href="https://app.netlify.com/projects/arthaquant-india/identity" target="_blank" rel="noopener noreferrer" class="link-cyan">app.netlify.com/projects/arthaquant-india/identity</a>
-      (Click Enable Identity → Registration: Invite only → Invite your email).
+      (Enable Identity &rarr; Registration: Invite only &rarr; Invite your email).
     </div>
     <form id="paper-auth-modal-form" class="auth-form">
       <div id="paper-auth-email-group">
@@ -821,15 +984,15 @@
         <input id="paper-auth-modal-email" type="email" maxlength="120" autocomplete="username" placeholder="you@domain.com" class="input-control" />
       </div>
       <div id="paper-auth-pass-group">
-        <label id="paper-auth-pass-label" class="field-label" for="paper-auth-modal-password">Password (min 8 chars, 12+ recommended)</label>
+        <label id="paper-auth-pass-label" class="field-label" for="paper-auth-modal-password">Password (min 8 chars)</label>
         <input id="paper-auth-modal-password" type="password" required minlength="8" maxlength="128" autocomplete="new-password" placeholder="Enter strong password..." class="input-control" />
       </div>
       <div id="paper-auth-confirm-group" class="hidden">
-        <label class="field-label" for="paper-auth-modal-confirm">Confirm Strong Password</label>
+        <label class="field-label" for="paper-auth-modal-confirm">Confirm Password</label>
         <input id="paper-auth-modal-confirm" type="password" minlength="8" maxlength="128" autocomplete="new-password" placeholder="Re-enter password..." class="input-control" />
       </div>
       <div id="paper-auth-modal-error" class="error-banner hidden"></div>
-      <button id="paper-auth-modal-submit-btn" type="submit" class="btn btn-primary btn-full">Activate Invited Account</button>
+      <button id="paper-auth-modal-submit-btn" type="submit" class="btn btn-primary btn-full">Activate Account</button>
     </form>
     <div id="paper-auth-modal-oauth-wrap" class="oauth-section hidden">
       <div class="oauth-divider"><span>Or sign in with invited provider</span></div>
@@ -841,14 +1004,14 @@
   <div id="paper-wallet-modal-backdrop" class="modal-backdrop hidden"></div>
   <div id="paper-wallet-modal" class="modal-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="paper-wallet-modal-heading">
     <div class="modal-header">
-      <h2 id="paper-wallet-modal-heading">Create Virtual Strategy Wallet</h2>
+      <h2 id="paper-wallet-modal-heading">New Paper Wallet</h2>
       <button id="paper-wallet-close-btn" type="button" class="btn btn-ghost btn-xs">Close &times;</button>
     </div>
-    <p class="muted-note modal-sub">Pick a 1-click template or configure a custom virtual wallet to test a distinct strategy.</p>
+    <p class="muted-note modal-sub">Pick a template or configure a custom virtual wallet.</p>
     <div id="paper-wallet-presets-bar" class="chips-row"></div>
     <form id="paper-wallet-form" class="auth-form">
       <div>
-        <label class="field-label" for="paper-wallet-name">Strategy Wallet Name</label>
+        <label class="field-label" for="paper-wallet-name">Wallet Name</label>
         <input id="paper-wallet-name" type="text" required minlength="2" maxlength="60" value="India QGLP ₹5L" class="input-control" />
       </div>
       <div class="modal-two-col">
@@ -860,13 +1023,13 @@
           </select>
         </div>
         <div>
-          <label class="field-label" for="paper-wallet-cash">Starting Virtual Cash</label>
+          <label class="field-label" for="paper-wallet-cash">Starting Cash</label>
           <input id="paper-wallet-cash" type="number" required min="100" step="any" value="500000" class="input-control" />
         </div>
       </div>
       <div class="modal-two-col">
         <div>
-          <label class="field-label" for="paper-wallet-preset">Strategy Philosophy Tag</label>
+          <label class="field-label" for="paper-wallet-preset">Strategy Tag</label>
           <select id="paper-wallet-preset" class="input-control">
             <option value="qglp_compounder" selected>Long-Term QGLP Compounder</option>
             <option value="street_quant">Street EPS Revisions + Quant</option>
@@ -877,7 +1040,7 @@
           </select>
         </div>
         <div>
-          <label class="field-label" for="paper-wallet-benchmark">Comparison Benchmark</label>
+          <label class="field-label" for="paper-wallet-benchmark">Benchmark</label>
           <select id="paper-wallet-benchmark" class="input-control">
             <option value="^NSEI" selected>Nifty 50 (^NSEI)</option>
             <option value="^GSPC">S&amp;P 500 (^GSPC)</option>
@@ -886,7 +1049,7 @@
         </div>
       </div>
       <div id="paper-wallet-error" class="error-banner hidden"></div>
-      <button id="paper-wallet-submit-btn" type="submit" class="btn btn-primary btn-full">Create Virtual Strategy Wallet</button>
+      <button id="paper-wallet-submit-btn" type="submit" class="btn btn-primary btn-full">Create Paper Wallet</button>
     </form>
   </div>
 
@@ -894,21 +1057,21 @@
   <div id="paper-deposit-modal-backdrop" class="modal-backdrop hidden"></div>
   <div id="paper-deposit-modal" class="modal-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="paper-deposit-heading">
     <div class="modal-header">
-      <h2 id="paper-deposit-heading">Load Virtual Cash into Wallet</h2>
+      <h2 id="paper-deposit-heading">Add Virtual Cash</h2>
       <button id="paper-deposit-close-btn" type="button" class="btn btn-ghost btn-xs">Close &times;</button>
     </div>
     <p id="paper-deposit-wallet-label" class="muted-note modal-sub"></p>
     <div id="paper-deposit-chips" class="chips-row"></div>
     <form id="paper-deposit-form" class="auth-form">
       <div>
-        <label class="field-label" for="paper-deposit-amount">Virtual Cash Amount to Deposit</label>
+        <label class="field-label" for="paper-deposit-amount">Amount to Add</label>
         <input id="paper-deposit-amount" type="number" required min="1" step="any" value="250000" class="input-control" />
       </div>
       <p class="muted-note">
-        Accurate Return Accounting: Deposits increase both Available Cash and Total Deposited Principal so your Net Return % reflects true investment alpha without artificial inflation.
+        Updates both Available Cash and Deposited Principal so Return % stays accurate.
       </p>
       <div id="paper-deposit-error" class="error-banner hidden"></div>
-      <button id="paper-deposit-submit-btn" type="submit" class="btn btn-primary btn-full">Add Virtual Cash</button>
+      <button id="paper-deposit-submit-btn" type="submit" class="btn btn-primary btn-full">Add Cash</button>
     </form>
   </div>
 
@@ -916,34 +1079,34 @@
   <div id="paper-order-modal-backdrop" class="modal-backdrop hidden"></div>
   <div id="paper-order-modal" class="modal-dialog modal-dialog-wide hidden" role="dialog" aria-modal="true" aria-labelledby="paper-order-modal-title">
     <div class="modal-header">
-      <h2 id="paper-order-modal-title">Paper Order &amp; Buy-on-Dip Ticket</h2>
+      <h2 id="paper-order-modal-title">Paper Order Ticket</h2>
       <button id="paper-order-close-btn" type="button" class="btn btn-ghost btn-xs">Close &times;</button>
     </div>
 
     <form id="paper-order-form" class="auth-form">
       <div id="paper-order-stock-picker-wrap">
-        <label class="field-label" for="paper-order-ticker-input">Stock Symbol (Nifty 200, Nasdaq 100, or S&amp;P 500)</label>
-        <input id="paper-order-ticker-input" list="paper-order-ticker-datalist" type="text" required maxlength="24" placeholder="Type ticker e.g. NVDA, MSFT, TCS.NS, ICICIBANK.NS..." class="input-control" />
+        <label class="field-label" for="paper-order-ticker-input">Stock Symbol</label>
+        <input id="paper-order-ticker-input" list="paper-order-ticker-datalist" type="text" required maxlength="24" placeholder="e.g. NVDA, MSFT, TCS.NS, ICICIBANK.NS..." class="input-control" />
         <datalist id="paper-order-ticker-datalist"></datalist>
       </div>
 
       <div id="paper-order-stock-summary" class="ticket-stock-box"></div>
 
       <div>
-        <label class="field-label" for="paper-order-wallet-select">Target Strategy Wallet</label>
+        <label class="field-label" for="paper-order-wallet-select">Target Wallet</label>
         <select id="paper-order-wallet-select" class="input-control"></select>
       </div>
 
       <div class="modal-two-col">
         <div>
-          <span class="field-label">Order Side</span>
+          <span class="field-label">Side</span>
           <div class="segmented-toggle">
             <button id="paper-side-buy-btn" type="button" class="seg-btn active">BUY</button>
             <button id="paper-side-sell-btn" type="button" class="seg-btn seg-sell">SELL</button>
           </div>
         </div>
         <div>
-          <span class="field-label">Execution Mode</span>
+          <span class="field-label">Order Mode</span>
           <div class="segmented-toggle">
             <button id="paper-type-market-btn" type="button" class="seg-btn">Market (Now)</button>
             <button id="paper-type-limit-btn" type="button" class="seg-btn active">Buy-on-Dip Limit</button>
@@ -952,27 +1115,27 @@
       </div>
 
       <div id="paper-limit-section" class="limit-config-box">
-        <label class="field-label" for="paper-order-limit-price">Target Dip / Limit Price (1-Click Presets or Custom)</label>
+        <label class="field-label" for="paper-order-limit-price">Target Dip / Limit Price</label>
         <div id="paper-dip-chips" class="chips-row"></div>
         <input id="paper-order-limit-price" type="number" min="0.01" step="0.01" class="input-control" />
         <div id="paper-limit-distance-hint" class="field-hint text-cyan"></div>
       </div>
 
       <div>
-        <label class="field-label" for="paper-order-shares">Whole Shares Quantity</label>
+        <label class="field-label" for="paper-order-shares">Shares Quantity</label>
         <div id="paper-qty-chips" class="chips-row"></div>
         <input id="paper-order-shares" type="number" required min="1" step="1" value="10" class="input-control" />
       </div>
 
       <div>
-        <label class="field-label" for="paper-order-note">Strategy Thesis / Order Note (Optional)</label>
-        <input id="paper-order-note" type="text" maxlength="140" placeholder="e.g. High-ROCE compounder — accumulate on -7% pullback" class="input-control" />
+        <label class="field-label" for="paper-order-note">Order Note (Optional)</label>
+        <input id="paper-order-note" type="text" maxlength="140" placeholder="e.g. Accumulate on -7% pullback" class="input-control" />
       </div>
 
       <div id="paper-order-preview-box" class="order-preview-box"></div>
 
       <div id="paper-order-error" class="error-banner hidden"></div>
-      <button id="paper-order-submit-btn" type="submit" class="btn btn-primary btn-full">Place Buy-on-Dip Limit Order</button>
+      <button id="paper-order-submit-btn" type="submit" class="btn btn-primary btn-full">Place Order</button>
     </form>
   </div>
 
@@ -980,7 +1143,7 @@
   <div id="paper-deploy-modal-backdrop" class="modal-backdrop hidden"></div>
   <div id="paper-deploy-modal" class="modal-dialog modal-dialog-xl hidden" role="dialog" aria-modal="true" aria-labelledby="paper-deploy-heading">
     <div class="modal-header">
-      <h2 id="paper-deploy-heading">🚀 Deploy Investment Blueprint to Paper Wallet</h2>
+      <h2 id="paper-deploy-heading">&#128640; Deploy Blueprint to Paper Wallet</h2>
       <button id="paper-deploy-close-btn" type="button" class="btn btn-ghost btn-xs">Close &times;</button>
     </div>
     <p id="paper-deploy-summary-note" class="muted-note modal-sub"></p>
@@ -988,26 +1151,26 @@
     <form id="paper-deploy-form" class="auth-form">
       <div class="modal-two-col">
         <div>
-          <label class="field-label" for="paper-deploy-wallet-select">Destination Paper Wallet</label>
+          <label class="field-label" for="paper-deploy-wallet-select">Destination Wallet</label>
           <select id="paper-deploy-wallet-select" class="input-control"></select>
         </div>
         <div>
-          <label class="field-label" for="paper-deploy-dip-pct">Staggered Pullback Limit Target</label>
+          <label class="field-label" for="paper-deploy-dip-pct">Pullback Limit Target</label>
           <select id="paper-deploy-dip-pct" class="input-control">
-            <option value="5">-5% Pullback Limit Orders</option>
-            <option value="7" selected>-7% Buy-on-Dip Limit Orders (Recommended)</option>
-            <option value="10">-10% Deep-Value Dip Limit Orders</option>
+            <option value="5">-5% Pullback Limit</option>
+            <option value="7" selected>-7% Buy-on-Dip Limit (Recommended)</option>
+            <option value="10">-10% Deep-Value Limit</option>
           </select>
         </div>
       </div>
 
       <div id="paper-deploy-new-wallet-fields" class="modal-two-col">
         <div>
-          <label class="field-label" for="paper-deploy-new-wallet-name">New Dedicated Wallet Name</label>
+          <label class="field-label" for="paper-deploy-new-wallet-name">New Wallet Name</label>
           <input id="paper-deploy-new-wallet-name" type="text" maxlength="60" value="India Nifty 200 Blueprint (₹)" class="input-control" />
         </div>
         <div>
-          <label class="field-label" for="paper-deploy-new-wallet-cash">Starting Virtual Cash (Includes Fee Cushion)</label>
+          <label class="field-label" for="paper-deploy-new-wallet-cash">Starting Cash</label>
           <input id="paper-deploy-new-wallet-cash" type="number" min="100" step="any" value="510000" class="input-control" />
         </div>
       </div>
@@ -1016,10 +1179,10 @@
         <table class="quant-table">
           <thead>
             <tr>
-              <th>Company &amp; Index</th>
-              <th>Immediate Market Buy Tranche</th>
-              <th>Queued Buy-on-Dip Limit Order</th>
-              <th>Est. Total + 25 bps Fee</th>
+              <th>Company</th>
+              <th>Market Tranche</th>
+              <th>Queued Dip Limit</th>
+              <th>Est. Total + Fee</th>
             </tr>
           </thead>
           <tbody id="paper-deploy-preview-tbody"></tbody>
@@ -1027,7 +1190,7 @@
       </div>
 
       <div id="paper-deploy-error" class="error-banner hidden"></div>
-      <button id="paper-deploy-confirm-btn" type="submit" class="btn btn-primary btn-full">🚀 Execute Market Tranche &amp; Queue Dip Orders</button>
+      <button id="paper-deploy-confirm-btn" type="submit" class="btn btn-primary btn-full">&#128640; Execute Market Tranche &amp; Queue Dip Orders</button>
     </form>
   </div>
 
