@@ -127,6 +127,110 @@ def fetch_nifty200_constituents() -> List[Dict[str, Any]]:
         return constituents
 
 
+GLOBAL_BENCHMARKS_AND_FX: Tuple[str, ...] = ("^NSEI", "^GSPC", "^NDX", "USDINR=X")
+
+
+def _extract_yahoo_series_from_node(
+    ticker: str,
+    node: Dict[str, Any],
+    prefer_adjclose: bool = False,
+) -> List[Tuple[str, str, float, float]]:
+    """Extract sorted `(ticker, trade_date, close_price, volume)` tuples using symbol `gmtoffset` + `regularMarketPrice`."""
+    meta = node.get("meta") or {}
+    try:
+        gmt_offset = int(meta.get("gmtoffset") or 0)
+    except (TypeError, ValueError):
+        gmt_offset = 0
+
+    timestamps = node.get("timestamp") or []
+    indicators = node.get("indicators") or {}
+    quotes = (indicators.get("quote") or [{}])[0]
+    adj_list = (indicators.get("adjclose") or [{}])[0].get("adjclose") if prefer_adjclose else None
+    closes = adj_list if adj_list else (quotes.get("close") or [])
+    volumes = quotes.get("volume") or []
+
+    by_date: Dict[str, Tuple[float, float]] = {}
+    last_bar_ts: Optional[int] = None
+    for idx, ts in enumerate(timestamps):
+        if idx >= len(closes) or closes[idx] is None:
+            continue
+        try:
+            px = float(closes[idx])
+        except (TypeError, ValueError):
+            continue
+        if px <= 0 or not math.isfinite(px):
+            continue
+        vol = 0.0
+        if idx < len(volumes) and volumes[idx] is not None:
+            try:
+                v_cand = float(volumes[idx])
+                if v_cand >= 0 and math.isfinite(v_cand):
+                    vol = v_cand
+            except (TypeError, ValueError):
+                vol = 0.0
+        t_int = int(ts)
+        d_str = dt.datetime.fromtimestamp(t_int + gmt_offset, tz=dt.timezone.utc).date().isoformat()
+        by_date[d_str] = (round(px, 2), vol)
+        last_bar_ts = t_int
+
+    try:
+        reg_px = float(meta.get("regularMarketPrice") or 0.0)
+    except (TypeError, ValueError):
+        reg_px = 0.0
+    try:
+        reg_ts = int(meta.get("regularMarketTime") or 0)
+    except (TypeError, ValueError):
+        reg_ts = 0
+
+    if reg_px > 0 and math.isfinite(reg_px) and (
+        last_bar_ts is None or reg_ts == 0 or reg_ts >= last_bar_ts - 3600
+    ):
+        eff_ts = (
+            reg_ts
+            if reg_ts > 0
+            else (last_bar_ts if last_bar_ts is not None else (int(timestamps[-1]) if timestamps else int(time.time())))
+        )
+        reg_d_str = dt.datetime.fromtimestamp(eff_ts + gmt_offset, tz=dt.timezone.utc).date().isoformat()
+        prev_vol = by_date.get(reg_d_str, (0.0, 0.0))[1]
+        by_date[reg_d_str] = (round(reg_px, 2), prev_vol)
+
+    return [(ticker, d, pv[0], pv[1]) for d, pv in sorted(by_date.items())]
+
+
+def _fetch_yahoo_chart_recent_single(
+    client: httpx.Client,
+    ticker: str,
+    range_str: str = "5d",
+    host_idx: int = 0,
+) -> List[Tuple[str, str, float, float]]:
+    """Fallback `/v8/finance/chart/{sym}` fetcher for benchmarks/FX or symbols omitted by `/v7/finance/spark`."""
+    enc = urllib.parse.quote(ticker, safe="")
+    enc_range = urllib.parse.quote(range_str, safe="")
+    hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
+    payload = None
+    for attempt in range(3):
+        host = hosts[(host_idx + attempt) % 2]
+        url = f"https://{host}/v8/finance/chart/{enc}?range={enc_range}&interval=1d"
+        try:
+            resp = client.get(url)
+            if resp.status_code == 200:
+                payload = resp.json()
+                break
+            if resp.status_code == 429:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            break
+        except Exception:
+            if attempt == 2:
+                return []
+    if not payload:
+        return []
+    results = ((payload or {}).get("chart") or {}).get("result") or []
+    if not results:
+        return []
+    return _extract_yahoo_series_from_node(ticker, results[0], prefer_adjclose=False)
+
+
 def fetch_yahoo_5y_prices(
     ticker: str,
     client: Optional[httpx.Client] = None,
@@ -135,7 +239,6 @@ def fetch_yahoo_5y_prices(
     """Fetch 5 years of daily split/dividend-adjusted prices from Yahoo Finance v8 chart API."""
     enc = urllib.parse.quote(ticker, safe="")
     hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
-    ist_tz = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
     owns_client = client is None
     sess = client or httpx.Client(headers={"User-Agent": BROWSER_UA}, follow_redirects=True, timeout=12.0)
@@ -162,41 +265,24 @@ def fetch_yahoo_5y_prices(
     results = (payload.get("chart") or {}).get("result") or []
     if not results:
         return []
-    res0 = results[0]
-    timestamps = res0.get("timestamp") or []
-    indicators = res0.get("indicators") or {}
-    quotes = (indicators.get("quote") or [{}])[0]
-    adj_list = (indicators.get("adjclose") or [{}])[0].get("adjclose")
-    closes = adj_list if adj_list else (quotes.get("close") or [])
-    volumes = quotes.get("volume") or []
-
-    by_date: Dict[str, Tuple[float, float]] = {}
-    for i, ts in enumerate(timestamps):
-        if i >= len(closes) or closes[i] is None:
-            continue
-        px = float(closes[i])
-        if px <= 0 or math.isnan(px):
-            continue
-        vol = float(volumes[i]) if i < len(volumes) and volumes[i] is not None else 0.0
-        d_str = dt.datetime.fromtimestamp(int(ts), tz=ist_tz).date().isoformat()
-        by_date[d_str] = (round(px, 2), vol)
-
-    return [(ticker, d, pv[0], pv[1]) for d, pv in sorted(by_date.items())]
+    return _extract_yahoo_series_from_node(ticker, results[0], prefer_adjclose=True)
 
 
 def fetch_yahoo_spark_batch_5y(tickers: List[str]) -> Dict[str, List[Tuple[str, str, float, float]]]:
     """Fetch 5Y daily split-adjusted prices for up to 20 symbols per HTTP GET via Yahoo spark API."""
-    ist_tz = dt.timezone(dt.timedelta(hours=5, minutes=30))
     out: Dict[str, List[Tuple[str, str, float, float]]] = {}
     chunk_size = 20
+    hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
+    unique_syms = list(dict.fromkeys(t.strip() for t in tickers if t and t.strip()))
 
     with httpx.Client(headers={"User-Agent": BROWSER_UA}, follow_redirects=True, timeout=15.0) as client:
-        for start in range(0, len(tickers), chunk_size):
-            batch = tickers[start : start + chunk_size]
+        for chunk_idx, start in enumerate(range(0, len(unique_syms), chunk_size)):
+            batch = unique_syms[start : start + chunk_size]
             encoded_syms = ",".join(urllib.parse.quote(t, safe="") for t in batch)
-            url = f"https://query1.finance.yahoo.com/v7/finance/spark?symbols={encoded_syms}&range=5y&interval=1d"
             payload = None
             for attempt in range(3):
+                host = hosts[(chunk_idx + attempt) % 2]
+                url = f"https://{host}/v7/finance/spark?symbols={encoded_syms}&range=5y&interval=1d"
                 resp = client.get(url)
                 if resp.status_code == 200:
                     payload = resp.json()
@@ -210,20 +296,91 @@ def fetch_yahoo_spark_batch_5y(tickers: List[str]) -> Dict[str, List[Tuple[str, 
                 resp_arr = item.get("response") or []
                 if not sym or not resp_arr:
                     continue
-                r0 = resp_arr[0]
-                timestamps = r0.get("timestamp") or []
-                closes = (((r0.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
-                by_date: Dict[str, Tuple[float, float]] = {}
-                for idx, ts in enumerate(timestamps):
-                    if idx >= len(closes) or closes[idx] is None:
-                        continue
-                    px = float(closes[idx])
-                    if px > 0 and not math.isnan(px):
-                        d_str = dt.datetime.fromtimestamp(int(ts), tz=ist_tz).date().isoformat()
-                        by_date[d_str] = (round(px, 2), 0.0)
-                if by_date:
-                    out[sym] = [(sym, d, pv[0], pv[1]) for d, pv in sorted(by_date.items())]
+                rows = _extract_yahoo_series_from_node(sym, resp_arr[0], prefer_adjclose=False)
+                if rows:
+                    out[sym] = rows
             time.sleep(0.12)
+
+    return out
+
+
+def fetch_yahoo_spark_batch_recent(
+    tickers: List[str],
+    range_str: str = "5d",
+) -> Dict[str, List[Tuple[str, str, float, float]]]:
+    """Fast concurrent multi-market daily/intraday price fetcher via Yahoo `/v7/finance/spark` + `/v8/finance/chart` fallback."""
+    unique_syms = list(dict.fromkeys(t.strip() for t in tickers if t and t.strip()))
+    if not unique_syms:
+        return {}
+
+    out: Dict[str, List[Tuple[str, str, float, float]]] = {}
+    chunk_size = 20
+    chunks = [unique_syms[i : i + chunk_size] for i in range(0, len(unique_syms), chunk_size)]
+    hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
+    enc_range = urllib.parse.quote(range_str, safe="")
+
+    with httpx.Client(headers={"User-Agent": BROWSER_UA}, follow_redirects=True, timeout=10.0) as client:
+
+        def _fetch_chunk(idx_and_batch: Tuple[int, List[str]]) -> Dict[str, List[Tuple[str, str, float, float]]]:
+            c_idx, batch = idx_and_batch
+            encoded_syms = ",".join(urllib.parse.quote(t, safe="") for t in batch)
+            payload = None
+            for attempt in range(3):
+                host = hosts[(c_idx + attempt) % 2]
+                url = f"https://{host}/v7/finance/spark?symbols={encoded_syms}&range={enc_range}&interval=1d"
+                try:
+                    resp = client.get(url)
+                    if resp.status_code == 200:
+                        payload = resp.json()
+                        break
+                    if resp.status_code == 429:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                except Exception:
+                    if attempt == 2:
+                        return {}
+            if not payload:
+                return {}
+
+            chunk_out: Dict[str, List[Tuple[str, str, float, float]]] = {}
+            for item in ((payload or {}).get("spark") or {}).get("result") or []:
+                sym = item.get("symbol")
+                resp_arr = item.get("response") or []
+                if not sym or not resp_arr:
+                    continue
+                rows = _extract_yahoo_series_from_node(sym, resp_arr[0], prefer_adjclose=False)
+                if rows:
+                    chunk_out[sym] = rows
+            return chunk_out
+
+        if chunks:
+            max_workers = min(6, len(chunks))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for chunk_res in pool.map(_fetch_chunk, enumerate(chunks)):
+                    out.update(chunk_res)
+
+        missing = [s for s in unique_syms if s not in out]
+        if missing:
+            priority_set = set(GLOBAL_BENCHMARKS_AND_FX)
+            ordered_missing = [s for s in missing if s in priority_set] + [
+                s for s in missing if s not in priority_set
+            ]
+            if not out and len(ordered_missing) > 40:
+                ordered_missing = ordered_missing[:40]
+            fb_workers = min(6, len(ordered_missing))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=fb_workers) as pool:
+                fut_map = {
+                    pool.submit(_fetch_yahoo_chart_recent_single, client, sym, range_str, i): sym
+                    for i, sym in enumerate(ordered_missing)
+                }
+                for fut in concurrent.futures.as_completed(fut_map):
+                    sym = fut_map[fut]
+                    try:
+                        rows = fut.result()
+                        if rows:
+                            out[sym] = rows
+                    except Exception as exc:
+                        logger.debug("Fallback Yahoo chart fetch skipped for %s: %s", sym, type(exc).__name__)
 
     return out
 
@@ -728,30 +885,48 @@ def fetch_screener_real_fundamentals(
 
 
 def refresh_live_prices_only(db: Database) -> Dict[str, Any]:
-    """Lightweight 4-second weekly/daily price update (~11 Yahoo batch calls, 0 Screener calls)."""
+    """Fast ~2-3s full-universe multi-market (`IN` + `US` + benchmarks + `USDINR=X`) price sync."""
     companies = db.get_all_companies()
     tickers = [c["ticker"] for c in companies]
     if not tickers:
         return run_stage1_bulk_funnel(db, shortlist_top_n=65)
 
-    price_map = fetch_yahoo_spark_batch_5y([BENCHMARK_TICKER] + tickers)
-    bm_rows = price_map.pop(BENCHMARK_TICKER, [])
-    if bm_rows:
-        db.upsert_prices(bm_rows)
+    request_symbols = list(dict.fromkeys(list(GLOBAL_BENCHMARKS_AND_FX) + tickers))
+    price_map = fetch_yahoo_spark_batch_recent(request_symbols, range_str="5d")
 
     all_rows: List[Tuple[str, str, float, float]] = []
     for rows in price_map.values():
-        all_rows.extend(rows)
+        if rows:
+            all_rows.extend(rows)
     if all_rows:
         db.upsert_prices(all_rows)
 
-    batch_calls = math.ceil((len(tickers) + 1) / 20)
+    company_set = set(tickers)
+    stage1_updates = [
+        (round(float(rows[-1][2]), 2), sym)
+        for sym, rows in price_map.items()
+        if sym in company_set and rows and float(rows[-1][2]) > 0
+    ]
+    if stage1_updates:
+        with db.connect() as conn:
+            conn.executemany(
+                "UPDATE stage1_funnel SET last_price = ? WHERE ticker = ?",
+                stage1_updates,
+            )
+
+    updated_stocks = sum(1 for tk in company_set if tk in price_map and price_map[tk])
+    bm_updated = any(bm in price_map and bool(price_map[bm]) for bm in ("^NSEI", "^GSPC", "^NDX"))
+    batch_calls = math.ceil(len(request_symbols) / 20)
+    latest_dates = [rows[-1][1] for rows in price_map.values() if rows]
+    as_of_date = max(latest_dates) if latest_dates else dt.datetime.now(dt.timezone.utc).date().isoformat()
+
     return {
-        "tickers_updated": len(price_map),
-        "tickers_refreshed": len(price_map),
-        "benchmark_updated": len(bm_rows) > 0,
+        "tickers_updated": updated_stocks,
+        "tickers_refreshed": updated_stocks,
+        "benchmark_updated": bm_updated,
         "external_api_calls": batch_calls,
         "spark_batch_calls": batch_calls,
+        "as_of_date": as_of_date,
     }
 
 

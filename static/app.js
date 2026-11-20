@@ -37,6 +37,7 @@ import {
 import {
   getCompanyDetailSnapshot,
   importCsvInMemory,
+  refreshCloudLivePrices,
   runBacktestSnapshot,
   runPlannerSnapshot,
   runScreenerSnapshot,
@@ -1006,12 +1007,22 @@ async function enterWorkspace() {
 // --- Navigation & Market Switchers ---
 
 function switchTab(tabName) {
+  if (state.drawerOpen) {
+    closeDeepDive();
+  }
+  const syncDrawer = document.getElementById("data-sync-drawer");
+  if (syncDrawer) {
+    syncDrawer.classList.add("hidden");
+  }
   state.activeTab = tabName;
   for (const btn of document.querySelectorAll(".nav-tab, .mobile-nav-btn")) {
     btn.classList.toggle("active", btn.dataset.tab === tabName);
   }
   for (const panel of document.querySelectorAll(".tab-panel")) {
     panel.classList.toggle("hidden", panel.id !== `tab-${tabName}`);
+  }
+  if (typeof window !== "undefined" && typeof window.scrollTo === "function") {
+    window.scrollTo(0, 0);
   }
   if (tabName === "backtest" && !state.backtestLoaded) {
     runBacktest();
@@ -2112,6 +2123,7 @@ function closeDeepDive() {
 }
 
 async function openDeepDive(ticker) {
+  const wasOpen = state.drawerOpen;
   const isSameTicker =
     state.currentDetail &&
     state.currentDetail.scorecard &&
@@ -2124,6 +2136,11 @@ async function openDeepDive(ticker) {
   document.getElementById("deep-dive-backdrop").classList.remove("hidden");
   document.getElementById("deep-dive-drawer").classList.remove("hidden");
   document.body.classList.add("drawer-open");
+
+  if (!isSameTicker || !wasOpen) {
+    const scrollBody = document.getElementById("company-detail-content");
+    if (scrollBody) scrollBody.scrollTop = 0;
+  }
 
   for (const row of document.querySelectorAll("#screener-tbody tr")) {
     row.classList.toggle("selected-row", row.dataset.ticker === ticker);
@@ -2150,7 +2167,7 @@ async function openDeepDive(ticker) {
     }
     state.currentDetail = detail;
     renderCompanyDetail(detail);
-    if (!isSameTicker) {
+    if (!isSameTicker || !wasOpen) {
       const scrollBody = document.getElementById("company-detail-content");
       if (scrollBody) scrollBody.scrollTop = 0;
     }
@@ -3262,16 +3279,23 @@ async function handleLiveTickerSync() {
 }
 
 async function handleFastPriceRefresh() {
-  if (state.staticMode) {
-    showToast(
-      "Cloud Snapshot Mode: Live Yahoo Finance batch price refresh requires the local FastAPI server."
-    );
-    return;
-  }
   const btn = document.getElementById("fast-prices-btn");
-  btn.textContent = "Refreshing Prices...";
-  btn.disabled = true;
+  const origLabel = (btn && btn.textContent) || "Refresh Prices";
+  if (btn) {
+    btn.textContent = "Refreshing Prices...";
+    btn.disabled = true;
+  }
   try {
+    if (state.staticMode) {
+      const res = await refreshCloudLivePrices();
+      showToast(
+        `Live Prices Synced: ${res.tickers_refreshed} stocks updated (As of ${res.as_of_date}).`
+      );
+      state.backtestLoaded = false;
+      state.plannerLoaded = false;
+      await loadScreener(false);
+      return;
+    }
     const res = await apiRequest("/api/funnel/prices", {
       method: "POST",
       jsonBody: {},
@@ -3285,8 +3309,10 @@ async function handleFastPriceRefresh() {
   } catch (err) {
     showToast(err.message, true);
   } finally {
-    btn.textContent = "Weekly Price Refresh (4s)";
-    btn.disabled = false;
+    if (btn) {
+      btn.textContent = origLabel;
+      btn.disabled = false;
+    }
   }
 }
 

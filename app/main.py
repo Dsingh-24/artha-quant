@@ -10,12 +10,15 @@ Enforces mandatory web security controls:
 
 from __future__ import annotations
 
+import datetime as dt
 import hmac
 import logging
 import os
 import secrets
+import sys
 import threading
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -176,12 +179,59 @@ def create_app(
     paper_service = PaperTradingService(db=db, market_cache=market_cache, quote_fetcher=quote_fetcher)
     rate_limiter = SlidingWindowRateLimiter(max_requests=220, window_seconds=60)
 
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if (
+            db_path == DEFAULT_DB_PATH
+            and quote_fetcher is None
+            and os.environ.get("PYTEST_CURRENT_TEST") is None
+            and "pytest" not in sys.modules
+        ):
+
+            def _background_stale_price_sync() -> None:
+                try:
+                    if db.count_companies() == 0:
+                        return
+                    today_utc = dt.datetime.now(dt.timezone.utc).date()
+                    wday = today_utc.isoweekday()
+                    min_fresh_date = (
+                        today_utc.isoformat()
+                        if wday <= 5
+                        else (today_utc - dt.timedelta(days=wday - 5)).isoformat()
+                    )
+                    with db.connect() as conn:
+                        r = conn.execute("SELECT MAX(trade_date) AS max_d FROM daily_prices").fetchone()
+                        max_d = str(r["max_d"] or "") if r else ""
+                    if not max_d or max_d < min_fresh_date:
+                        logger.info(
+                            "Local DB daily_prices stale (max=%s < %s); starting background live price sync.",
+                            max_d or "none",
+                            min_fresh_date,
+                        )
+                        summary = refresh_live_prices_only(db)
+                        market_cache.invalidate()
+                        logger.info(
+                            "Background live price sync complete: %s stocks updated (as of %s).",
+                            summary.get("tickers_refreshed", 0),
+                            summary.get("as_of_date", ""),
+                        )
+                except Exception as exc:
+                    logger.debug("Background startup price sync skipped: %s", type(exc).__name__)
+
+            threading.Thread(
+                target=_background_stale_price_sync,
+                name="arthaquant-startup-price-sync",
+                daemon=True,
+            ).start()
+        yield
+
     app = FastAPI(
         title="ArthaQuant — Indian Equity Investment Advisor & Backtester",
         version="1.1.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
     app.state.db = db
     app.state.market_cache = market_cache
@@ -376,6 +426,62 @@ def create_app(
         return {"authenticated": False}
 
     # --- Two-Stage Funnel, Screener & Live Sync ---
+
+    @app.get("/api/market-prices")
+    def get_market_prices(
+        _sess: Dict[str, Any] = Depends(require_session),
+    ) -> Dict[str, Any]:
+        _companies, _fund_df, price_mat, _stage1_rows = market_cache.load()
+        prices_dict: Dict[str, float] = {}
+        latest_trade_date = ""
+        latest_in_date = ""
+        latest_us_date = ""
+
+        if not price_mat.empty:
+            latest_trade_date = str(price_mat.index[-1])
+            last_row = price_mat.iloc[-1]
+            for tk, raw_val in last_row.items():
+                if pd.notna(raw_val):
+                    px_f = float(raw_val)
+                    if px_f > 0:
+                        prices_dict[str(tk)] = round(px_f, 2)
+                else:
+                    s_col = price_mat[tk].dropna()
+                    if not s_col.empty:
+                        px_f = float(s_col.iloc[-1])
+                        if px_f > 0:
+                            prices_dict[str(tk)] = round(px_f, 2)
+
+            cutoff_idx = max(0, len(price_mat.index) - 15)
+            cutoff_date = str(price_mat.index[cutoff_idx])
+            with db.connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT
+                        MAX(CASE WHEN ticker = '^NSEI' OR ticker LIKE '%.NS' OR ticker LIKE '%.BO' THEN trade_date END) AS in_as_of,
+                        MAX(CASE WHEN ticker != '^NSEI' AND ticker NOT LIKE '%.NS' AND ticker NOT LIKE '%.BO' AND ticker != 'USDINR=X' THEN trade_date END) AS us_as_of
+                    FROM daily_prices
+                    WHERE trade_date >= ?
+                    """,
+                    (cutoff_date,),
+                ).fetchone()
+                if row:
+                    latest_in_date = str(row["in_as_of"] or latest_trade_date)
+                    latest_us_date = str(row["us_as_of"] or latest_trade_date)
+                else:
+                    latest_in_date = latest_trade_date
+                    latest_us_date = latest_trade_date
+
+        now_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return {
+            "schema": "arthaquant.live_prices.v1",
+            "as_of_date": latest_trade_date,
+            "in_as_of": latest_in_date,
+            "us_as_of": latest_us_date,
+            "updated_at": now_iso,
+            "stock_count": len(prices_dict),
+            "prices": prices_dict,
+        }
 
     @app.post("/api/screener")
     def run_screener(

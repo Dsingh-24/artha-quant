@@ -312,6 +312,14 @@ def compute_sell_proceeds(
     return gross, fee, net
 
 
+def _pos_finite_float(raw_val: Any) -> float:
+    try:
+        fv = float(raw_val)
+        return fv if fv > 0 and math.isfinite(fv) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _fetch_single_yahoo_ohlc(client: httpx.Client, symbol: str) -> Optional[Dict[str, Any]]:
     encoded = urllib.parse.quote(symbol, safe="")
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?range=5d&interval=1d"
@@ -325,8 +333,10 @@ def _fetch_single_yahoo_ohlc(client: httpx.Client, symbol: str) -> Optional[Dict
             return None
         res0 = results[0]
         meta = res0.get("meta") or {}
-        gmt_offset = int(meta.get("gmtoffset") or 0)
-        tz = dt.timezone(dt.timedelta(seconds=gmt_offset))
+        try:
+            gmt_offset = int(meta.get("gmtoffset") or 0)
+        except (TypeError, ValueError):
+            gmt_offset = 0
 
         timestamps = res0.get("timestamp") or []
         quotes = (((res0.get("indicators") or {}).get("quote")) or [{}])[0]
@@ -334,33 +344,69 @@ def _fetch_single_yahoo_ohlc(client: httpx.Client, symbol: str) -> Optional[Dict
         lows = quotes.get("low") or []
         highs = quotes.get("high") or []
 
+        bar_close: Optional[float] = None
+        bar_low: Optional[float] = None
+        bar_high: Optional[float] = None
+        bar_ts: Optional[int] = None
+        bar_date: Optional[str] = None
+
         for idx in range(len(timestamps) - 1, -1, -1):
             if idx >= len(closes) or closes[idx] is None:
                 continue
-            c_val = float(closes[idx])
-            if c_val <= 0 or math.isnan(c_val):
+            c_val = _pos_finite_float(closes[idx])
+            if c_val <= 0:
                 continue
             lo_raw = lows[idx] if idx < len(lows) else None
             hi_raw = highs[idx] if idx < len(highs) else None
-            lo_val = float(lo_raw) if lo_raw is not None and float(lo_raw) > 0 and not math.isnan(float(lo_raw)) else c_val
-            hi_val = float(hi_raw) if hi_raw is not None and float(hi_raw) > 0 and not math.isnan(float(hi_raw)) else c_val
-            lo_val = min(lo_val, c_val)
-            hi_val = max(hi_val, c_val)
-            t_date = dt.datetime.fromtimestamp(int(timestamps[idx]), tz=tz).date().isoformat()
+            lo_cand = _pos_finite_float(lo_raw)
+            hi_cand = _pos_finite_float(hi_raw)
+            bar_close = c_val
+            bar_low = min(lo_cand, c_val) if lo_cand > 0 else c_val
+            bar_high = max(hi_cand, c_val) if hi_cand > 0 else c_val
+            bar_ts = int(timestamps[idx])
+            bar_date = dt.datetime.fromtimestamp(bar_ts + gmt_offset, tz=dt.timezone.utc).date().isoformat()
+            break
+
+        reg_px = _pos_finite_float(meta.get("regularMarketPrice"))
+        reg_lo = _pos_finite_float(meta.get("regularMarketDayLow"))
+        reg_hi = _pos_finite_float(meta.get("regularMarketDayHigh"))
+        try:
+            reg_ts = int(meta.get("regularMarketTime") or 0)
+        except (TypeError, ValueError):
+            reg_ts = 0
+
+        if reg_px > 0 and (bar_ts is None or reg_ts == 0 or reg_ts >= bar_ts - 3600):
+            close_px = round(reg_px, 2)
+            eff_ts = reg_ts if reg_ts > 0 else (bar_ts if bar_ts is not None else int(time.time()))
+            reg_date = dt.datetime.fromtimestamp(eff_ts + gmt_offset, tz=dt.timezone.utc).date().isoformat()
+            lo_val = min(reg_lo, close_px) if reg_lo > 0 else close_px
+            hi_val = max(reg_hi, close_px) if reg_hi > 0 else close_px
+            if bar_date == reg_date and bar_low is not None and bar_high is not None:
+                lo_val = min(lo_val, bar_low)
+                hi_val = max(hi_val, bar_high)
             return {
                 "ticker": symbol,
-                "close_price": round(c_val, 2),
+                "close_price": close_px,
                 "day_low": round(lo_val, 2),
                 "day_high": round(hi_val, 2),
-                "trade_date": t_date,
+                "trade_date": reg_date,
+            }
+
+        if bar_close is not None and bar_low is not None and bar_high is not None and bar_date is not None:
+            return {
+                "ticker": symbol,
+                "close_price": round(bar_close, 2),
+                "day_low": round(bar_low, 2),
+                "day_high": round(bar_high, 2),
+                "trade_date": bar_date,
             }
     except Exception as exc:
         logger.debug("Yahoo quote fetch skipped for %s: %s", symbol, type(exc).__name__)
     return None
 
 
-def fetch_yahoo_chart_quotes(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Fetch latest daily close/low/high from Yahoo Finance `v8/finance/chart` concurrently."""
+def default_yahoo_quote_fetcher(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Fetch latest daily/intraday close/low/high from Yahoo Finance `v8/finance/chart` concurrently."""
     unique_syms = sorted({t.strip() for t in tickers if t and t.strip()})
     if not unique_syms:
         return {}
@@ -378,6 +424,11 @@ def fetch_yahoo_chart_quotes(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
     except Exception as exc:
         logger.warning("Batch Yahoo live quote refresh unavailable: %s", type(exc).__name__)
     return out
+
+
+def fetch_yahoo_chart_quotes(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Backward-compatible alias for `default_yahoo_quote_fetcher`."""
+    return default_yahoo_quote_fetcher(tickers)
 
 
 class PaperTradingService:

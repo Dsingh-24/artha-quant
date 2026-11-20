@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * ArthaQuant V5.0 Security-Hardened Static-Shell Service Worker.
+ * ArthaQuant V5.2 Security-Hardened Static-Shell Service Worker.
  *
  * Strict Security Invariants:
  * 1. Immediately bypasses all non-GET requests and all cross-origin requests.
@@ -11,7 +11,7 @@
  * 3. Uses Network-First with cache fallback strictly for allowlisted static UI shell assets.
  */
 
-const CACHE_NAME = "arthaquant-shell-v5";
+const CACHE_NAME = "arthaquant-shell-v5.2";
 
 const PRECACHE_SHELL_URLS = [
   "/",

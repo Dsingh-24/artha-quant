@@ -1,4 +1,5 @@
 import type { Config } from "@netlify/functions";
+import { refreshUniversePricesBlob } from "../lib/market-prices-service.mts";
 import { PaperServiceError, runGlobalDailyPaperRefresh } from "../lib/paper-pg-service.mts";
 
 const RESPONSE_HEADERS: Record<string, string> = {
@@ -18,34 +19,71 @@ export default async (req: Request): Promise<Response> => {
     // Manual invocation via `netlify functions:invoke` may omit JSON body
   }
 
-  try {
-    const summary = await runGlobalDailyPaperRefresh(undefined, "US");
+  const [uniRes, paperRes] = await Promise.allSettled([
+    refreshUniversePricesBlob("US"),
+    runGlobalDailyPaperRefresh(undefined, "US"),
+  ]);
+
+  let universeCount = 0;
+  let universeAsOf: string | null = null;
+  if (uniRes.status === "fulfilled") {
+    universeCount = uniRes.value.stock_count;
+    universeAsOf = uniRes.value.us_as_of;
+  } else {
+    const uniErrMsg =
+      uniRes.reason instanceof Error
+        ? uniRes.reason.message.replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "[redacted]")
+        : "Unknown error";
+    console.warn("[daily-paper-refresh] Universe blob refresh warning:", uniErrMsg);
+  }
+
+  if (paperRes.status === "fulfilled") {
+    const summary = paperRes.value;
     console.log(
-      `[daily-paper-refresh] Completed scope=${summary.market_scope} as_of=${summary.as_of_date}: quotes=${summary.quotes_updated}, filled=${summary.orders_filled}, portfolios=${summary.portfolios_snapshotted}, idle=${Boolean(summary.skipped_idle)}, next_run=${nextRun || "n/a"}`,
+      `[daily-paper-refresh] Completed scope=${summary.market_scope} as_of=${summary.as_of_date}: universe_blob=${universeCount} (us_as_of=${universeAsOf || "n/a"}), paper_quotes=${summary.quotes_updated}, filled=${summary.orders_filled}, portfolios=${summary.portfolios_snapshotted}, idle=${Boolean(summary.skipped_idle)}, next_run=${nextRun || "n/a"}`,
     );
     return Response.json(
       {
         status: "ok",
         next_run: nextRun || null,
+        universe_prices_updated: universeCount,
+        universe_as_of_date: universeAsOf,
         ...summary,
       },
       { status: 200, headers: RESPONSE_HEADERS },
     );
-  } catch (err) {
-    if (err instanceof PaperServiceError && err.status === 503) {
-      console.warn("[daily-paper-refresh] Skipped because database is not provisioned yet.");
-      return Response.json(
-        { status: "skipped", detail: err.message },
-        { status: 503, headers: RESPONSE_HEADERS },
-      );
-    }
-    const msg = err instanceof Error ? err.message.replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "[redacted]") : "Unknown error";
-    console.error("[daily-paper-refresh] Refresh error:", msg);
+  }
+
+  const err = paperRes.reason;
+  if (err instanceof PaperServiceError && err.status === 503) {
+    console.warn(
+      `[daily-paper-refresh] Paper DB skipped (not provisioned); universe_blob=${universeCount} (us_as_of=${universeAsOf || "n/a"}).`,
+    );
     return Response.json(
-      { status: "error", detail: "Scheduled daily paper refresh failed." },
-      { status: 500, headers: RESPONSE_HEADERS },
+      {
+        status: "skipped",
+        detail: err.message,
+        universe_prices_updated: universeCount,
+        universe_as_of_date: universeAsOf,
+      },
+      { status: 503, headers: RESPONSE_HEADERS },
     );
   }
+
+  const msg =
+    err instanceof Error
+      ? err.message.replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "[redacted]")
+      : "Unknown error";
+  console.error("[daily-paper-refresh] Refresh error:", msg);
+  return Response.json(
+    {
+      status: "error",
+      detail: "Scheduled daily paper refresh failed.",
+      universe_prices_updated: universeCount,
+      universe_as_of_date: universeAsOf,
+    },
+    { status: 500, headers: RESPONSE_HEADERS },
+  );
 };
 
 // 22:00 UTC Mon-Fri = 5:00 PM EST (winter) / 6:00 PM EDT (summer, shifts 1h across US DST), safely after 4:00 PM ET US market close.

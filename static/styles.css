@@ -26,6 +26,12 @@
   padding: 0;
 }
 
+html {
+  overflow-x: clip;
+  max-width: 100%;
+  -webkit-text-size-adjust: 100%;
+}
+
 body {
   background-color: var(--bg-base);
   color: var(--text-primary);
@@ -34,10 +40,27 @@ body {
   line-height: 1.55;
   font-variant-numeric: tabular-nums;
   min-height: 100vh;
+  overflow-x: clip;
+  max-width: 100%;
+  overscroll-behavior-y: contain;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .hidden {
   display: none !important;
+}
+
+.app-shell,
+.main-container,
+.tab-panel,
+.panel,
+.control-card,
+.charts-two-col > *,
+.dd-two-col > *,
+.kpi-strip > *,
+.adv-group-card {
+  min-width: 0;
+  max-width: 100%;
 }
 
 /* Auth Gate */
@@ -270,7 +293,7 @@ body {
 
 /* Main Container */
 .main-container {
-  max-width: 1460px;
+  max-width: min(1460px, 100%);
   margin: 0 auto;
   padding: 24px 28px 60px;
 }
@@ -847,7 +870,10 @@ body {
 .top-gap { margin-top: 10px; }
 
 .table-scroll {
+  max-width: 100%;
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
 }
 
 .leaderboard-scroll {
@@ -1345,6 +1371,13 @@ body {
 .chart-box-sm {
   width: 100%;
   min-height: 180px;
+}
+
+.chart-box svg,
+.chart-box-sm svg {
+  max-width: 100%;
+  height: auto;
+  display: block;
 }
 
 .legend-inline {
@@ -3685,5 +3718,290 @@ body.drawer-open {
   .brand-title .tag-nasdaq,
   .brand-title .tag-sp500 {
     display: none;
+  }
+}
+
+/* ==========================================================================
+   V5.2 Mobile Browser & Standalone PWA Layout Polish (Desktop > 900px Untouched)
+   ========================================================================== */
+
+@media (max-width: 900px) {
+  .topbar {
+    padding: calc(8px + env(safe-area-inset-top, 0px)) 14px 8px;
+    gap: 8px;
+    flex-wrap: nowrap;
+  }
+
+  .topbar .nav-tabs {
+    display: none;
+  }
+
+  .main-container {
+    padding: 12px 12px calc(92px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .mobile-bottom-nav {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    max-width: 100vw;
+    z-index: 60;
+    transform: translateZ(0);
+    -webkit-transform: translateZ(0);
+    touch-action: manipulation;
+    padding: 6px 6px calc(6px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .mobile-nav-btn {
+    min-height: 48px;
+    touch-action: manipulation;
+  }
+
+  /* Collapse Multi-Column Grids Cleanly (Zero Horizontal Overflow Across All Tabs) */
+  .charts-two-col {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .dd-two-col {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .street-metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .podium-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .kpi-strip,
+  .paper-kpi-five {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 9px;
+  }
+
+  .waterfall-row {
+    grid-template-columns: 1fr auto;
+    gap: 6px;
+  }
+
+  /* Prevent iOS Safari Auto-Zoom on Input Focus */
+  .input-control,
+  select.input-control,
+  input.input-control {
+    font-size: 16px;
+    min-height: 42px;
+  }
+
+  /* Smooth Horizontal Scrollable Pill Bars */
+  .market-switcher,
+  .market-switcher-compact {
+    max-width: 100%;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding: 3px;
+  }
+
+  .market-switcher::-webkit-scrollbar,
+  .market-switcher-compact::-webkit-scrollbar,
+  .rating-chip-strip::-webkit-scrollbar,
+  .paper-wallet-strip::-webkit-scrollbar,
+  .subtab-bar::-webkit-scrollbar,
+  .dd-subtab-bar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .market-switcher .market-btn,
+  .market-switcher-compact .market-btn {
+    flex: 0 0 auto;
+    min-height: 36px;
+  }
+
+  .rating-chip-strip,
+  .paper-wallet-strip,
+  .subtab-bar,
+  .dd-subtab-bar {
+    max-width: 100%;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .rating-chip-strip > *,
+  .paper-wallet-strip > *,
+  .subtab-bar > *,
+  .dd-subtab-bar > * {
+    flex: 0 0 auto;
+  }
+}
+
+/* Native-App Mobile Card Layout for Main Screener Rankings Table Only */
+@media (max-width: 768px) {
+  #tab-screener .leaderboard-scroll {
+    max-height: none;
+    overflow-x: visible;
+  }
+
+  #tab-screener .leaderboard-table {
+    display: block;
+    width: 100%;
+  }
+
+  #tab-screener .leaderboard-table thead {
+    display: none;
+  }
+
+  #tab-screener .leaderboard-table tbody {
+    display: block;
+    width: 100%;
+  }
+
+  #tab-screener .leaderboard-table tbody tr {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 6px 10px;
+    background: rgba(9, 14, 24, 0.58);
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    padding: 12px 13px;
+    margin-bottom: 9px;
+  }
+
+  #tab-screener .leaderboard-table tbody tr td {
+    display: block;
+    padding: 0;
+    border: none;
+    min-width: 0;
+  }
+
+  #tab-screener .leaderboard-table tbody tr td:nth-child(1) {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  #tab-screener .leaderboard-table tbody tr td:nth-child(2) {
+    grid-column: 1 / 2;
+  }
+
+  #tab-screener .leaderboard-table tbody tr td:nth-child(3) {
+    grid-column: 2 / 3;
+    justify-self: end;
+    text-align: right;
+  }
+
+  #tab-screener .leaderboard-table tbody tr td:nth-child(3) .score-cell-wrap {
+    min-width: 0;
+    max-width: 108px;
+  }
+
+  #tab-screener .leaderboard-table tbody tr td:nth-child(4) {
+    grid-column: 1 / -1;
+  }
+
+  #tab-screener .leaderboard-table tbody tr td:nth-child(5) {
+    grid-column: 1 / -1;
+    padding-top: 8px;
+    border-top: 1px solid rgba(34, 50, 77, 0.55);
+  }
+
+  #tab-screener .leaderboard-table tbody tr td:nth-child(5) .price-action-cell,
+  #tab-screener .leaderboard-table tbody tr td:nth-child(5) .price-action-wrap {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  #tab-screener .leaderboard-table tbody tr td:nth-child(n + 6) {
+    grid-column: 1 / -1;
+  }
+
+  #tab-screener .leaderboard-table tbody tr td.empty-state-box {
+    grid-column: 1 / -1;
+    text-align: center;
+    padding: 20px 12px;
+  }
+}
+
+/* Compact Mobile Topbar, Cards, Full-Width Deep-Dive Sheet & Clean Modals */
+@media (max-width: 640px) {
+  #market-status-line,
+  #user-badge {
+    display: none;
+  }
+
+  .panel,
+  .control-card {
+    padding: 12px 13px;
+    margin-bottom: 11px;
+  }
+
+  .kpi-card {
+    padding: 10px 12px;
+  }
+
+  .kpi-value {
+    font-size: 17px;
+  }
+
+  .deep-dive-drawer {
+    width: 100vw;
+    max-width: 100vw;
+    border-left: none;
+    z-index: 75;
+  }
+
+  .drawer-sticky-bar {
+    padding: calc(10px + env(safe-area-inset-top, 0px)) 14px 10px;
+  }
+
+  .drawer-scroll-body {
+    padding: 14px 14px calc(28px + env(safe-area-inset-bottom, 0px));
+    gap: 12px;
+  }
+
+  .dd-hero-card {
+    padding: 14px 15px;
+    gap: 12px;
+  }
+
+  .dd-hero-top {
+    gap: 10px;
+    align-items: flex-start;
+  }
+
+  .dd-hero-title {
+    font-size: 17px;
+  }
+
+  .dd-hero-right {
+    text-align: left;
+  }
+
+  .dd-cmp {
+    font-size: 20px;
+  }
+
+  .modal-dialog,
+  .modal-dialog-wide,
+  .modal-dialog-xl {
+    width: calc(100vw - 20px);
+    max-width: calc(100vw - 20px);
+    max-height: calc(100dvh - 24px);
+    padding: 16px;
+    z-index: 85;
   }
 }

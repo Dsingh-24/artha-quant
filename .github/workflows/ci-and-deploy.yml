@@ -60,14 +60,15 @@ jobs:
       - name: Build Netlify static bundle (`dist/`) & compact AI stock context
         run: sh scripts/build_netlify.sh
 
-      - name: Typecheck & bundle-verify Netlify Functions (`ai-memo`, `paper-api`, `daily-paper-refresh`, `nse-close-paper-refresh`)
+      - name: Typecheck & bundle-verify Netlify Functions (`ai-memo`, `paper-api`, `daily-paper-refresh`, `nse-close-paper-refresh`, `market-prices`)
         run: |
-          ./node_modules/.bin/tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --strict --skipLibCheck netlify/functions/ai-memo.mts netlify/functions/paper-api.mts netlify/functions/daily-paper-refresh.mts netlify/functions/nse-close-paper-refresh.mts netlify/lib/paper-pg-service.mts
+          ./node_modules/.bin/tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --strict --skipLibCheck netlify/functions/ai-memo.mts netlify/functions/paper-api.mts netlify/functions/daily-paper-refresh.mts netlify/functions/nse-close-paper-refresh.mts netlify/functions/market-prices.mts netlify/lib/paper-pg-service.mts netlify/lib/market-prices-service.mts
           ./node_modules/.bin/esbuild netlify/functions/ai-memo.mts --bundle --platform=node --format=esm --target=node22 --external:@google/genai --outfile=/tmp/ai-memo-check.mjs
           ./node_modules/.bin/esbuild netlify/functions/paper-api.mts --bundle --platform=node --format=esm --target=node22 --external:@netlify/database --external:pg --outfile=/tmp/paper-api-check.mjs
           ./node_modules/.bin/esbuild netlify/functions/daily-paper-refresh.mts --bundle --platform=node --format=esm --target=node22 --external:@netlify/database --external:pg --outfile=/tmp/daily-paper-refresh-check.mjs
           ./node_modules/.bin/esbuild netlify/functions/nse-close-paper-refresh.mts --bundle --platform=node --format=esm --target=node22 --external:@netlify/database --external:pg --outfile=/tmp/nse-close-paper-refresh-check.mjs
-          rm -f /tmp/ai-memo-check.mjs /tmp/paper-api-check.mjs /tmp/daily-paper-refresh-check.mjs /tmp/nse-close-paper-refresh-check.mjs
+          ./node_modules/.bin/esbuild netlify/functions/market-prices.mts --bundle --platform=node --format=esm --target=node22 --external:@netlify/database --external:pg --outfile=/tmp/market-prices-check.mjs
+          rm -f /tmp/ai-memo-check.mjs /tmp/paper-api-check.mjs /tmp/daily-paper-refresh-check.mjs /tmp/nse-close-paper-refresh-check.mjs /tmp/market-prices-check.mjs
 
       - name: Trigger Netlify Deploy via Build Hook (if configured)
         if: github.ref == 'refs/heads/main' && env.NETLIFY_BUILD_HOOK_URL != ''

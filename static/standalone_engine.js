@@ -1579,19 +1579,181 @@ function indexSnapshot(raw) {
   return raw;
 }
 
+export function isValidLivePricesOverlay(obj) {
+  return Boolean(
+    obj &&
+      typeof obj === "object" &&
+      obj.schema === "arthaquant.live_prices.v1" &&
+      obj.prices &&
+      typeof obj.prices === "object" &&
+      !Array.isArray(obj.prices) &&
+      !Array.isArray(obj.companies)
+  );
+}
+
+export function applyLivePriceOverlay(raw, overlay) {
+  if (!raw || typeof raw !== "object" || !isValidLivePricesOverlay(overlay)) {
+    return raw;
+  }
+  if (!Array.isArray(raw.price_dates)) {
+    raw.price_dates = [];
+  }
+  if (!raw.prices || typeof raw.prices !== "object") {
+    raw.prices = {};
+  }
+  if (raw._baseDateCount === undefined) {
+    raw._baseDateCount = raw.price_dates.length;
+    raw._baseAsOfDate = raw.as_of_date;
+    raw._baseLastPrices = {};
+    if (raw._baseDateCount > 0) {
+      for (const [tk, arr] of Object.entries(raw.prices)) {
+        if (Array.isArray(arr) && arr.length >= raw._baseDateCount) {
+          raw._baseLastPrices[tk] = arr[raw._baseDateCount - 1];
+        }
+      }
+    }
+  }
+
+  raw.price_dates.length = raw._baseDateCount;
+  for (const [tk, arr] of Object.entries(raw.prices)) {
+    if (Array.isArray(arr)) {
+      if (arr.length > raw._baseDateCount) {
+        arr.length = raw._baseDateCount;
+      }
+      if (raw._baseDateCount > 0 && Object.prototype.hasOwnProperty.call(raw._baseLastPrices, tk)) {
+        arr[raw._baseDateCount - 1] = raw._baseLastPrices[tk];
+      }
+    }
+  }
+
+  const baseLastDate = raw.price_dates[raw.price_dates.length - 1] || "";
+  const overlayDate =
+    typeof overlay.as_of_date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(overlay.as_of_date)
+      ? overlay.as_of_date
+      : baseLastDate;
+
+  const fxOv = Number(overlay.prices[USD_INR_TICKER]);
+  if (Number.isFinite(fxOv) && fxOv > 0 && !Array.isArray(raw.prices[USD_INR_TICKER])) {
+    raw.prices[USD_INR_TICKER] = new Array(raw._baseDateCount).fill(roundTo(fxOv, 2));
+  }
+
+  if (overlayDate > baseLastDate) {
+    raw.price_dates.push(overlayDate);
+    raw.as_of_date = overlayDate;
+    for (const [tk, arr] of Object.entries(raw.prices)) {
+      if (!Array.isArray(arr)) continue;
+      const ovPx = Number(overlay.prices[tk]);
+      arr.push(
+        Number.isFinite(ovPx) && ovPx > 0
+          ? roundTo(ovPx, 2)
+          : arr.length > 0
+          ? arr[arr.length - 1]
+          : null
+      );
+    }
+  } else if (raw.price_dates.length > 0) {
+    raw.as_of_date = baseLastDate;
+    for (const [tk, arr] of Object.entries(raw.prices)) {
+      if (!Array.isArray(arr) || arr.length === 0) continue;
+      const ovPx = Number(overlay.prices[tk]);
+      if (Number.isFinite(ovPx) && ovPx > 0) {
+        arr[arr.length - 1] = roundTo(ovPx, 2);
+      }
+    }
+  }
+
+  for (const r of raw.stage1_funnel || []) {
+    if (!r || !r.ticker) continue;
+    const pxArr = raw.prices[r.ticker];
+    if (!Array.isArray(pxArr) || pxArr.length === 0) continue;
+    const validCloses = [];
+    for (let i = 0; i < pxArr.length; i++) {
+      const v = pxArr[i];
+      if (v !== null && v !== undefined) {
+        const n = Number(v);
+        if (Number.isFinite(n) && n > 0) {
+          validCloses.push(n);
+        }
+      }
+    }
+    if (validCloses.length === 0) continue;
+    const curPx = validCloses[validCloses.length - 1];
+    r.last_price = roundTo(curPx, 2);
+
+    const w52Start = Math.max(0, validCloses.length - 252);
+    let high52w = curPx;
+    for (let i = w52Start; i < validCloses.length; i++) {
+      if (validCloses[i] > high52w) high52w = validCloses[i];
+    }
+    r.dist_52w_high_pct = roundTo((curPx / Math.max(0.01, high52w) - 1.0) * 100.0, 1);
+
+    const dmaStart = Math.max(0, validCloses.length - 200);
+    let sum200 = 0.0;
+    const cnt200 = validCloses.length - dmaStart;
+    for (let i = dmaStart; i < validCloses.length; i++) {
+      sum200 += validCloses[i];
+    }
+    const dma200 = sum200 / Math.max(1, cnt200);
+    r.above_200dma = curPx >= dma200 ? 1 : 0;
+
+    const base6m = validCloses[Math.max(0, validCloses.length - 126)];
+    if (base6m > 0) {
+      const ret6m = (curPx / base6m - 1.0) * 100.0;
+      r.ret_6m_pct = roundTo(ret6m, 1);
+    }
+  }
+
+  return indexSnapshot(raw);
+}
+
 export async function getSnapshot() {
   if (!cachedSnapshotPromise) {
-    cachedSnapshotPromise = window
+    const snapFetch = window
       .fetch("/static/data/market_snapshot.json", { credentials: "same-origin" })
       .then((resp) => {
         if (!resp.ok) {
           throw new Error(`Failed to load market snapshot (${resp.status})`);
         }
         return resp.json();
-      })
-      .then((raw) => indexSnapshot(raw));
+      });
+    const overlayFetch = window
+      .fetch("/api/market-prices", { credentials: "same-origin" })
+      .then((resp) => (resp && resp.ok ? resp.json() : null))
+      .catch(() => null);
+    cachedSnapshotPromise = Promise.all([snapFetch, overlayFetch])
+      .then(([raw, overlay]) =>
+        isValidLivePricesOverlay(overlay) ? applyLivePriceOverlay(raw, overlay) : indexSnapshot(raw)
+      )
+      .catch((err) => {
+        cachedSnapshotPromise = null;
+        throw err;
+      });
   }
   return cachedSnapshotPromise;
+}
+
+export async function refreshCloudLivePrices() {
+  const snap = await getSnapshot();
+  const resp = await window.fetch("/api/market-prices", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(
+      (data && (data.detail || data.error)) || `Live price refresh failed (${resp.status})`
+    );
+  }
+  if (!isValidLivePricesOverlay(data)) {
+    throw new Error("Live price overlay unavailable on this host.");
+  }
+  applyLivePriceOverlay(snap, data);
+  return {
+    tickers_refreshed: Number(data.stock_count || Object.keys(data.prices || {}).length),
+    as_of_date: snap.as_of_date,
+  };
 }
 
 function findDateIndexOnOrBefore(dates, targetDate) {

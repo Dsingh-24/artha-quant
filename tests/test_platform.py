@@ -820,7 +820,7 @@ def test_python_js_bit_for_bit_parity_across_five_modes(tmp_path: Path) -> None:
         pytest.skip("WebKit JavaScriptCore (jsc) not available on this host")
 
     root = Path(__file__).resolve().parent.parent
-    client, csrf = _authenticated_multimarket_client(tmp_path)
+    client, csrf = _authenticated_multimarket_client(tmp_path, force_snapshot_hydration=True)
 
     py_out: dict[str, dict] = {"screener": {}, "planner": {}, "backtest": {}, "company": {}}
     for mode in ("ALL", "IN", "US", "NASDAQ100", "SP500"):
@@ -2737,5 +2737,611 @@ const window = {{
     ]
     assert 0 < out["topPeRatio"] < 15
     assert out["tailInvalidPeRatio"] >= 99 or out["tailInvalidPeRatio"] <= 0
+
+
+def test_v51_daily_universe_price_overlay_and_intraday_regular_market_price(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import datetime as dt
+    import json
+    import os
+    import re
+    import shutil
+    import subprocess
+
+    import httpx
+    import pytest
+
+    from app.paper_trading import default_yahoo_quote_fetcher
+
+    root = Path(__file__).resolve().parent.parent
+    snap_path = root / "static" / "data" / "market_snapshot.json"
+    raw_snap_obj = json.loads(snap_path.read_text(encoding="utf-8"))
+    base_as_of = str(raw_snap_obj["as_of_date"])
+    assert base_as_of < "2026-11-19"
+    base_date_count = len(raw_snap_obj["price_dates"])
+    assert base_date_count >= 1200
+
+    # 1. Frontend Overlay (`standalone_engine.js` via WebKit `jsc` or Node in CI)
+    jsc_bin = Path("/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc")
+    node_bin = shutil.which("node")
+    if not node_bin:
+        for cand in sorted((root.parent / ".tools").glob("node-*/bin/node"), reverse=True):
+            if cand.is_file():
+                node_bin = str(cand)
+                break
+
+    if not jsc_bin.exists() and not node_bin:
+        pytest.skip("Neither WebKit JavaScriptCore (jsc) nor Node.js available on this host")
+
+    eng_stripped = re.sub(
+        r"^export\s+",
+        "",
+        (root / "static" / "standalone_engine.js").read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
+    )
+    snap_str = str(snap_path.resolve())
+    runtime_prelude = (
+        ""
+        if jsc_bin.exists()
+        else 'const fs = require("node:fs"); const readFile = (p) => fs.readFileSync(p, "utf-8"); const print = console.log; const quit = (c) => process.exit(c);'
+    )
+
+    overlay_driver = f"""
+{runtime_prelude}
+const rawBaseline = JSON.parse(readFile({json.dumps(snap_str)}));
+const baseSnapshotClone = JSON.parse(JSON.stringify(rawBaseline));
+
+const overlayDay1 = {{
+  schema: "arthaquant.live_prices.v1",
+  as_of_date: "2026-11-19",
+  in_as_of: "2026-11-19",
+  us_as_of: "2026-11-19",
+  updated_at: "2026-11-19T17:45:00Z",
+  stock_count: 711,
+  prices: {{
+    "NVDA": 245.00,
+    "MU": 910.50,
+    "TCS.NS": 2100.00,
+    "^NSEI": 26125.40,
+    "^GSPC": 7490.80,
+    "^NDX": 27450.25,
+    "USDINR=X": 94.50,
+  }},
+}};
+
+const overlayDay2 = {{
+  schema: "arthaquant.live_prices.v1",
+  as_of_date: "2026-11-20",
+  in_as_of: "2026-11-20",
+  us_as_of: "2026-11-20",
+  updated_at: "2026-11-20T17:45:00Z",
+  stock_count: 711,
+  prices: {{
+    "NVDA": 252.80,
+    "MU": 925.00,
+    "TCS.NS": 2480.00,
+    "^NSEI": 26310.00,
+    "^GSPC": 7540.20,
+    "^NDX": 27610.50,
+    "USDINR=X": 94.85,
+  }},
+}};
+
+let activeOverlay = null;
+const window = {{
+  fetch: async (url, opts = {{}}) => {{
+    const u = String(url);
+    if (u.includes("market_snapshot.json")) {{
+      return {{
+        ok: true,
+        status: 200,
+        json: async () => JSON.parse(JSON.stringify(rawBaseline)),
+      }};
+    }}
+    if (u.includes("/api/market-prices")) {{
+      if (opts && opts.method === "POST") {{
+        return {{ ok: true, status: 200, json: async () => overlayDay2 }};
+      }}
+      if (!activeOverlay) {{
+        return {{ ok: false, status: 404, json: async () => ({{}}) }};
+      }}
+      return {{ ok: true, status: 200, json: async () => activeOverlay }};
+    }}
+    throw new Error("Unexpected URL: " + u);
+  }},
+}};
+{eng_stripped}
+
+(async () => {{
+  // Baseline score without overlay for PE ratio comparison
+  const baseIdx = indexSnapshot(baseSnapshotClone);
+  const baseScored = scoreUniversePointInTime(baseIdx, baseIdx.as_of_date, "street_quant", null, true);
+  const baseByTk = Object.fromEntries(baseScored.map((s) => [s.ticker, s]));
+  const baseS1ByTk = Object.fromEntries(baseIdx.stage1_funnel.map((r) => [r.ticker, Object.assign({{}}, r)]));
+
+  // Enable Day 1 overlay via getSnapshot()
+  activeOverlay = overlayDay1;
+  const snap = await getSnapshot();
+  const screener1 = await runScreenerSnapshot({{
+    preset: "street_quant",
+    sector: "ALL",
+    min_score: 0,
+    market: "ALL",
+  }});
+  const planner1 = await runPlannerSnapshot({{
+    market: "ALL",
+    lump_sum_inr: 500000,
+    monthly_sip_inr: 0,
+    horizon_years: 7,
+    target_corpus_inr: 1250000,
+    risk_profile: "equity_direct",
+    preset: "qglp_compounder",
+    max_stocks: 8,
+    save_plan: false,
+  }});
+
+  const s1ByTk1 = Object.fromEntries(screener1.stage1_funnel.map((r) => [r.ticker, Object.assign({{}}, r)]));
+  const stByTk1 = Object.fromEntries(screener1.stocks.map((s) => [s.ticker, s]));
+  const day1DatesLen = snap.price_dates.length;
+
+  // Apply SECOND overlay ("2026-11-20") on the SAME snapshot instance via refreshCloudLivePrices()
+  const refRes = await refreshCloudLivePrices();
+  const screener2 = await runScreenerSnapshot({{
+    preset: "street_quant",
+    sector: "ALL",
+    min_score: 0,
+    market: "ALL",
+  }});
+  const stByTk2 = Object.fromEntries(screener2.stocks.map((s) => [s.ticker, s]));
+  const day2DatesLen = snap.price_dates.length;
+  const uniqueDateCount = new Set(snap.price_dates).size;
+  const misalignedArrays = Object.entries(snap.prices).filter(
+    ([_tk, arr]) => Array.isArray(arr) && arr.length !== day2DatesLen
+  ).length;
+
+  print("__V51_OVERLAY_JSON__" + JSON.stringify({{
+    baseAsOf: baseIdx.as_of_date,
+    baseDateCount: rawBaseline.price_dates.length,
+    basePe: {{
+      NVDA: baseByTk["NVDA"].metrics.pe_ratio,
+      MU: baseByTk["MU"].metrics.pe_ratio,
+      TCS: baseByTk["TCS.NS"].metrics.pe_ratio,
+    }},
+    baseS1: {{
+      NVDA: baseS1ByTk["NVDA"],
+      MU: baseS1ByTk["MU"],
+      TCS: baseS1ByTk["TCS.NS"],
+    }},
+    day1: {{
+      asOf: screener1.as_of_date,
+      bmNifty: screener1.benchmark_nifty50,
+      bmSp500: screener1.benchmark_sp500,
+      bmNasdaq: screener1.benchmark_nasdaq100,
+      plannerFx: planner1.fx_usd_inr,
+      datesLen: day1DatesLen,
+      stocks: {{
+        NVDA: {{ price: stByTk1["NVDA"].price, pe: stByTk1["NVDA"].metrics.pe_ratio }},
+        MU: {{ price: stByTk1["MU"].price, pe: stByTk1["MU"].metrics.pe_ratio }},
+        TCS: {{ price: stByTk1["TCS.NS"].price, pe: stByTk1["TCS.NS"].metrics.pe_ratio }},
+      }},
+      s1: {{
+        NVDA: s1ByTk1["NVDA"],
+        MU: s1ByTk1["MU"],
+        TCS: s1ByTk1["TCS.NS"],
+      }},
+    }},
+    day2: {{
+      refreshResult: refRes,
+      asOf: screener2.as_of_date,
+      bmNifty: screener2.benchmark_nifty50,
+      bmSp500: screener2.benchmark_sp500,
+      datesLen: day2DatesLen,
+      uniqueDateCount,
+      misalignedArrays,
+      nvdaPrice: stByTk2["NVDA"].price,
+      tcsPrice: stByTk2["TCS.NS"].price,
+    }},
+  }}));
+}})().catch((e) => {{ print("V51_JS_ERR:" + (e && e.stack ? e.stack : e)); quit(1); }});
+"""
+    drv_path = tmp_path / "v51_overlay_check.cjs"
+    drv_path.write_text(overlay_driver, encoding="utf-8")
+    runner = [str(jsc_bin), str(drv_path)] if jsc_bin.exists() else [str(node_bin), str(drv_path)]
+    proc = subprocess.run(runner, check=True, capture_output=True, text=True)
+    ov = json.loads(proc.stdout.split("__V51_OVERLAY_JSON__", 1)[1].strip())
+
+    # Assert Day 1 overlay updates screener as_of_date, prices, P/E, stage1_funnel technicals, benchmarks, and Planner FX
+    d1 = ov["day1"]
+    assert d1["asOf"] == "2026-11-19"
+    assert d1["datesLen"] == base_date_count + 1
+    assert d1["bmNifty"] == 26125.40
+    assert d1["bmSp500"] == 7490.80
+    assert d1["bmNasdaq"] == 27450.25
+    assert d1["plannerFx"] == 94.50
+
+    assert d1["stocks"]["NVDA"]["price"] == 245.00
+    assert d1["stocks"]["MU"]["price"] == 910.50
+    assert d1["stocks"]["TCS"]["price"] == 2100.00
+    assert d1["stocks"]["NVDA"]["pe"] > ov["basePe"]["NVDA"]
+    assert d1["stocks"]["MU"]["pe"] > ov["basePe"]["MU"]
+    assert d1["stocks"]["TCS"]["pe"] < ov["basePe"]["TCS"]
+
+    # Stage-1 funnel technicals recomputed cleanly (`last_price`, `dist_52w_high_pct`, `above_200dma`)
+    assert d1["s1"]["NVDA"]["last_price"] == 245.00
+    assert d1["s1"]["NVDA"]["dist_52w_high_pct"] == 0.0  # 245.00 sets a new 52-week high above 239.24
+    assert d1["s1"]["NVDA"]["above_200dma"] == 1 and ov["baseS1"]["NVDA"]["above_200dma"] == 0
+
+    assert d1["s1"]["MU"]["last_price"] == 910.50
+    assert d1["s1"]["MU"]["dist_52w_high_pct"] > ov["baseS1"]["MU"]["dist_52w_high_pct"]
+    assert d1["s1"]["MU"]["above_200dma"] == 1 and ov["baseS1"]["MU"]["above_200dma"] == 0
+
+    assert d1["s1"]["TCS"]["last_price"] == 2100.00
+    assert d1["s1"]["TCS"]["dist_52w_high_pct"] < ov["baseS1"]["TCS"]["dist_52w_high_pct"]
+    assert d1["s1"]["TCS"]["above_200dma"] == 0 and ov["baseS1"]["TCS"]["above_200dma"] == 1
+
+    # Assert Day 2 overlay replaces tail slot idempotently (+1 over baseline, zero duplicate dates, 0 misaligned series)
+    d2 = ov["day2"]
+    assert d2["refreshResult"]["as_of_date"] == "2026-11-20"
+    assert d2["refreshResult"]["tickers_refreshed"] == 711
+    assert d2["asOf"] == "2026-11-20"
+    assert d2["datesLen"] == base_date_count + 1
+    assert d2["uniqueDateCount"] == base_date_count + 1
+    assert d2["misalignedArrays"] == 0
+    assert d2["bmNifty"] == 26310.00
+    assert d2["bmSp500"] == 7540.20
+    assert d2["nvdaPrice"] == 252.80
+    assert d2["tcsPrice"] == 2480.00
+
+    # Verify static/sw.js shell cache is on v5.x series and static/app.js imports refreshCloudLivePrices
+    sw_txt = (root / "static" / "sw.js").read_text(encoding="utf-8")
+    app_txt = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'CACHE_NAME = "arthaquant-shell-v5.' in sw_txt
+    assert "refreshCloudLivePrices" in app_txt
+
+    # 2. Local `/api/market-prices` & Intraday `regularMarketPrice` Priority (`app/main.py` & `app/paper_trading.py`)
+    client, _csrf = _authenticated_client(tmp_path)
+    anon_client = TestClient(client.app, base_url="https://127.0.0.1:8000")
+    assert anon_client.get("/api/market-prices").status_code == 401
+
+    mp_res = client.get("/api/market-prices")
+    assert mp_res.status_code == 200
+    mp_body = mp_res.json()
+    assert mp_body["schema"] == "arthaquant.live_prices.v1"
+    assert mp_body["stock_count"] >= 10
+    assert isinstance(mp_body["prices"], dict) and len(mp_body["prices"]) == mp_body["stock_count"]
+    assert mp_body["prices"]["TCS.NS"] > 0
+    assert mp_body["prices"]["^NSEI"] > 0
+
+    # Mock `httpx.Client.get` on `default_yahoo_quote_fetcher`: active intraday session where `closes[-1]` is `None`!
+    today_dt = dt.datetime(2026, 11, 19, 16, 30, 0, tzinfo=dt.timezone.utc)
+    today_epoch = int(today_dt.timestamp())
+    yesterday_epoch = today_epoch - 86400
+
+    class _FakeYahooChartResp:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "chart": {
+                    "result": [
+                        {
+                            "meta": {
+                                "symbol": "NVDA",
+                                "regularMarketPrice": 149.75,
+                                "regularMarketDayLow": 146.10,
+                                "regularMarketDayHigh": 150.40,
+                                "regularMarketTime": today_epoch,
+                                "gmtoffset": -18000,
+                            },
+                            "timestamp": [yesterday_epoch, today_epoch - 3600],
+                            "indicators": {
+                                "quote": [
+                                    {
+                                        "close": [138.20, None],
+                                        "low": [134.50, None],
+                                        "high": [140.10, None],
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            }
+
+    monkeypatch.setattr(httpx.Client, "get", lambda self, url, **kw: _FakeYahooChartResp())
+    fetched_quotes = default_yahoo_quote_fetcher(["NVDA"])
+    assert "NVDA" in fetched_quotes
+    nvda_q = fetched_quotes["NVDA"]
+    assert nvda_q["close_price"] == 149.75
+    assert nvda_q["day_low"] == 146.10  # Must NOT mix yesterday's 134.50 candle low into today's session!
+    assert nvda_q["day_high"] == 150.40
+    assert nvda_q["trade_date"] == "2026-11-19"
+
+    # 3. Cloud Functions Strict TS + `esbuild` across all 5 `.mts` Functions + Runtime Origin & Cache-Header Check
+    ci_yml = (root / ".github" / "workflows" / "ci-and-deploy.yml").read_text(encoding="utf-8")
+    assert "netlify/functions/market-prices.mts" in ci_yml
+    assert "netlify/lib/market-prices-service.mts" in ci_yml
+
+    tsc_bin = root / "node_modules" / ".bin" / "tsc"
+    esbuild_bin = root / "node_modules" / ".bin" / "esbuild"
+    if tsc_bin.exists() and node_bin:
+        tsc_env = {**os.environ, "PATH": f"{Path(node_bin).parent}:{os.environ.get('PATH', '')}"}
+        subprocess.run(
+            [
+                str(tsc_bin),
+                "--noEmit",
+                "--target",
+                "ES2022",
+                "--module",
+                "NodeNext",
+                "--moduleResolution",
+                "NodeNext",
+                "--allowImportingTsExtensions",
+                "--strict",
+                "--skipLibCheck",
+                str(root / "netlify/functions/ai-memo.mts"),
+                str(root / "netlify/functions/paper-api.mts"),
+                str(root / "netlify/functions/daily-paper-refresh.mts"),
+                str(root / "netlify/functions/nse-close-paper-refresh.mts"),
+                str(root / "netlify/functions/market-prices.mts"),
+                str(root / "netlify/lib/paper-pg-service.mts"),
+                str(root / "netlify/lib/market-prices-service.mts"),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=tsc_env,
+        )
+
+    mp_bundle = tmp_path / "market_prices_fn.mjs"
+    if esbuild_bin.exists():
+        fn_specs = (
+            ("netlify/functions/ai-memo.mts", tmp_path / "ai_memo_fn.mjs", ["--external:@google/genai"]),
+            (
+                "netlify/functions/paper-api.mts",
+                tmp_path / "paper_api_fn.mjs",
+                ["--external:@netlify/database", "--external:pg"],
+            ),
+            (
+                "netlify/functions/daily-paper-refresh.mts",
+                tmp_path / "daily_refresh_fn.mjs",
+                ["--external:@netlify/database", "--external:pg"],
+            ),
+            (
+                "netlify/functions/nse-close-paper-refresh.mts",
+                tmp_path / "nse_refresh_fn.mjs",
+                ["--external:@netlify/database", "--external:pg"],
+            ),
+            (
+                "netlify/functions/market-prices.mts",
+                mp_bundle,
+                ["--external:@netlify/database", "--external:pg"],
+            ),
+        )
+        for fn_rel, out_path, externals in fn_specs:
+            subprocess.run(
+                [
+                    str(esbuild_bin),
+                    str(root / fn_rel),
+                    "--bundle",
+                    "--platform=node",
+                    "--format=esm",
+                    "--target=node22",
+                    *externals,
+                    f"--outfile={out_path}",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            assert out_path.exists() and out_path.stat().st_size > 1000
+
+    if mp_bundle.exists() and node_bin:
+        node_check_script = f"""
+import handler from {json.dumps(mp_bundle.as_uri())};
+
+globalThis.fetch = async (url) => {{
+  const u = String(url);
+  if (u.includes("/v7/finance/spark")) {{
+    const m = /symbols=([^&]+)/.exec(u);
+    const syms = m ? decodeURIComponent(m[1]).split(",") : [];
+    return new Response(JSON.stringify({{
+      spark: {{
+        result: syms.filter((s) => s !== "USDINR=X").map((sym) => ({{
+          symbol: sym,
+          response: [{{
+            meta: {{ symbol: sym, regularMarketPrice: sym === "NVDA" ? 149.75 : 220.0, regularMarketTime: 1795110000, gmtoffset: 0 }},
+            timestamp: [1795020000],
+            indicators: {{ quote: [{{ close: [210.0] }}] }},
+          }}],
+        }})),
+      }},
+    }}), {{ status: 200, headers: {{ "Content-Type": "application/json" }} }});
+  }}
+  if (u.includes("/v8/finance/chart/")) {{
+    return new Response(JSON.stringify({{
+      chart: {{
+        result: [{{
+          meta: {{ regularMarketPrice: 94.50, regularMarketDayLow: 94.10, regularMarketDayHigh: 94.75, regularMarketTime: 1795110000, gmtoffset: 0 }},
+          timestamp: [1795020000],
+          indicators: {{ quote: [{{ close: [93.90], low: [93.80], high: [94.10] }}] }},
+        }}],
+      }},
+    }}), {{ status: 200, headers: {{ "Content-Type": "application/json" }} }});
+  }}
+  throw new Error("Unexpected fetch URL in market-prices test: " + u);
+}};
+
+const getRes = await handler(new Request("https://arthaquant-india.netlify.app/api/market-prices", {{ method: "GET" }}));
+const getBody = await getRes.json();
+
+const evilPostRes = await handler(new Request("https://arthaquant-india.netlify.app/api/market-prices", {{
+  method: "POST",
+  headers: {{
+    "Origin": "https://evil.example",
+    "Host": "arthaquant-india.netlify.app",
+    "Content-Type": "application/json",
+  }},
+  body: "{{}}",
+}}));
+
+const okPostRes = await handler(new Request("https://arthaquant-india.netlify.app/api/market-prices", {{
+  method: "POST",
+  headers: {{
+    "Origin": "https://arthaquant-india.netlify.app",
+    "Host": "arthaquant-india.netlify.app",
+    "Content-Type": "application/json",
+  }},
+  body: "{{}}",
+}}));
+
+const delRes = await handler(new Request("https://arthaquant-india.netlify.app/api/market-prices", {{ method: "DELETE" }}));
+
+console.log("__MP_CLOUD_JSON__" + JSON.stringify({{
+  getStatus: getRes.status,
+  cdnCache: getRes.headers.get("Netlify-CDN-Cache-Control"),
+  browserCache: getRes.headers.get("Cache-Control"),
+  nosniff: getRes.headers.get("X-Content-Type-Options"),
+  schema: getBody.schema,
+  stockCount: getBody.stock_count,
+  nvdaPx: getBody.prices["NVDA"],
+  fxPx: getBody.prices["USDINR=X"],
+  evilPostStatus: evilPostRes.status,
+  evilPostCache: evilPostRes.headers.get("Cache-Control"),
+  okPostStatus: okPostRes.status,
+  delStatus: delRes.status,
+}}));
+"""
+        node_drv = tmp_path / "mp_cloud_runtime.mjs"
+        node_drv.write_text(node_check_script, encoding="utf-8")
+        mp_proc = subprocess.run(
+            [str(node_bin), str(node_drv)],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(root),
+        )
+        mp_cloud = json.loads(mp_proc.stdout.split("__MP_CLOUD_JSON__", 1)[1].strip())
+        assert mp_cloud["getStatus"] == 200
+        assert "s-maxage=900" in str(mp_cloud["cdnCache"])
+        assert "max-age=120" in str(mp_cloud["browserCache"])
+        assert mp_cloud["nosniff"] == "nosniff"
+        assert mp_cloud["schema"] == "arthaquant.live_prices.v1"
+        assert mp_cloud["stockCount"] >= 707
+        assert mp_cloud["nvdaPx"] == 149.75
+        assert mp_cloud["fxPx"] == 94.50
+        assert mp_cloud["evilPostStatus"] == 403
+        assert mp_cloud["evilPostCache"] == "no-store"
+        assert mp_cloud["okPostStatus"] == 200
+        assert mp_cloud["delStatus"] == 405
+
+
+def test_v52_mobile_pwa_layout_and_bottom_nav_invariants() -> None:
+    import re
+
+    root = Path(__file__).resolve().parent.parent
+    css_txt = (root / "static" / "styles.css").read_text(encoding="utf-8")
+    app_txt = (root / "static" / "app.js").read_text(encoding="utf-8")
+    sw_txt = (root / "static" / "sw.js").read_text(encoding="utf-8")
+
+    # 1. Balanced braces & structural overflow-x: clip on html and body
+    assert css_txt.count("{") == css_txt.count("}"), "Unbalanced braces in static/styles.css"
+    html_block = re.search(r"(?:^|\n)html\s*\{([^}]*)\}", css_txt)
+    body_block = re.search(r"(?:^|\n)body\s*\{([^}]*)\}", css_txt)
+    assert html_block and "overflow-x: clip;" in html_block.group(1)
+    assert body_block and "overflow-x: clip;" in body_block.group(1)
+
+    # 2. min-width: 0 containment on .charts-two-col > *, .tab-panel, and .panel
+    containment_blocks = re.findall(r"([^{}]+)\{([^{}]*min-width\s*:\s*0[^{}]*)\}", css_txt)
+    containment_selectors = "\n".join(sel for sel, _ in containment_blocks)
+    assert ".charts-two-col > *" in containment_selectors
+    assert ".tab-panel" in containment_selectors
+    assert ".panel" in containment_selectors
+
+    # 3. V5.2 mobile @media (max-width: 900px) block appears strictly AFTER V5.0 desktop .main-container rule
+    v50_marker_idx = css_txt.find("V5.0 Calm")
+    assert v50_marker_idx != -1, "V5.0 section marker missing in static/styles.css"
+    v50_main_match = re.search(r"\n\.main-container\s*\{", css_txt[v50_marker_idx:])
+    assert v50_main_match is not None, "V5.0 desktop .main-container rule missing"
+    v50_main_abs_idx = v50_marker_idx + v50_main_match.start()
+
+    def _extract_media_blocks(text: str, query: str) -> list[tuple[int, str]]:
+        blocks: list[tuple[int, str]] = []
+        pattern = re.compile(rf"@media\s*\(\s*{re.escape(query)}\s*\)\s*\{{")
+        for m in pattern.finditer(text):
+            depth = 1
+            pos = m.end()
+            while pos < len(text) and depth > 0:
+                ch = text[pos]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                pos += 1
+            blocks.append((m.start(), text[m.end() : pos - 1]))
+        return blocks
+
+    media_900_blocks = _extract_media_blocks(css_txt, "max-width: 900px")
+    assert media_900_blocks, "Missing @media (max-width: 900px) block"
+    # Find the V5.2 mobile block placed AFTER V5.0 desktop .main-container
+    post_v50_900 = [(idx, body) for idx, body in media_900_blocks if idx > v50_main_abs_idx]
+    assert post_v50_900, "No @media (max-width: 900px) block appears after V5.0 base .main-container"
+
+    # Assert mobile .main-container env(safe-area-inset-bottom) rule is strictly after V5.0 desktop .main-container
+    mobile_main_safe_idx = -1
+    v52_900_body = ""
+    for idx, body in post_v50_900:
+        m_main = re.search(r"\.main-container\s*\{[^}]*env\(safe-area-inset-bottom", body)
+        if m_main:
+            mobile_main_safe_idx = idx + m_main.start()
+            v52_900_body = body
+    assert mobile_main_safe_idx > v50_main_abs_idx, (
+        "Mobile .main-container safe-area-inset-bottom rule must appear strictly after V5.0 desktop .main-container"
+    )
+
+    # 4. .charts-two-col collapses to grid-template-columns: 1fr inside @media (max-width: 900px)
+    charts_collapse = re.search(r"\.charts-two-col\s*\{[^}]*grid-template-columns\s*:\s*1fr", v52_900_body)
+    assert charts_collapse is not None, ".charts-two-col must collapse to 1fr inside V5.2 @media (max-width: 900px)"
+
+    # 5. .mobile-bottom-nav fixed positioning, bottom: 0, z-index, and env(safe-area-inset-bottom)
+    nav_match = re.search(r"\.mobile-bottom-nav\s*\{([^}]*)\}", v52_900_body)
+    assert nav_match is not None, ".mobile-bottom-nav rule missing in V5.2 @media (max-width: 900px)"
+    nav_body = nav_match.group(1)
+    assert re.search(r"position\s*:\s*fixed\s*;", nav_body)
+    assert re.search(r"bottom\s*:\s*0\s*;", nav_body)
+    assert re.search(r"z-index\s*:\s*\d+\s*;", nav_body)
+    assert "env(safe-area-inset-bottom" in nav_body
+
+    # 6. Mobile inputs use font-size: 16px inside @media (max-width: 900px) (prevents iOS Safari auto-zoom)
+    input_zoom_guard = re.search(
+        r"input\.input-control[^{]*\{[^}]*font-size\s*:\s*16px",
+        v52_900_body,
+    )
+    assert input_zoom_guard is not None, "Mobile inputs must enforce font-size: 16px inside @media (max-width: 900px)"
+
+    # 7. Mobile #tab-screener .leaderboard-table card layout rules exist inside @media (max-width: 768px)
+    media_768_blocks = _extract_media_blocks(css_txt, "max-width: 768px")
+    assert media_768_blocks, "Missing @media (max-width: 768px) block"
+    combined_768 = "\n".join(body for _, body in media_768_blocks)
+    assert "#tab-screener .leaderboard-table" in combined_768
+    assert "#tab-screener .leaderboard-table thead" in combined_768
+    assert re.search(
+        r"#tab-screener\s+\.leaderboard-table\s+tbody\s+tr\s*\{[^}]*display\s*:\s*grid",
+        combined_768,
+    )
+
+    # 8. static/app.js switchTab calls closeDeepDive() when state.drawerOpen and resets scrollTo(0, 0)
+    switch_tab_match = re.search(r"function\s+switchTab\s*\([^)]*\)\s*\{([\s\S]*?)\n\}", app_txt)
+    assert switch_tab_match is not None, "switchTab function missing in static/app.js"
+    switch_tab_body = switch_tab_match.group(1)
+    assert re.search(r"if\s*\(\s*state\.drawerOpen\s*\)\s*\{[^}]*closeDeepDive\s*\(\s*\)", switch_tab_body)
+    assert "window.scrollTo(0, 0)" in switch_tab_body
+
+    # 9. static/sw.js shell cache bumped to arthaquant-shell-v5.2
+    assert 'CACHE_NAME = "arthaquant-shell-v5.2"' in sw_txt
+
+
 
 

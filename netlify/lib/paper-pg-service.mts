@@ -1,12 +1,9 @@
 import crypto from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  getDatabase,
-  MissingDatabaseConnectionError,
-  type DatabaseConnection,
-} from "@netlify/database";
+import type { DatabaseConnection } from "@netlify/database";
 
 export const FX_USD_INR_SYMBOL = "USDINR=X";
 export const USD_INR_FX = 93.44;
@@ -330,11 +327,35 @@ function makeShortId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 14)}`;
 }
 
-export function resolveDbConnection(): DatabaseConnection {
+type NetlifyDatabaseModule = {
+  getDatabase: () => DatabaseConnection;
+  MissingDatabaseConnectionError: new (...args: unknown[]) => Error;
+};
+
+function loadNetlifyDatabaseModule(): NetlifyDatabaseModule {
   try {
-    return getDatabase();
+    return createRequire(import.meta.url)("@netlify/database") as NetlifyDatabaseModule;
+  } catch {
+    return createRequire(path.join(process.cwd(), "package.json"))(
+      "@netlify/database",
+    ) as NetlifyDatabaseModule;
+  }
+}
+
+export function resolveDbConnection(): DatabaseConnection {
+  let dbMod: NetlifyDatabaseModule;
+  try {
+    dbMod = loadNetlifyDatabaseModule();
+  } catch {
+    throw new PaperServiceError("Unable to initialize database connection.", 503);
+  }
+  try {
+    return dbMod.getDatabase();
   } catch (err) {
-    if (err instanceof MissingDatabaseConnectionError) {
+    if (
+      err instanceof dbMod.MissingDatabaseConnectionError ||
+      (err instanceof Error && err.name === "MissingDatabaseConnectionError")
+    ) {
       throw new PaperServiceError(
         "Netlify Managed Postgres is not provisioned yet on this deploy. Deploy with @netlify/database installed so migrations under netlify/database/migrations/ auto-provision the database.",
         503,
@@ -442,6 +463,62 @@ export function computeSellProceeds(
   return { gross, fee, netCredit };
 }
 
+function buildUniverseFromRawMarketSnapshot(snap: Record<string, unknown>): StockUniverseContext {
+  const asOf = typeof snap.as_of_date === "string" ? snap.as_of_date : utcTodayStr();
+  const pricesMap = (snap.prices ?? {}) as Record<string, Array<number | null>>;
+  const s1Map: Record<string, Record<string, unknown>> = {};
+  if (Array.isArray(snap.stage1_funnel)) {
+    for (const r of snap.stage1_funnel) {
+      if (r && typeof r === "object" && typeof (r as Record<string, unknown>).ticker === "string") {
+        s1Map[(r as Record<string, unknown>).ticker as string] = r as Record<string, unknown>;
+      }
+    }
+  }
+  const latestPx = (sym: string): number | null => {
+    const arr = pricesMap[sym];
+    if (!Array.isArray(arr)) return null;
+    for (let i = arr.length - 1; i >= 0; i -= 1) {
+      if (typeof arr[i] === "number" && Number.isFinite(arr[i]!)) {
+        return roundTo(arr[i]!, 2);
+      }
+    }
+    return null;
+  };
+  const benchmarks: Record<string, number> = {};
+  for (const bm of BENCHMARK_SYMBOLS) {
+    const px = latestPx(bm);
+    if (px && px > 0) benchmarks[bm] = px;
+  }
+  const stocks: Record<string, StockUniverseEntry> = {};
+  for (const rawComp of Array.isArray(snap.companies) ? snap.companies : []) {
+    if (!rawComp || typeof rawComp !== "object") continue;
+    const c = rawComp as Record<string, unknown>;
+    const tk = typeof c.ticker === "string" ? c.ticker : "";
+    if (!tk) continue;
+    const s1 = s1Map[tk] ?? {};
+    const rawTag = String(c.index_tag ?? s1.index_tag ?? "").toUpperCase();
+    const isUs = c.market === "US" || rawTag === "NASDAQ100" || rawTag === "SP500";
+    const s1Score = typeof s1.stage1_score === "number" ? roundTo(s1.stage1_score, 1) : 55.0;
+    stocks[tk] = {
+      name: typeof c.name === "string" ? c.name : tk,
+      sector: typeof c.sector === "string" ? c.sector : "Diversified",
+      industry: typeof c.industry === "string" ? c.industry : "",
+      market: isUs ? "US" : "IN",
+      index_tag: isUs ? (rawTag === "SP500" ? "SP500" : "NASDAQ100") : "NIFTY200",
+      currency: isUs ? "USD" : "INR",
+      last_price: typeof s1.last_price === "number" ? roundTo(s1.last_price, 2) : latestPx(tk),
+      composite_score: s1Score,
+      rating: s1Score >= 68 ? "Buy" : s1Score >= 48 ? "Hold" : "Avoid",
+    };
+  }
+  return {
+    as_of_date: asOf,
+    stock_count: Object.keys(stocks).length,
+    benchmarks,
+    stocks,
+  };
+}
+
 export async function loadStockUniverse(reqUrl?: string): Promise<StockUniverseContext> {
   if (cachedUniverse && cachedUniverse.stock_count > 0) {
     return cachedUniverse;
@@ -476,6 +553,22 @@ export async function loadStockUniverse(reqUrl?: string): Promise<StockUniverseC
     }
   }
 
+  // Local repository disk fallback when stock_ai_context.json has not been built yet
+  try {
+    const rawSnapDisk = await readFile(
+      path.resolve(process.cwd(), "static/data/market_snapshot.json"),
+      "utf-8",
+    );
+    const parsedSnapDisk = JSON.parse(rawSnapDisk) as Record<string, unknown>;
+    const builtFromDisk = buildUniverseFromRawMarketSnapshot(parsedSnapDisk);
+    if (builtFromDisk.stock_count > 0) {
+      cachedUniverse = builtFromDisk;
+      return cachedUniverse;
+    }
+  } catch {
+    // Fall through to HTTP fetch if reqUrl provided
+  }
+
   if (reqUrl) {
     const snapUrl = new URL("/static/data/market_snapshot.json", reqUrl);
     const res = await fetch(snapUrl, {
@@ -484,59 +577,7 @@ export async function loadStockUniverse(reqUrl?: string): Promise<StockUniverseC
     });
     if (res.ok) {
       const snap = (await res.json()) as Record<string, unknown>;
-      const asOf = typeof snap.as_of_date === "string" ? snap.as_of_date : utcTodayStr();
-      const pricesMap = (snap.prices ?? {}) as Record<string, Array<number | null>>;
-      const s1Map: Record<string, Record<string, unknown>> = {};
-      if (Array.isArray(snap.stage1_funnel)) {
-        for (const r of snap.stage1_funnel) {
-          if (r && typeof r === "object" && typeof (r as Record<string, unknown>).ticker === "string") {
-            s1Map[(r as Record<string, unknown>).ticker as string] = r as Record<string, unknown>;
-          }
-        }
-      }
-      const latestPx = (sym: string): number | null => {
-        const arr = pricesMap[sym];
-        if (!Array.isArray(arr)) return null;
-        for (let i = arr.length - 1; i >= 0; i -= 1) {
-          if (typeof arr[i] === "number" && Number.isFinite(arr[i]!)) {
-            return roundTo(arr[i]!, 2);
-          }
-        }
-        return null;
-      };
-      const benchmarks: Record<string, number> = {};
-      for (const bm of BENCHMARK_SYMBOLS) {
-        const px = latestPx(bm);
-        if (px && px > 0) benchmarks[bm] = px;
-      }
-      const stocks: Record<string, StockUniverseEntry> = {};
-      for (const rawComp of Array.isArray(snap.companies) ? snap.companies : []) {
-        if (!rawComp || typeof rawComp !== "object") continue;
-        const c = rawComp as Record<string, unknown>;
-        const tk = typeof c.ticker === "string" ? c.ticker : "";
-        if (!tk) continue;
-        const s1 = s1Map[tk] ?? {};
-        const rawTag = String(c.index_tag ?? s1.index_tag ?? "").toUpperCase();
-        const isUs = c.market === "US" || rawTag === "NASDAQ100" || rawTag === "SP500";
-        const s1Score = typeof s1.stage1_score === "number" ? roundTo(s1.stage1_score, 1) : 55.0;
-        stocks[tk] = {
-          name: typeof c.name === "string" ? c.name : tk,
-          sector: typeof c.sector === "string" ? c.sector : "Diversified",
-          industry: typeof c.industry === "string" ? c.industry : "",
-          market: isUs ? "US" : "IN",
-          index_tag: isUs ? (rawTag === "SP500" ? "SP500" : "NASDAQ100") : "NIFTY200",
-          currency: isUs ? "USD" : "INR",
-          last_price: typeof s1.last_price === "number" ? roundTo(s1.last_price, 2) : latestPx(tk),
-          composite_score: s1Score,
-          rating: s1Score >= 68 ? "Buy" : s1Score >= 48 ? "Hold" : "Avoid",
-        };
-      }
-      cachedUniverse = {
-        as_of_date: asOf,
-        stock_count: Object.keys(stocks).length,
-        benchmarks,
-        stocks,
-      };
+      cachedUniverse = buildUniverseFromRawMarketSnapshot(snap);
       return cachedUniverse;
     }
   }
@@ -2394,7 +2435,13 @@ export async function deployPaperBasket(
 interface YahooChartResponse {
   chart?: {
     result?: Array<{
-      meta?: { gmtoffset?: number };
+      meta?: {
+        regularMarketPrice?: number;
+        regularMarketDayLow?: number;
+        regularMarketDayHigh?: number;
+        regularMarketTime?: number;
+        gmtoffset?: number;
+      };
       timestamp?: number[];
       indicators?: {
         quote?: Array<{
@@ -2430,9 +2477,24 @@ async function fetchSingleYahooOhlc(symbol: string): Promise<LiveQuoteRow | null
     const lows = q?.low ?? [];
     const highs = q?.high ?? [];
 
+    let barClose = 0;
+    let barLow = 0;
+    let barHigh = 0;
+    let barTs: number | null = null;
+    let barTradeDate = "";
+
     for (let idx = timestamps.length - 1; idx >= 0; idx -= 1) {
       const cRaw = closes[idx];
-      if (cRaw === null || cRaw === undefined || !Number.isFinite(cRaw) || cRaw <= 0) continue;
+      const tsRaw = Number(timestamps[idx]);
+      if (
+        cRaw === null ||
+        cRaw === undefined ||
+        !Number.isFinite(cRaw) ||
+        cRaw <= 0 ||
+        !Number.isFinite(tsRaw)
+      ) {
+        continue;
+      }
       const loRaw = lows[idx];
       const hiRaw = highs[idx];
       let loVal = loRaw !== null && loRaw !== undefined && Number.isFinite(loRaw) && loRaw > 0 ? loRaw : cRaw;
@@ -2440,21 +2502,67 @@ async function fetchSingleYahooOhlc(symbol: string): Promise<LiveQuoteRow | null
       loVal = Math.min(loVal, cRaw);
       hiVal = Math.max(hiVal, cRaw);
 
-      const localEpochMs = (Number(timestamps[idx]) + gmtOffsetSec) * 1000;
-      const tradeDate = new Date(localEpochMs).toISOString().slice(0, 10);
+      barClose = cRaw;
+      barLow = loVal;
+      barHigh = hiVal;
+      barTs = tsRaw;
+      barTradeDate = new Date((tsRaw + gmtOffsetSec) * 1000).toISOString().slice(0, 10);
+      break;
+    }
+
+    const regPx = Number(res0.meta?.regularMarketPrice ?? 0);
+    const regTs = Number(res0.meta?.regularMarketTime ?? 0);
+
+    if (
+      Number.isFinite(regPx) &&
+      regPx > 0 &&
+      (barTs === null || regTs === 0 || regTs >= barTs - 3600)
+    ) {
+      const closePx = roundTo(regPx, 2);
+      const baseEpochSec =
+        regTs > 0 && Number.isFinite(regTs)
+          ? regTs
+          : barTs !== null
+            ? barTs
+            : Math.floor(Date.now() / 1000);
+      const regTradeDate = new Date((baseEpochSec + gmtOffsetSec) * 1000).toISOString().slice(0, 10);
+
+      const regLow = Number(res0.meta?.regularMarketDayLow ?? 0);
+      const regHigh = Number(res0.meta?.regularMarketDayHigh ?? 0);
+      let lo = regLow > 0 && Number.isFinite(regLow) ? Math.min(regLow, closePx) : closePx;
+      let hi = regHigh > 0 && Number.isFinite(regHigh) ? Math.max(regHigh, closePx) : closePx;
+
+      if (barTs !== null && barTradeDate === regTradeDate) {
+        lo = Math.min(lo, barLow);
+        hi = Math.max(hi, barHigh);
+      }
 
       return {
         ticker: symbol,
-        close_price: roundTo(cRaw, 2),
-        day_low: roundTo(loVal, 2),
-        day_high: roundTo(hiVal, 2),
-        trade_date: tradeDate,
+        close_price: closePx,
+        day_low: roundTo(lo, 2),
+        day_high: roundTo(hi, 2),
+        trade_date: regTradeDate,
+      };
+    }
+
+    if (barTs !== null && barClose > 0) {
+      return {
+        ticker: symbol,
+        close_price: roundTo(barClose, 2),
+        day_low: roundTo(barLow, 2),
+        day_high: roundTo(hiValOrClose(barHigh, barClose), 2),
+        trade_date: barTradeDate,
       };
     }
   } catch {
     // Graceful skip on timeout or upstream failure
   }
   return null;
+}
+
+function hiValOrClose(val: number, fallback: number): number {
+  return Number.isFinite(val) && val > 0 ? val : fallback;
 }
 
 export async function fetchYahooChartQuotes(tickers: string[]): Promise<Map<string, LiveQuoteRow>> {
