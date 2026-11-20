@@ -1824,6 +1824,8 @@ const fetch = async (req) => new Response("ok", {{ status: 200, headers: {{ "Cac
     assert "reserved_cash >= 0" in mig_sql
 
     pg_svc_txt = (root / "netlify" / "lib" / "paper-pg-service.mts").read_text(encoding="utf-8")
+    assert 'from "@netlify/database"' in pg_svc_txt
+    assert "createRequire" not in pg_svc_txt
     paper_api_txt = (root / "netlify" / "functions" / "paper-api.mts").read_text(encoding="utf-8")
     cron_txt = (root / "netlify" / "functions" / "daily-paper-refresh.mts").read_text(encoding="utf-8")
     nse_cron_txt = (root / "netlify" / "functions" / "nse-close-paper-refresh.mts").read_text(encoding="utf-8")
@@ -3141,6 +3143,10 @@ const window = {{
             assert out_path.exists() and out_path.stat().st_size > 1000
 
     if mp_bundle.exists() and node_bin:
+        root_node_modules = root / "node_modules"
+        tmp_node_modules = tmp_path / "node_modules"
+        if root_node_modules.is_dir() and not tmp_node_modules.exists():
+            tmp_node_modules.symlink_to(root_node_modules)
         node_check_script = f"""
 import handler from {json.dumps(mp_bundle.as_uri())};
 

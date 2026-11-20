@@ -1,9 +1,12 @@
 import crypto from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { DatabaseConnection } from "@netlify/database";
+import {
+  getDatabase,
+  MissingDatabaseConnectionError,
+  type DatabaseConnection,
+} from "@netlify/database";
 
 export const FX_USD_INR_SYMBOL = "USDINR=X";
 export const USD_INR_FX = 93.44;
@@ -327,33 +330,12 @@ function makeShortId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 14)}`;
 }
 
-type NetlifyDatabaseModule = {
-  getDatabase: () => DatabaseConnection;
-  MissingDatabaseConnectionError: new (...args: unknown[]) => Error;
-};
-
-function loadNetlifyDatabaseModule(): NetlifyDatabaseModule {
-  try {
-    return createRequire(import.meta.url)("@netlify/database") as NetlifyDatabaseModule;
-  } catch {
-    return createRequire(path.join(process.cwd(), "package.json"))(
-      "@netlify/database",
-    ) as NetlifyDatabaseModule;
-  }
-}
-
 export function resolveDbConnection(): DatabaseConnection {
-  let dbMod: NetlifyDatabaseModule;
   try {
-    dbMod = loadNetlifyDatabaseModule();
-  } catch {
-    throw new PaperServiceError("Unable to initialize database connection.", 503);
-  }
-  try {
-    return dbMod.getDatabase();
+    return getDatabase();
   } catch (err) {
     if (
-      err instanceof dbMod.MissingDatabaseConnectionError ||
+      err instanceof MissingDatabaseConnectionError ||
       (err instanceof Error && err.name === "MissingDatabaseConnectionError")
     ) {
       throw new PaperServiceError(
