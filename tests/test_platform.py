@@ -2758,7 +2758,9 @@ def test_v51_daily_universe_price_overlay_and_intraday_regular_market_price(
     snap_path = root / "static" / "data" / "market_snapshot.json"
     raw_snap_obj = json.loads(snap_path.read_text(encoding="utf-8"))
     base_as_of = str(raw_snap_obj["as_of_date"])
-    assert base_as_of < "2026-11-19"
+    base_dt = dt.date.fromisoformat(base_as_of)
+    day1_date = (base_dt + dt.timedelta(days=1)).isoformat()
+    day2_date = (base_dt + dt.timedelta(days=2)).isoformat()
     base_date_count = len(raw_snap_obj["price_dates"])
     assert base_date_count >= 1200
 
@@ -2794,10 +2796,10 @@ const baseSnapshotClone = JSON.parse(JSON.stringify(rawBaseline));
 
 const overlayDay1 = {{
   schema: "arthaquant.live_prices.v1",
-  as_of_date: "2026-11-19",
-  in_as_of: "2026-11-19",
-  us_as_of: "2026-11-19",
-  updated_at: "2026-11-19T17:45:00Z",
+  as_of_date: {json.dumps(day1_date)},
+  in_as_of: {json.dumps(day1_date)},
+  us_as_of: {json.dumps(day1_date)},
+  updated_at: {json.dumps(day1_date + "T17:45:00Z")},
   stock_count: 711,
   prices: {{
     "NVDA": 245.00,
@@ -2812,10 +2814,10 @@ const overlayDay1 = {{
 
 const overlayDay2 = {{
   schema: "arthaquant.live_prices.v1",
-  as_of_date: "2026-11-20",
-  in_as_of: "2026-11-20",
-  us_as_of: "2026-11-20",
-  updated_at: "2026-11-20T17:45:00Z",
+  as_of_date: {json.dumps(day2_date)},
+  in_as_of: {json.dumps(day2_date)},
+  us_as_of: {json.dumps(day2_date)},
+  updated_at: {json.dumps(day2_date + "T17:45:00Z")},
   stock_count: 711,
   prices: {{
     "NVDA": 252.80,
@@ -2953,7 +2955,7 @@ const window = {{
 
     # Assert Day 1 overlay updates screener as_of_date, prices, P/E, stage1_funnel technicals, benchmarks, and Planner FX
     d1 = ov["day1"]
-    assert d1["asOf"] == "2026-11-19"
+    assert d1["asOf"] == day1_date
     assert d1["datesLen"] == base_date_count + 1
     assert d1["bmNifty"] == 26125.40
     assert d1["bmSp500"] == 7490.80
@@ -2982,9 +2984,9 @@ const window = {{
 
     # Assert Day 2 overlay replaces tail slot idempotently (+1 over baseline, zero duplicate dates, 0 misaligned series)
     d2 = ov["day2"]
-    assert d2["refreshResult"]["as_of_date"] == "2026-11-20"
+    assert d2["refreshResult"]["as_of_date"] == day2_date
     assert d2["refreshResult"]["tickers_refreshed"] == 711
-    assert d2["asOf"] == "2026-11-20"
+    assert d2["asOf"] == day2_date
     assert d2["datesLen"] == base_date_count + 1
     assert d2["uniqueDateCount"] == base_date_count + 1
     assert d2["misalignedArrays"] == 0
